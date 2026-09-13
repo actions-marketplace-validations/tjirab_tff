@@ -8,12 +8,15 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
 from tff.core.model import ModelRepresentation
 from tff.core.utils.jinja import clean_dataform_for_parsing
+
+if TYPE_CHECKING:
+    from tff.core.config import FitnessFunctionsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -568,8 +571,12 @@ def load_dataform_models(
     project_root: Path,
     manifest_path: Path | str | None = None,
     dialect: str | None = None,
+    max_workers: int | None = None,
+    config: FitnessFunctionsConfig | None = None,
 ) -> dict[str, ModelRepresentation]:
     """Load Dataform models via precompiled JSON, CLI compilation, or direct source parsing."""
+    from tff.core.parallel import precompute_model_asts
+
     settings = _load_settings(project_root)
     if dialect is None:
         warehouse = settings.get("warehouse") or settings.get("defaultLocation")
@@ -581,7 +588,14 @@ def load_dataform_models(
         try:
             with open(manifest_file, encoding="utf-8") as f:
                 data = json.load(f)
-            return _parse_compiled_graph(data, project_root, dialect=dialect)
+            models = _parse_compiled_graph(data, project_root, dialect=dialect)
+            precompute_model_asts(
+                models,
+                project_root=project_root,
+                config=config,
+                max_workers=max_workers,
+            )
+            return models
         except Exception as e:
             if manifest_path:
                 raise e
@@ -591,9 +605,23 @@ def load_dataform_models(
     compiled_data = _compile_via_cli(project_root)
     if compiled_data:
         try:
-            return _parse_compiled_graph(compiled_data, project_root, dialect=dialect)
+            models = _parse_compiled_graph(compiled_data, project_root, dialect=dialect)
+            precompute_model_asts(
+                models,
+                project_root=project_root,
+                config=config,
+                max_workers=max_workers,
+            )
+            return models
         except Exception as e:
             logger.debug("Failed to parse CLI compilation output: %s", e)
 
     # Tier 3: Direct static source parsing
-    return _load_models_from_sources(project_root, settings, dialect=dialect)
+    models = _load_models_from_sources(project_root, settings, dialect=dialect)
+    precompute_model_asts(
+        models,
+        project_root=project_root,
+        config=config,
+        max_workers=max_workers,
+    )
+    return models

@@ -6,6 +6,7 @@ import argparse
 import importlib
 import importlib.metadata
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -236,7 +237,7 @@ class TFFArgumentParser(argparse.ArgumentParser):
         self.exit(2)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main_impl(argv: list[str] | None = None) -> int:
     if argv is None:
         args_list = sys.argv[1:]
     else:
@@ -340,6 +341,22 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Disable saving run execution logs to .tff_logs/",
     )
+    lint_parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel worker processes for model loading and AST traversal",
+    )
+    lint_parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable disk-based AST caching",
+    )
+    lint_parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Clear persistent AST disk cache before execution",
+    )
 
     health_parser = subparsers.add_parser(
         "health", help="Show project health report and scores"
@@ -404,6 +421,22 @@ def main(argv: list[str] | None = None) -> int:
         "--no-log",
         action="store_true",
         help="Disable saving run execution logs to .tff_logs/",
+    )
+    health_parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel worker processes for model loading and AST traversal",
+    )
+    health_parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable disk-based AST caching",
+    )
+    health_parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Clear persistent AST disk cache before execution",
     )
 
     # Info subcommand
@@ -499,6 +532,12 @@ def main(argv: list[str] | None = None) -> int:
         "--no-log",
         action="store_true",
         help="Disable saving run execution logs to .tff_logs/",
+    )
+    docs_parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel worker processes for model loading and AST traversal",
     )
 
     # Init subcommand
@@ -631,6 +670,12 @@ def main(argv: list[str] | None = None) -> int:
         "--json",
         action="store_true",
         help="Output results in JSON format to stdout",
+    )
+    action_parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel worker processes for model loading and AST traversal",
     )
 
     help_parser = subparsers.add_parser("help", help="Show help details for a command")
@@ -991,6 +1036,8 @@ def main(argv: list[str] | None = None) -> int:
             docs_kwargs["no_log"] = True
         if getattr(args, "manifest", None) is not None:
             docs_kwargs["manifest_path"] = args.manifest
+        if getattr(args, "workers", None) is not None:
+            docs_kwargs["workers"] = args.workers
         try:
             output_file = generate_docs_dashboard(**docs_kwargs)
             print(f"Successfully generated HTML dashboard at: {output_file}")
@@ -1052,6 +1099,22 @@ def main(argv: list[str] | None = None) -> int:
 
         if not getattr(config, "_config_file_found", True) and not getattr(args, "json", False):
             print(MISSING_CONFIG_NOTICE, file=sys.stderr)
+
+        if getattr(args, "workers", None) is not None:
+            config.workers = args.workers
+        if getattr(args, "no_cache", False):
+            config.cache_ast = False
+            os.environ["TFF_NO_CACHE"] = "1"
+        elif not getattr(config, "cache_ast", True):
+            os.environ["TFF_NO_CACHE"] = "1"
+
+        if getattr(args, "clear_cache", False):
+            from tff.core.ast_cache import clear_ast_cache
+
+            custom_cache = getattr(config, "cache_dir", None) if config else None
+            cleared = clear_ast_cache(project_root=project_root, custom_dir=custom_cache)
+            if not getattr(args, "json", False):
+                print(f"Cleared {cleared} AST cache file(s).")
 
         if args.command == "lint":
             checks = _parse_checks(args.checks)
@@ -1128,7 +1191,6 @@ def main(argv: list[str] | None = None) -> int:
                 generate_sarif_report,
             )
             import json
-            import os
 
             json_data = get_lint_json_data(findings, models_checked, args.fail_level)
             save_log(
@@ -1252,6 +1314,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    orig_tff_no_cache = os.environ.get("TFF_NO_CACHE")
+    try:
+        return _main_impl(argv)
+    finally:
+        if orig_tff_no_cache is None:
+            os.environ.pop("TFF_NO_CACHE", None)
+        else:
+            os.environ["TFF_NO_CACHE"] = orig_tff_no_cache
 
 
 if __name__ == "__main__":
