@@ -542,6 +542,8 @@ def test_normalize_project_roots(tmp_path: Path):
     assert normalize_project_roots([p1, str(p2)]) == [p1.resolve(), p2.resolve()]
 
     # Deduplication and order preservation
+    assert normalize_project_roots([p1, str(p2), p1, str(p1)]) == [p1.resolve(), p2.resolve()]
+
     p1.mkdir(parents=True, exist_ok=True)
     symlink_p1 = tmp_path / "symlink_proj1"
     symlink_p1.symlink_to(p1)
