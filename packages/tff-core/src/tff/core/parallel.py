@@ -16,6 +16,7 @@ from tff.core.ast_cache import (
     is_cache_enabled,
     parse_sql_with_cache,
 )
+from tff.core.model import read_model_sql
 from tff.core.utils.jinja import clean_dataform_for_parsing, clean_jinja_for_parsing
 
 if TYPE_CHECKING:
@@ -104,19 +105,7 @@ def precompute_model_asts(
         if model.is_external or model.is_symbolic:
             continue
 
-        sql = model.query
-        if sql is None:
-            if not model.path:
-                continue
-            path = Path(model.path)
-            target_path = path if path.is_absolute() or not project_root else project_root / path
-            if not target_path.exists():
-                continue
-            try:
-                sql = target_path.read_text(encoding="utf-8")
-            except Exception:
-                continue
-
+        sql = read_model_sql(model, project_root=project_root)
         if not sql or not sql.strip():
             continue
 
@@ -164,6 +153,9 @@ def precompute_model_asts(
             m_name, expr = _worker_parse_model_sql(task)
             if expr is not None and m_name in models:
                 models[m_name].expression = expr
+ 
+ 
+batch_parse_ast_in_parallel = precompute_model_asts
 
 
 def _extract_model_findings(
