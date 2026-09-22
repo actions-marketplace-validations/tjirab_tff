@@ -2,7 +2,7 @@
   <img src="assets/tff.svg" alt="tff logo" width="160">
 </p>
 
-# Architectural Boundaries & DAG Governance
+# Fast, Zero-Warehouse-Cost Architectural Linter & DAG Governance
 
 **Enforce clean boundaries, layer integrity, and logic deduplication for dbt, SQLMesh, and Dataform.**
 
@@ -50,39 +50,48 @@ Run `tff` inside any existing transformation repository without creating any con
 === "dbt"
 
     ```bash
-    # 1. Install adapter
+    # Instant zero-install invocation:
+    uvx --from "tff-core[dbt]" tff check
+
+    # Or install adapter:
     pip install "tff-core[dbt]"
 
-    # 2. Audit existing models for layer violations & duplicate CTEs
+    # Audit existing models for layer violations & duplicate CTEs
     tff check
 
-    # 3. Compute baseline architectural health score (0–100)
+    # Compute baseline architectural health score (0–100)
     tff health
     ```
 
 === "SQLMesh"
 
     ```bash
-    # 1. Install adapter
+    # Instant zero-install invocation:
+    uvx --from "tff-core[sqlmesh]" tff check
+
+    # Or install adapter:
     pip install "tff-core[sqlmesh]"
 
-    # 2. Audit existing models for layer violations & duplicate CTEs
+    # Audit existing models for layer violations & duplicate CTEs
     tff check
 
-    # 3. Compute baseline architectural health score (0–100)
+    # Compute baseline architectural health score (0–100)
     tff health
     ```
 
 === "Dataform"
 
     ```bash
-    # 1. Install adapter
+    # Instant zero-install invocation:
+    uvx --from "tff-core[dataform]" tff check
+
+    # Or install adapter:
     pip install "tff-core[dataform]"
 
-    # 2. Audit existing models for layer violations & duplicate CTEs
+    # Audit existing models for layer violations & duplicate CTEs
     tff check
 
-    # 3. Compute baseline architectural health score (0–100)
+    # Compute baseline architectural health score (0–100)
     tff health
     ```
 

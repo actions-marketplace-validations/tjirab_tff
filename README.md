@@ -7,7 +7,7 @@
 
 # tff
 
-### Architectural boundaries and DAG governance for dbt, SQLMesh, and Dataform.
+### Fast, zero-warehouse-cost architectural linter & health dashboard for dbt, SQLMesh & Dataform.
 **Catch illegal upstream joins, layer violations, and duplicate transformation logic in CI.**
 
 [![PyPI version](https://img.shields.io/pypi/v/tff-core.svg?logo=pypi)](https://pypi.org/project/tff-core/)
@@ -53,15 +53,20 @@ Lint failed — fix errors above before merging.
 Run `tff` inside any existing dbt, SQLMesh, or Dataform repository. **No configuration file required**—`tff` automatically infers standard layer conventions (`staging` → `intermediate` → `core` → `marts`) and immediately audits your DAG:
 
 ```bash
-# 1. Install for your pipeline framework
+# Instant zero-install invocation via uvx:
+uvx --from "tff-core[dbt]" tff check        # for dbt
+# uvx --from "tff-core[sqlmesh]" tff check  # for SQLMesh
+# uvx --from "tff-core[dataform]" tff check # for Dataform
+
+# Or install for your pipeline framework:
 pip install "tff-core[dbt]"        # for dbt (or: uv add "tff-core[dbt]")
 # pip install "tff-core[sqlmesh]"  # for SQLMesh
 # pip install "tff-core[dataform]" # for Dataform
 
-# 2. Catch layer violations, duplicate CTEs, and circular dependencies
+# Catch layer violations, duplicate CTEs, and circular dependencies
 tff check
 
-# 3. Calculate your repository architecture health score (0–100)
+# Calculate your repository architecture health score (0–100)
 tff health
 ```
 
@@ -69,9 +74,11 @@ tff health
 
 ## Why tff?
 
-* 🛡️ **Architectural Boundaries**: Prevent dependency anti-patterns (e.g., marts querying raw staging directly or unauthorized cross-mart coupling).
-* 🔍 **Logic Deduplication**: Automatically detect duplicate complex CTEs across models (Connascence of Algorithm) and flag them for refactoring into upstream shared models.
-* 🚦 **CI/CD Quality Gates**: Built-in GitHub Action (`tjirab/tff@v1`) diffs PR changes against base branches, gates merges on health scores (`--fail-under`), and emits PR annotations.
+* 🛡️ **Layer Boundary Integrity**: Prevent dependency anti-patterns (e.g., marts querying raw staging directly or unauthorized cross-mart coupling).
+* 🔍 **Duplicate CTE Detector**: Automatically detect duplicate complex CTEs across models (Connascence of Algorithm) and flag them for refactoring into upstream shared models.
+* 📊 **Model Health Score**: Calculate objective repository health metrics (0–100) and enforce CI quality gates with `tff health --fail-under 80`.
+* 🚦 **dbt, SQLMesh & Dataform CI Linter**: Built-in GitHub Action (`tjirab/tff@v1`) diffs PR changes against base branches, gates merges on health scores, and emits inline PR annotations.
+* 🛠️ **Automated Fixers**: Auto-fix positional `GROUP BY`/`ORDER BY` clauses and scaffold missing metadata with `tff lint --fix`.
 * 📐 **Multi-Engine Support**: First-class support for **dbt**, **SQLMesh**, and **Google Cloud Dataform**.
 
 ---
