@@ -1,5 +1,111 @@
 # Changelog
 
+## [0.21.0](https://github.com/tjirab/tff/compare/tff-core-v0.20.0...tff-core-v0.21.0) (2026-09-24)
+
+
+### Features
+
+* **ci:** add corpus snapshot regression tests, performance SLA benchmark, rule lifecycle, and false positive template ([#268](https://github.com/tjirab/tff/issues/268)) ([1316cd2](https://github.com/tjirab/tff/commit/1316cd25393d446712f8b93877b1ba536ff00acd))
+* **cli:** support clickable documentation links in terminal reporting with Rich OSC-8 hyperlinks ([#286](https://github.com/tjirab/tff/issues/286)) ([d84571f](https://github.com/tjirab/tff/commit/d84571f2a76cb93df3b3d6d383dfe7e962f9fe5d))
+* **core:** add join_type_parity check for Connascence of Type ([#27](https://github.com/tjirab/tff/issues/27)) ([#275](https://github.com/tjirab/tff/issues/275)) ([36b4149](https://github.com/tjirab/tff/commit/36b4149246479a9ca57db0c665c00655989d6a9c))
+* **core:** add systematic documentation URL references across checks, PR comments, and reports ([#283](https://github.com/tjirab/tff/issues/283)) ([ffab51f](https://github.com/tjirab/tff/commit/ffab51faab8568abc2c87c9bd4d228831206e24d))
+* **health:** support clickable documentation links in project health report breakdown ([#288](https://github.com/tjirab/tff/issues/288)) ([9808832](https://github.com/tjirab/tff/commit/9808832cb3af53da25470fff9baf79e089402c28))
+
+
+### Bug Fixes
+
+* **cov:** refine finding message and include macro resolution guidance ([#282](https://github.com/tjirab/tff/issues/282)) ([f2e48e3](https://github.com/tjirab/tff/commit/f2e48e333ff2fda31ac33113dd9e2a9117355905))
+
+## [0.20.0](https://github.com/tjirab/tff/compare/tff-core-v0.19.0...tff-core-v0.20.0) (2026-09-18)
+
+
+### Features
+
+* **cli:** human-readable error diagnostics and top-level exception boundary ([#247](https://github.com/tjirab/tff/issues/247)) ([#251](https://github.com/tjirab/tff/issues/251)) ([b206206](https://github.com/tjirab/tff/commit/b206206b5259b7ba6c559f124b8753bd00a6e83b))
+* **core:** introduce structured exception hierarchy and OS error translator ([#246](https://github.com/tjirab/tff/issues/246)) ([#249](https://github.com/tjirab/tff/issues/249)) ([64c992c](https://github.com/tjirab/tff/commit/64c992c80098749e0277e0ea3dd4d91914842a0e))
+* **core:** isolate per-model rule execution errors with contextual diagnostics ([#248](https://github.com/tjirab/tff/issues/248)) ([#254](https://github.com/tjirab/tff/issues/254)) ([c423e09](https://github.com/tjirab/tff/commit/c423e09322b3dd5e85efedc85a5fed1bcc7e0999))
+
+
+### Bug Fixes
+
+* **dbt:** handle empty original_file_path and avoid EISDIR in environment_agnostic_references ([#236](https://github.com/tjirab/tff/issues/236)) ([0e94c31](https://github.com/tjirab/tff/commit/0e94c3176ff818ad53af1a3f06fc4b6c2791e54f))
+
+
+### Performance Improvements
+
+* **parallel:** optimize executor task chunking for large model repositories ([#256](https://github.com/tjirab/tff/issues/256)) ([#258](https://github.com/tjirab/tff/issues/258)) ([68b8b0d](https://github.com/tjirab/tff/commit/68b8b0d95e0ea2beff2c2b008b8ea6c38b48cf30))
+
+## [0.19.0](https://github.com/tjirab/tff/compare/tff-core-v0.18.0...tff-core-v0.19.0) (2026-09-17)
+
+
+### Features
+
+* **cli:** support multi-project flags (-p / --project) in docs and stats commands ([#225](https://github.com/tjirab/tff/issues/225)) ([#229](https://github.com/tjirab/tff/issues/229)) ([d00577a](https://github.com/tjirab/tff/commit/d00577af7c4a006610c609a60bfb901385398845))
+* **docs:** add VHS terminal demo GIFs and check CLI alias ([#232](https://github.com/tjirab/tff/issues/232)) ([8828dd7](https://github.com/tjirab/tff/commit/8828dd757a6b9447ed4e7a5866bbcafd5e00c9a9))
+* **sqlmesh:** support multi-repo projects and repeatable CLI project flags ([#223](https://github.com/tjirab/tff/issues/223)) ([29dc5ed](https://github.com/tjirab/tff/commit/29dc5ed4dec9b569ba693ffd587f0fa3745ba330))
+
+
+### Performance Improvements
+
+* **core:** deduplicate project roots in normalize_project_roots ([#228](https://github.com/tjirab/tff/issues/228)) ([3b21faf](https://github.com/tjirab/tff/commit/3b21faf28afbbd6d470e1e01c271eb5b957a3bbf))
+
+## [0.18.0](https://github.com/tjirab/tff/compare/tff-core-v0.17.0...tff-core-v0.18.0) (2026-09-17)
+
+
+### Features
+
+* **branding:** refactor TFF to lowercase tff and update info logo ([#219](https://github.com/tjirab/tff/issues/219)) ([ce2f975](https://github.com/tjirab/tff/commit/ce2f975857f6dfec81769aa9abf108acc96b3262))
+
+## [0.17.0](https://github.com/tjirab/tff/compare/tff-core-v0.16.1...tff-core-v0.17.0) (2026-09-16)
+
+
+### Features
+
+* **autofix:** [1/5] Close Dataform metadata auto-fix parity gap ([#212](https://github.com/tjirab/tff/issues/212)) ([2a29f84](https://github.com/tjirab/tff/commit/2a29f84afbb270ee80c4b45ca9582e9a79bfbb86))
+* **autofix:** refactor nested subqueries in final SELECT to named CTEs ([#216](https://github.com/tjirab/tff/issues/216)) ([2da4f59](https://github.com/tjirab/tff/commit/2da4f59fd600f561dc52f5a6935709675ae13d43))
+
+## [0.16.1](https://github.com/tjirab/tff/compare/tff-core-v0.16.0...tff-core-v0.16.1) (2026-09-15)
+
+
+### Bug Fixes
+
+* **core:** resolve get_ast_cache_dir to ast subdirectory when directory exists ([#189](https://github.com/tjirab/tff/issues/189)) ([#209](https://github.com/tjirab/tff/issues/209)) ([c3ded50](https://github.com/tjirab/tff/commit/c3ded5034fe9d4922967edbdd146ab78b0d8855d))
+* **core:** respect TFF_NO_CACHE in parse_sql_with_cache ([#188](https://github.com/tjirab/tff/issues/188)) ([#207](https://github.com/tjirab/tff/issues/207)) ([78d9410](https://github.com/tjirab/tff/commit/78d941077a035aceacee3dfb1020c8c1d625263e))
+* **cov:** preserve literals containing '@' and skip SQLMesh macro cleanup in dbt ([#175](https://github.com/tjirab/tff/issues/175)) ([#204](https://github.com/tjirab/tff/issues/204)) ([b4934ca](https://github.com/tjirab/tff/commit/b4934ca6140dfd4ebb41fd8f479ffec39f7a8baa))
+
+## [0.16.0](https://github.com/tjirab/tff/compare/tff-core-v0.15.1...tff-core-v0.16.0) (2026-09-15)
+
+
+### Features
+
+* **rules:** deprecate and remove warn_only in sql_complexity ([#202](https://github.com/tjirab/tff/issues/202)) ([779e574](https://github.com/tjirab/tff/commit/779e57432d120b0a863529df400f7a676a10d9fa))
+
+## [0.15.1](https://github.com/tjirab/tff/compare/tff-core-v0.15.0...tff-core-v0.15.1) (2026-09-15)
+
+
+### Bug Fixes
+
+* **rules:** resolve warning vs error severity mismatch in sql_complexity ([#198](https://github.com/tjirab/tff/issues/198)) ([f6f20f4](https://github.com/tjirab/tff/commit/f6f20f44e4cde39e67a027feb35d4d52bd50ca76))
+
+## [0.15.0](https://github.com/tjirab/tff/compare/tff-core-v0.14.0...tff-core-v0.15.0) (2026-09-13)
+
+
+### Features
+
+* **cli:** add --debug flag and verbose logging for under-the-hood inspection ([#191](https://github.com/tjirab/tff/issues/191)) ([8ab1004](https://github.com/tjirab/tff/commit/8ab100474364e86ff13302b9c7e0aa22c0cd71ec))
+
+
+### Performance Improvements
+
+* **core:** parallelize AST traversal and duplicate CTE fingerprinting ([#161](https://github.com/tjirab/tff/issues/161)) ([#187](https://github.com/tjirab/tff/issues/187)) ([83c5ab6](https://github.com/tjirab/tff/commit/83c5ab6924621747d22644b2b3507aba0d2c80f7))
+
+## [0.14.0](https://github.com/tjirab/tff/compare/tff-core-v0.13.0...tff-core-v0.14.0) (2026-09-13)
+
+
+### Features
+
+* **plugins:** support custom fitness rules and third-party adapters via entry points ([#160](https://github.com/tjirab/tff/issues/160)) ([#185](https://github.com/tjirab/tff/issues/185)) ([56304bf](https://github.com/tjirab/tff/commit/56304bf0b3043e62e10b02e25d401c780e785019))
+
 ## [0.13.0](https://github.com/tjirab/tff/compare/tff-core-v0.12.1...tff-core-v0.13.0) (2026-09-11)
 
 

@@ -60,19 +60,21 @@ def parse_model_block_args(block_text: str) -> list[tuple[str, str]]:
     return parsed_pairs
 
 
-def fix_positional_clauses(sql: str, dialect: str) -> str:
-    """Rewrite positional GROUP BY and ORDER BY integers to explicit columns."""
+def _resolve_dialect(dialect: str) -> str | None:
+    """Resolve and validate a dialect string for sqlglot."""
     from sqlglot.dialects.dialect import Dialect
 
-    resolved_dialect = None
     if dialect:
         try:
             Dialect.get_or_raise(dialect)
-            resolved_dialect = dialect
+            return dialect
         except ValueError:
             pass
+    return None
 
-    # 1. Extract the SQLMesh MODEL or Dataform config block if present
+
+def _extract_model_or_config_block(sql: str) -> tuple[str, str]:
+    """Extract SQLMesh MODEL or Dataform config block if present, returning (block, query_part)."""
     model_block_match = re.match(
         r"^\s*(MODEL\s*\(.*?\)\s*;)", sql, flags=re.DOTALL | re.IGNORECASE
     )
@@ -112,26 +114,49 @@ def fix_positional_clauses(sql: str, dialect: str) -> str:
     else:
         model_block = ""
         query_part = sql
+    return model_block, query_part
 
-    # 2. Extract macros/Jinja to placeholders to prevent parsing errors
-    patterns = [
-        r"\{#.*?#\}",
-        r"\{\{.*?\}\}",
-        r"\{%.*?%\}",
-        r"@\w+\([^)]*\)",
-        r"@\w+",
-        r"\$\{.*?\}",
-    ]
-    combined_pattern = re.compile("|".join(patterns), re.DOTALL)
-    placeholders = {}
 
-    def repl(match):
+_MACRO_PATTERNS = [
+    r"\{#.*?#\}",
+    r"\{\{.*?\}\}",
+    r"\{%.*?%\}",
+    r"@\w+\([^)]*\)",
+    r"@\w+",
+    r"\$\{.*?\}",
+]
+_MACRO_COMBINED_PATTERN = re.compile("|".join(_MACRO_PATTERNS), re.DOTALL)
+
+
+def _mask_macros(query: str) -> tuple[str, dict[str, str]]:
+    """Replace macros/Jinja with unique placeholder tokens to prevent SQL parsing errors."""
+    placeholders: dict[str, str] = {}
+
+    def repl(match: re.Match) -> str:
         idx = len(placeholders)
         ph = f"__TFF_MACRO_PH_{idx}__"
         placeholders[ph] = match.group(0)
         return ph
 
-    temp_query = combined_pattern.sub(repl, query_part)
+    return _MACRO_COMBINED_PATTERN.sub(repl, query), placeholders
+
+
+def _unmask_macros(query: str, placeholders: dict[str, str]) -> str:
+    """Restore macro/Jinja placeholders back to their original strings."""
+    for ph, orig in placeholders.items():
+        query = query.replace(ph, orig)
+    return query
+
+
+def fix_positional_clauses(sql: str, dialect: str) -> str:
+    """Rewrite positional GROUP BY and ORDER BY integers to explicit columns."""
+    resolved_dialect = _resolve_dialect(dialect)
+
+    # 1. Extract the SQLMesh MODEL or Dataform config block if present
+    model_block, query_part = _extract_model_or_config_block(sql)
+
+    # 2. Extract macros/Jinja to placeholders to prevent parsing errors
+    temp_query, placeholders = _mask_macros(query_part)
 
     # 3. Parse with sqlglot
     try:
@@ -182,8 +207,107 @@ def fix_positional_clauses(sql: str, dialect: str) -> str:
 
     # 5. Format back and restore placeholders
     modified_query = parsed.sql(dialect=resolved_dialect)
-    for ph, orig in placeholders.items():
-        modified_query = modified_query.replace(ph, orig)
+    modified_query = _unmask_macros(modified_query, placeholders)
+
+    if model_block:
+        return model_block + "\n\n" + modified_query
+    return modified_query
+
+
+def lift_nested_subqueries(sql: str, dialect: str) -> str:
+    """Refactor nested subqueries in FROM and JOIN clauses of the final SELECT into named CTEs."""
+    resolved_dialect = _resolve_dialect(dialect)
+    model_block, query_part = _extract_model_or_config_block(sql)
+    temp_query, placeholders = _mask_macros(query_part)
+
+    try:
+        parsed = sqlglot.parse_one(temp_query, read=resolved_dialect)
+    except Exception:
+        return sql
+
+    final_select = parsed.this if isinstance(parsed, exp.With) else parsed
+    if not isinstance(final_select, exp.Select):
+        return sql
+
+    from_clause = final_select.args.get("from_") or final_select.args.get("from")
+    joins = final_select.args.get("joins") or []
+
+    subqueries_to_lift: list[exp.Subquery] = []
+    if (
+        from_clause
+        and isinstance(from_clause.this, exp.Subquery)
+        and isinstance(from_clause.this.this, exp.Query)
+    ):
+        subqueries_to_lift.append(from_clause.this)
+
+    for join in joins:
+        if isinstance(join.this, exp.Subquery) and isinstance(
+            join.this.this, exp.Query
+        ):
+            subqueries_to_lift.append(join.this)
+
+    if not subqueries_to_lift:
+        return sql
+
+    with_clause = (
+        parsed
+        if isinstance(parsed, exp.With)
+        else (final_select.args.get("with_") or final_select.args.get("with"))
+    )
+    existing_cte_names: set[str] = set()
+    if with_clause:
+        for cte in with_clause.expressions:
+            if cte.alias:
+                existing_cte_names.add(cte.alias.lower())
+
+    new_ctes: list[exp.CTE] = []
+    extracted_counter = 1
+
+    for sub in subqueries_to_lift:
+        orig_alias = sub.alias
+        if not orig_alias:
+            while f"__extracted_cte_{extracted_counter}".lower() in existing_cte_names:
+                extracted_counter += 1
+            alias = f"__extracted_cte_{extracted_counter}"
+            extracted_counter += 1
+        elif orig_alias.lower() in existing_cte_names:
+            base = orig_alias
+            idx = 1
+            while f"{base}_{idx}".lower() in existing_cte_names:
+                idx += 1
+            alias = f"{base}_{idx}"
+        else:
+            alias = orig_alias
+
+        existing_cte_names.add(alias.lower())
+
+        alias_node = sub.args.get("alias")
+        if alias_node and alias_node.this and alias_node.name == alias:
+            cte_alias = alias_node.copy()
+        else:
+            cte_alias = exp.TableAlias(this=exp.to_identifier(alias))
+
+        cte = exp.CTE(this=sub.this.copy(), alias=cte_alias)
+        new_ctes.append(cte)
+
+        if orig_alias and alias != orig_alias:
+            table_node = exp.Table(
+                this=exp.to_identifier(alias),
+                alias=exp.TableAlias(this=exp.to_identifier(orig_alias)),
+            )
+        else:
+            table_node = exp.Table(this=exp.to_identifier(alias))
+
+        sub.replace(table_node)
+
+    if with_clause:
+        for cte in new_ctes:
+            with_clause.append("expressions", cte)
+    else:
+        final_select.set("with_", exp.With(expressions=new_ctes))
+
+    modified_query = parsed.sql(dialect=resolved_dialect)
+    modified_query = _unmask_macros(modified_query, placeholders)
 
     if model_block:
         return model_block + "\n\n" + modified_query
@@ -334,25 +458,295 @@ def fix_dbt_metadata(
         return f"Failed to write/scaffold schema.yml in {abs_path.parent}: {e}"
 
 
+def _find_matching_brace(text: str, open_brace_idx: int) -> int:
+    """Find the index of the matching closing brace '}' for the open brace at open_brace_idx."""
+    if open_brace_idx < 0 or open_brace_idx >= len(text) or text[open_brace_idx] != "{":
+        return -1
+    depth = 0
+    in_quote = None
+    i = open_brace_idx
+    length = len(text)
+    while i < length:
+        ch = text[i]
+        if in_quote:
+            if ch == "\\" and i + 1 < length:
+                i += 2
+                continue
+            if ch == in_quote:
+                in_quote = None
+        elif ch in ('"', "'", "`"):
+            in_quote = ch
+        elif ch == "/" and i + 1 < length and text[i + 1] == "/":
+            nl = text.find("\n", i)
+            if nl == -1:
+                break
+            i = nl
+            continue
+        elif ch == "/" and i + 1 < length and text[i + 1] == "*":
+            end_c = text.find("*/", i + 2)
+            if end_c == -1:
+                break
+            i = end_c + 2
+            continue
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def fix_dataform_metadata(
+    abs_path: Path,
+    missing_owner: bool,
+    missing_description: bool,
+    model_name: str | None = None,
+) -> str | None:
+    """Scaffold or update metadata fields (owner, description) in a Dataform .sqlx file."""
+    if not missing_owner and not missing_description:
+        return None
+
+    if abs_path.suffix not in (".sqlx", ".sql") or not abs_path.exists() or abs_path.is_dir():
+        return None
+
+    try:
+        content = abs_path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+    # Check for existing config { ... } block
+    match = re.search(r"^\s*config\s*\{", content, re.MULTILINE | re.IGNORECASE)
+    if not match:
+        match = re.search(r"\bconfig\s*\{", content, re.IGNORECASE)
+
+    if not match:
+        # Scaffold a minimal config block header
+        scaffold_lines = ["config {", '  type: "view",']
+        if missing_description and missing_owner:
+            scaffold_lines.append('  description: "TODO: Add description",')
+            scaffold_lines.append("  bigquery: {")
+            scaffold_lines.append("    labels: {")
+            scaffold_lines.append('      owner: "TODO: Add owner"')
+            scaffold_lines.append("    }")
+            scaffold_lines.append("  }")
+        elif missing_description:
+            scaffold_lines.append('  description: "TODO: Add description"')
+        elif missing_owner:
+            scaffold_lines.append("  bigquery: {")
+            scaffold_lines.append("    labels: {")
+            scaffold_lines.append('      owner: "TODO: Add owner"')
+            scaffold_lines.append("    }")
+            scaffold_lines.append("  }")
+        scaffold_lines.append("}")
+        scaffold_str = "\n".join(scaffold_lines)
+
+        stripped = content.strip()
+        if stripped:
+            new_content = scaffold_str + "\n\n" + stripped + "\n"
+        else:
+            new_content = scaffold_str + "\n"
+
+        try:
+            abs_path.write_text(new_content, encoding="utf-8")
+            return f"Scaffolded config block in {abs_path.name}"
+        except Exception as e:
+            return f"Failed to write Dataform metadata for {abs_path.name}: {e}"
+
+    # Existing config block found
+    brace_start = match.end() - 1
+    brace_end = _find_matching_brace(content, brace_start)
+    if brace_end == -1:
+        return None
+
+    config_str = content[brace_start : brace_end + 1]
+
+    # Parse what is currently configured
+    from tff.dataform.manifest import _parse_sqlx_config
+
+    parsed, _ = _parse_sqlx_config(content)
+
+    has_desc = bool(parsed.get("description")) if isinstance(parsed, dict) else False
+    if not has_desc:
+        has_desc = bool(
+            re.search(r'\bdescription\s*:\s*(["\'])(?!\1).+?\1', config_str)
+        )
+
+    has_owner = False
+    if isinstance(parsed, dict):
+        meta = parsed.get("bigquery", {}) or {}
+        has_owner = bool(
+            meta.get("labels", {}).get("owner")
+            or meta.get("owner")
+            or parsed.get("owner")
+        )
+    if not has_owner:
+        has_owner = bool(
+            re.search(r'\bowner\s*:\s*(["\'])(?!\1).+?\1', config_str)
+        )
+
+    need_desc = missing_description and not has_desc
+    need_owner = missing_owner and not has_owner
+
+    if not need_desc and not need_owner:
+        return None
+
+    # Handle empty string values if already present
+    modified_config = config_str
+    if need_desc and re.search(r'\bdescription\s*:\s*(["\'])\s*\1', modified_config):
+        modified_config = re.sub(
+            r'(\bdescription\s*:\s*)(["\'])\s*\2',
+            r'\1"TODO: Add description"',
+            modified_config,
+            count=1,
+        )
+        need_desc = False
+
+    if need_owner and re.search(r'\bowner\s*:\s*(["\'])\s*\1', modified_config):
+        modified_config = re.sub(
+            r'(\bowner\s*:\s*)(["\'])\s*\2',
+            r'\1"TODO: Add owner"',
+            modified_config,
+            count=1,
+        )
+        need_owner = False
+
+    if not need_desc and not need_owner:
+        new_content = content[:brace_start] + modified_config + content[brace_end + 1 :]
+        try:
+            abs_path.write_text(new_content, encoding="utf-8")
+            return f"Added missing metadata to config block in {abs_path.name}"
+        except Exception as e:
+            return f"Failed to write Dataform metadata for {abs_path.name}: {e}"
+
+    # Determine indentation
+    indent = "  "
+    for line in modified_config.splitlines()[1:]:
+        m = re.match(r"^(\s+)\S", line)
+        if m:
+            indent = m.group(1)
+            break
+
+    # If owner needed, check if bigquery: { ... } already exists
+    bq_match = re.search(r"\bbigquery\s*:\s*\{", modified_config)
+    if need_owner and bq_match:
+        bq_brace_start = bq_match.end() - 1
+        bq_brace_end = _find_matching_brace(modified_config, bq_brace_start)
+        if bq_brace_end != -1:
+            bq_inner = modified_config[bq_brace_start : bq_brace_end + 1]
+            labels_match = re.search(r"\blabels\s*:\s*\{", bq_inner)
+            if labels_match:
+                lbl_brace_start = bq_brace_start + labels_match.end() - 1
+                lbl_brace_end = _find_matching_brace(modified_config, lbl_brace_start)
+                if lbl_brace_end != -1:
+                    lbl_nl = modified_config.find("\n", lbl_brace_start, lbl_brace_end)
+                    if lbl_nl != -1:
+                        insert_at = lbl_nl + 1
+                        injection = f'{indent * 3}owner: "TODO: Add owner",\n'
+                    else:
+                        insert_at = lbl_brace_start + 1
+                        injection = ' owner: "TODO: Add owner", '
+                    modified_config = (
+                        modified_config[:insert_at]
+                        + injection
+                        + modified_config[insert_at:]
+                    )
+                    need_owner = False
+            else:
+                bq_nl = modified_config.find("\n", bq_brace_start, bq_brace_end)
+                if bq_nl != -1:
+                    insert_at = bq_nl + 1
+                    injection = (
+                        f"{indent * 2}labels: {{\n"
+                        f'{indent * 3}owner: "TODO: Add owner"\n'
+                        f"{indent * 2}}},\n"
+                    )
+                else:
+                    insert_at = bq_brace_start + 1
+                    injection = ' labels: { owner: "TODO: Add owner" }, '
+                modified_config = (
+                    modified_config[:insert_at]
+                    + injection
+                    + modified_config[insert_at:]
+                )
+                need_owner = False
+
+    fields_to_inject = []
+    if need_desc:
+        fields_to_inject.append(f'{indent}description: "TODO: Add description",\n')
+    if need_owner:
+        fields_to_inject.append(
+            f"{indent}bigquery: {{\n"
+            f"{indent * 2}labels: {{\n"
+            f'{indent * 3}owner: "TODO: Add owner"\n'
+            f"{indent * 2}}}\n"
+            f"{indent}}},\n"
+        )
+
+    if fields_to_inject:
+        nl_idx = modified_config.find("\n")
+        inner_content = modified_config[1:-1].strip()
+        if not inner_content:
+            cleaned_injection = "".join(fields_to_inject).rstrip()
+            if cleaned_injection.endswith(","):
+                cleaned_injection = cleaned_injection[:-1]
+            modified_config = "{\n" + cleaned_injection + "\n}"
+        elif nl_idx != -1:
+            insert_at = nl_idx + 1
+            modified_config = (
+                modified_config[:insert_at]
+                + "".join(fields_to_inject)
+                + modified_config[insert_at:]
+            )
+        else:
+            modified_config = (
+                "{\n"
+                + "".join(fields_to_inject)
+                + indent
+                + modified_config[1:-1].strip()
+                + "\n}"
+            )
+
+    new_content = content[:brace_start] + modified_config + content[brace_end + 1 :]
+    try:
+        abs_path.write_text(new_content, encoding="utf-8")
+        return f"Added missing metadata to config block in {abs_path.name}"
+    except Exception as e:
+        return f"Failed to write Dataform metadata for {abs_path.name}: {e}"
+
+
+
 def apply_autofixes(
-    project_root: Path,
+    project_root: Path | Sequence[Path],
     provider: str | PipelineAdapter,
     findings: list[LintFinding],
     models: dict[str, ModelRepresentation],
 ) -> list[str]:
     """Identify auto-fixable violations from findings and apply modifications to source files."""
-    from tff.core.adapter import get_adapter
+    from tff.core.adapter import get_adapter, normalize_project_roots
 
     if isinstance(provider, str):
         adapter = get_adapter(provider)
     else:
         adapter = provider
 
+    roots = normalize_project_roots(project_root)
+
     # Group findings by file path
     grouped = defaultdict(list)
     for f in findings:
         if f.path:
-            abs_path = (project_root / f.path).resolve()
+            p = Path(f.path)
+            if p.is_absolute():
+                abs_path = p.resolve()
+            else:
+                abs_path = (roots[0] / f.path).resolve()
+                for r in roots:
+                    cand = (r / f.path).resolve()
+                    if cand.exists():
+                        abs_path = cand
+                        break
             grouped[abs_path].append(f)
 
     applied_logs = []
@@ -386,7 +780,34 @@ def apply_autofixes(
                     f"Failed to fix positional references in {abs_path.name}: {e}"
                 )
 
-        # 2. Fix metadata issues (owner, description)
+        # 2. Fix nested subqueries in final SELECT
+        subquery_findings = [
+            f
+            for f in file_findings
+            if f.check == "sqlcomplexity"
+            and "nested subquery in final SELECT" in f.message
+        ]
+        if subquery_findings and abs_path.suffix in (".sql", ".sqlx"):
+            dialect = "ansi"
+            for model in models.values():
+                if Path(model.path).resolve() == abs_path:
+                    dialect = model.dialect
+                    break
+
+            try:
+                sql = abs_path.read_text(encoding="utf-8")
+                fixed_sql = lift_nested_subqueries(sql, dialect)
+                if fixed_sql != sql:
+                    abs_path.write_text(fixed_sql, encoding="utf-8")
+                    applied_logs.append(
+                        f"Refactored nested subqueries in final SELECT to CTEs in {abs_path.name}"
+                    )
+            except Exception as e:
+                applied_logs.append(
+                    f"Failed to refactor nested subqueries in {abs_path.name}: {e}"
+                )
+
+        # 3. Fix metadata issues (owner, description)
         missing_owner = any(f.check == "nomissingowner" for f in file_findings)
         missing_description = any(
             f.check == "nomissingdescription" for f in file_findings
@@ -395,8 +816,16 @@ def apply_autofixes(
         if missing_owner or missing_description:
             model_name = file_findings[0].model
             if model_name:
+                matching_root = roots[0]
+                for r in roots:
+                    try:
+                        abs_path.relative_to(r)
+                        matching_root = r
+                        break
+                    except ValueError:
+                        pass
                 log = adapter.apply_metadata_fix(
-                    project_root=project_root,
+                    project_root=matching_root,
                     abs_path=abs_path,
                     model_name=model_name,
                     missing_owner=missing_owner,

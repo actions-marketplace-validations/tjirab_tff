@@ -563,6 +563,65 @@ def test_cli_autofix_with_dataform(tmp_path: Path):
     assert "GROUP BY id" in fixed_content or "GROUP BY 1" in fixed_content
 
 
+def test_cli_autofix_metadata_with_dataform(tmp_path: Path):
+    (tmp_path / "workflow_settings.yaml").write_text("defaultProject: p\n", encoding="utf-8")
+    definitions_dir = tmp_path / "definitions"
+    definitions_dir.mkdir(parents=True, exist_ok=True)
+    sqlx = """config {
+  type: 'view',
+  assertions: { uniqueKey: ['id'], nonNull: ['id'] }
+}
+SELECT 1 AS id
+"""
+    file_path = definitions_dir / "stg_orders.sqlx"
+    file_path.write_text(sqlx, encoding="utf-8")
+
+    # Run lint with --fix
+    exit_code = main(["lint", "--project", str(tmp_path), "--provider", "dataform", "--fix"])
+    assert exit_code == 0
+
+    # Verify metadata added
+    fixed_content = file_path.read_text(encoding="utf-8")
+    assert 'description: "TODO: Add description"' in fixed_content
+    assert 'owner: "TODO: Add owner"' in fixed_content
+
+    # Re-running lint reports 0 findings
+    exit_code_after = main(["lint", "--project", str(tmp_path), "--provider", "dataform"])
+    assert exit_code_after == 0
+
+
+def test_cli_autofix_metadata_no_config_with_dataform(tmp_path: Path):
+    (tmp_path / "workflow_settings.yaml").write_text("defaultProject: p\n", encoding="utf-8")
+    (tmp_path / "fitness_functions.yaml").write_text("""
+rules:
+  metadata:
+    owner: true
+    description: true
+    grain: false
+    not_null: false
+    unique_values: false
+""", encoding="utf-8")
+    definitions_dir = tmp_path / "definitions"
+    definitions_dir.mkdir(parents=True, exist_ok=True)
+    sqlx = "SELECT 1 AS id\n"
+    file_path = definitions_dir / "stg_raw.sqlx"
+    file_path.write_text(sqlx, encoding="utf-8")
+
+    # Run lint with --fix
+    exit_code = main(["lint", "--project", str(tmp_path), "--provider", "dataform", "--fix"])
+    assert exit_code == 0
+
+    # Verify config block scaffolded
+    fixed_content = file_path.read_text(encoding="utf-8")
+    assert 'description: "TODO: Add description"' in fixed_content
+    assert 'owner: "TODO: Add owner"' in fixed_content
+    assert "SELECT 1 AS id" in fixed_content
+
+    # Re-running lint reports 0 findings
+    exit_code_after = main(["lint", "--project", str(tmp_path), "--provider", "dataform"])
+    assert exit_code_after == 0
+
+
 def test_clean_dataform_edge_cases():
     # Unclosed brace should return text safely
     unclosed = "config { type: 'view' "
@@ -810,10 +869,12 @@ def test_load_models_from_sources_unreadable_and_odd_grains(tmp_path: Path):
 
 
 def test_load_dataform_models_manifest_exception(tmp_path: Path):
+    from tff.core.exceptions import TffManifestError
+
     bad_manifest = tmp_path / "corrupt.json"
     bad_manifest.write_text("invalid json", encoding="utf-8")
 
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises((json.JSONDecodeError, TffManifestError)):
         load_dataform_models(tmp_path, manifest_path=bad_manifest)
 
 
@@ -835,6 +896,26 @@ def test_load_dataform_models_cli_compilation_success_and_failure(tmp_path: Path
     with patch("tff.dataform.manifest._compile_via_cli", return_value=invalid_cli_output):
         models_fallback = load_dataform_models(tmp_path)
         assert isinstance(models_fallback, dict)
+
+
+def test_dataform_run_all_checks_with_no_cache(tmp_path: Path):
+    from tff.core.config import FitnessFunctionsConfig
+    from tff.dataform.runner import run_all_checks
+
+    definitions_dir = tmp_path / "definitions"
+    definitions_dir.mkdir(parents=True, exist_ok=True)
+    sqlx = """
+    config {
+      type: 'view'
+    }
+    SELECT 1 AS val
+    """
+    (definitions_dir / "m1.sqlx").write_text(sqlx, encoding="utf-8")
+
+    config = FitnessFunctionsConfig(cache_ast=False)
+    findings, checked, _ = run_all_checks(project_root=tmp_path, config=config)
+    assert checked == 1
+    assert not (tmp_path / ".tff_cache").exists()
 
 
 

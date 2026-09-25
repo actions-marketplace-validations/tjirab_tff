@@ -382,3 +382,271 @@ def test_cli_info_adapter_error(tmp_path: Path):
 
 def test_cli_get_adapter():
     assert isinstance(_get_adapter("dbt"), DBTAdapter)
+
+
+def test_register_adapter_variations():
+    from tff.core.adapter import _REGISTERED_ADAPTERS, register_adapter
+
+    # 1. Register class
+    register_adapter("dummy_cls", ConcreteDummyAdapter)
+    assert isinstance(get_adapter("dummy_cls"), ConcreteDummyAdapter)
+
+    # 2. Register instance
+    dummy_inst = ConcreteDummyAdapter()
+    register_adapter("dummy_inst", dummy_inst)
+    assert get_adapter("dummy_inst") is dummy_inst
+
+    # 3. Register factory
+    register_adapter("dummy_factory", lambda: ConcreteDummyAdapter())
+    assert isinstance(get_adapter("dummy_factory"), ConcreteDummyAdapter)
+
+    # 4. Invalid factory returning non-adapter
+    register_adapter("bad_factory", lambda: "not_an_adapter")
+    with pytest.raises(TypeError, match="did not return a PipelineAdapter instance"):
+        get_adapter("bad_factory")
+
+    _REGISTERED_ADAPTERS.pop("dummy_cls", None)
+    _REGISTERED_ADAPTERS.pop("dummy_inst", None)
+    _REGISTERED_ADAPTERS.pop("dummy_factory", None)
+    _REGISTERED_ADAPTERS.pop("bad_factory", None)
+
+
+def test_adapter_entry_points_loading():
+    from tff.core.adapter import _load_adapter_from_entry_point
+
+    # 1. Class
+    ep_cls = MagicMock()
+    ep_cls.name = "ep_cls"
+    ep_cls.load.return_value = ConcreteDummyAdapter
+
+    # 2. Instance
+    ep_inst = MagicMock()
+    ep_inst.name = "ep_inst"
+    ep_inst.load.return_value = ConcreteDummyAdapter()
+
+    # 3. Factory
+    ep_factory = MagicMock()
+    ep_factory.name = "ep_factory"
+    ep_factory.load.return_value = lambda: ConcreteDummyAdapter()
+
+    # 4. Invalid type
+    ep_bad = MagicMock()
+    ep_bad.name = "ep_bad"
+    ep_bad.load.return_value = 12345
+
+    # 5. Load error
+    ep_err = MagicMock()
+    ep_err.name = "ep_err"
+    ep_err.load.side_effect = RuntimeError("Crash on import")
+
+    with patch(
+        "importlib.metadata.entry_points",
+        return_value=[ep_cls, ep_inst, ep_factory, ep_bad, ep_err],
+    ):
+        # Successful loads
+        assert isinstance(get_adapter("ep_cls"), ConcreteDummyAdapter)
+        assert isinstance(get_adapter("ep_inst"), ConcreteDummyAdapter)
+        assert isinstance(get_adapter("ep_factory"), ConcreteDummyAdapter)
+
+        # Invalid type
+        with pytest.raises(TypeError, match="did not resolve to a PipelineAdapter"):
+            get_adapter("ep_bad")
+
+        # Load error
+        with pytest.raises(ImportError, match="Failed to load adapter plugin 'ep_err'"):
+            get_adapter("ep_err")
+
+        # Not found in entry points
+        assert _load_adapter_from_entry_point("nonexistent_ep") is None
+
+    # Entry point discovery exception
+    with patch("importlib.metadata.entry_points", side_effect=Exception("Metadata fail")):
+        assert _load_adapter_from_entry_point("ep_cls") is None
+
+
+def test_get_available_providers():
+    from tff.core.adapter import _REGISTERED_ADAPTERS, get_available_providers, register_adapter
+
+    register_adapter("custom_prov_1", ConcreteDummyAdapter)
+    ep_prov = MagicMock()
+    ep_prov.name = "ep_prov_2"
+
+    with patch("importlib.metadata.entry_points", return_value=[ep_prov]):
+        provs = get_available_providers()
+        assert "dbt" in provs
+        assert "sqlmesh" in provs
+        assert "dataform" in provs
+        assert "custom_prov_1" in provs
+        assert "ep_prov_2" in provs
+
+    # Metadata error handled gracefully
+    with patch("importlib.metadata.entry_points", side_effect=Exception("EP error")):
+        provs = get_available_providers()
+        assert "dbt" in provs
+
+    _REGISTERED_ADAPTERS.pop("custom_prov_1", None)
+
+
+def test_detect_provider_with_custom_adapter(tmp_path: Path):
+    from tff.core.adapter import _REGISTERED_ADAPTERS, register_adapter
+
+    class CustomProjectAdapter(ConcreteDummyAdapter):
+        @property
+        def provider_name(self) -> str:
+            return "custom_proj"
+
+        def is_applicable(self, project_root: Path) -> bool:
+            return (project_root / "custom_proj.yml").exists()
+
+    register_adapter("custom_proj", CustomProjectAdapter)
+    assert get_adapter("custom_proj").provider_name == "custom_proj"
+    try:
+        # Detects custom project
+        (tmp_path / "custom_proj.yml").touch()
+        assert detect_provider(tmp_path) == "custom_proj"
+
+        # Multiple detected: dbt and custom_proj
+        (tmp_path / "dbt_project.yml").touch()
+        with pytest.raises(ValueError, match="Multiple pipeline configuration files were detected"):
+            detect_provider(tmp_path)
+
+        # Clean up files
+        (tmp_path / "custom_proj.yml").unlink()
+        (tmp_path / "dbt_project.yml").unlink()
+
+        # Exception in is_applicable ignored gracefully
+        class CrashingAdapter(ConcreteDummyAdapter):
+            def is_applicable(self, project_root: Path) -> bool:
+                raise RuntimeError("Crash in is_applicable")
+
+        register_adapter("crashing_adapter", CrashingAdapter)
+        with pytest.raises(ValueError, match="Could not detect project type"):
+            detect_provider(tmp_path)
+        _REGISTERED_ADAPTERS.pop("crashing_adapter", None)
+    finally:
+        _REGISTERED_ADAPTERS.pop("custom_proj", None)
+
+
+def test_normalize_project_roots(tmp_path: Path):
+    from tff.core.adapter import normalize_project_roots
+
+    # Single Path
+    p1 = tmp_path / "proj1"
+    assert normalize_project_roots(p1) == [p1.resolve()]
+
+    # Single str
+    assert normalize_project_roots(str(p1)) == [p1.resolve()]
+
+    # Sequence of Path and str
+    p2 = tmp_path / "proj2"
+    assert normalize_project_roots([p1, str(p2)]) == [p1.resolve(), p2.resolve()]
+
+    # Deduplication and order preservation
+    assert normalize_project_roots([p1, str(p2), p1, str(p1)]) == [p1.resolve(), p2.resolve()]
+
+    p1.mkdir(parents=True, exist_ok=True)
+    symlink_p1 = tmp_path / "symlink_proj1"
+    symlink_p1.symlink_to(p1)
+
+    assert normalize_project_roots([p2, p1, str(p2), p1, symlink_p1, str(p1)]) == [
+        p2.resolve(),
+        p1.resolve(),
+    ]
+
+
+def test_detect_provider_multiple_roots(tmp_path: Path):
+    r1 = tmp_path / "repo1"
+    r2 = tmp_path / "repo2"
+    r1.mkdir()
+    r2.mkdir()
+
+    # Both SQLMesh
+    (r1 / "config.py").touch()
+    (r2 / "config.yaml").touch()
+    assert detect_provider([r1, r2]) == "sqlmesh"
+
+    # Conflicting: r1 is SQLMesh, r2 has dbt_project.yml
+    (r2 / "config.yaml").unlink()
+    (r2 / "dbt_project.yml").touch()
+    with pytest.raises(ValueError, match="Conflicting pipeline engine providers"):
+        detect_provider([r1, r2])
+
+    # Empty roots fallback to cwd
+    with patch("tff.core.adapter._detect_provider_single", return_value="sqlmesh") as mock_single:
+        assert detect_provider([]) == "sqlmesh"
+        mock_single.assert_called_once_with(Path.cwd())
+
+
+def test_sqlmesh_adapter_multiple_roots(tmp_path: Path):
+    from tff.sqlmesh.adapter import SQLMeshAdapter
+
+    adapter = SQLMeshAdapter()
+    r1 = tmp_path / "r1"
+    r2 = tmp_path / "r2"
+    r1.mkdir()
+    r2.mkdir()
+    (r1 / "config.py").touch()
+    (r2 / "settings.yaml").touch()
+
+    # 1. Diagnostics with multiple roots
+    diag = adapter.get_diagnostic_files([r1, r2])
+    labels = [label for label, _ in diag]
+    assert "[r1] config.py" in labels
+    assert "[r2] settings.yaml" in labels
+
+    # 2. load_models passes multiple paths to Context
+    with (
+        patch("sqlmesh.core.context.Context") as mock_context_cls,
+        patch("tff.sqlmesh.runner.map_sqlmesh_context_models", return_value={"m": MagicMock()}),
+    ):
+        models = adapter.load_models([r1, r2])
+        assert "m" in models
+        mock_context_cls.assert_called_once()
+        _, kwargs = mock_context_cls.call_args
+        assert kwargs["paths"] == [str(r1.resolve()), str(r2.resolve())]
+
+    # 3. run_checks forwards roots
+    cfg = MagicMock()
+    with patch("tff.sqlmesh.runner.run_all_checks", return_value=([], 5, ["sqlmesh"])) as mock_run:
+        findings, count, sel = adapter.run_checks([r1, r2], cfg)
+        assert count == 5
+        mock_run.assert_called_once_with(
+            project_root=[r1, r2],
+            config=cfg,
+            checks=None,
+            models=None,
+        )
+
+
+def test_sqlmesh_runner_run_all_checks_multiple_roots(tmp_path: Path):
+    from tff.sqlmesh.runner import run_all_checks
+
+    r1 = tmp_path / "repo1"
+    r2 = tmp_path / "repo2"
+    r1.mkdir()
+    r2.mkdir()
+
+    cfg = MagicMock()
+    cfg.checks.materialization_depth.enabled = False
+
+    with (
+        patch("tff.sqlmesh.runner.Context") as mock_context_cls,
+        patch("tff.sqlmesh.runner.map_sqlmesh_context_models", return_value={}),
+        patch("tff.sqlmesh.runner.collect_sqlmesh_findings", return_value=[]),
+    ):
+        mock_ctx = MagicMock()
+        mock_ctx.models = {}
+        mock_context_cls.return_value = mock_ctx
+
+        # Test with no checks specified (default)
+        run_all_checks(project_root=[r1, r2], config=cfg)
+        _, kwargs = mock_context_cls.call_args
+        assert kwargs["paths"] == [str(r1.resolve()), str(r2.resolve())]
+
+        mock_context_cls.reset_mock()
+        # Test with checks=["sqlmesh"]
+        run_all_checks(project_root=[r1, r2], config=cfg, checks=["sqlmesh"])
+        _, kwargs = mock_context_cls.call_args
+        assert kwargs["paths"] == [str(r1.resolve()), str(r2.resolve())]
+
+

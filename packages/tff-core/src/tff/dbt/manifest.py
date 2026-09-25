@@ -1,29 +1,82 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
+from typing import TYPE_CHECKING
+
 from tff.core.model import ModelRepresentation
+from tff.core.parallel import precompute_model_asts
+
+if TYPE_CHECKING:
+    from tff.core.config import FitnessFunctionsConfig
+
+logger = logging.getLogger(__name__)
 
 
 def load_dbt_models(
     project_root: Path,
     target_dir: str = "target",
     dialect: str | None = None,
+    max_workers: int | None = None,
+    config: FitnessFunctionsConfig | None = None,
 ) -> dict[str, ModelRepresentation]:
     manifest_path = project_root / target_dir / "manifest.json"
+    logger.debug("Loading dbt manifest from %s", manifest_path)
     if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"dbt manifest not found at {manifest_path}. Please run 'dbt compile' first."
+        from tff.core.exceptions import TffManifestNotFoundError
+
+        raise TffManifestNotFoundError(
+            f"dbt manifest not found at '{manifest_path}'. Please run 'dbt compile' first.",
+            provider="dbt",
+            path=manifest_path,
+            hint="Run 'dbt compile' to generate target/manifest.json before running tff.",
         )
 
-    with open(manifest_path, encoding="utf-8") as f:
-        manifest = json.load(f)
+    if manifest_path.is_dir():
+        import errno
+        from tff.core.exceptions import normalize_os_error
+
+        raise normalize_os_error(
+            IsADirectoryError(errno.EISDIR, "Is a directory", str(manifest_path)),
+            path=manifest_path,
+            operation="read",
+            expected_type="dbt manifest file",
+            provider="dbt",
+            hint=f"Expected '{manifest_path}' to be a JSON file, but found a directory.",
+        )
+
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+    except OSError as exc:
+        from tff.core.exceptions import normalize_os_error
+
+        raise normalize_os_error(
+            exc,
+            path=manifest_path,
+            operation="read",
+            expected_type="dbt manifest file",
+            provider="dbt",
+        ) from exc
+    except Exception as exc:
+        from tff.core.exceptions import TffManifestError
+
+        raise TffManifestError(
+            f"Failed to parse dbt manifest at '{manifest_path}': {exc}",
+            provider="dbt",
+            path=manifest_path,
+            hint="Ensure target/manifest.json contains valid JSON by re-running 'dbt compile'.",
+            original_error=exc,
+        ) from exc
 
     # Auto-infer dialect from dbt adapter type if not explicitly provided
     adapter_type = manifest.get("metadata", {}).get("adapter_type")
     if dialect is None:
         dialect = adapter_type
+
+    logger.debug("Resolved dbt SQL dialect: %s (adapter_type: %s)", dialect, adapter_type)
 
     if not dialect:
         raise ValueError(
@@ -99,19 +152,11 @@ def load_dbt_models(
 
         is_symbolic = materialized == "ephemeral"
 
-        rel_path = node.get("original_file_path", "")
-        abs_path = str(project_root / rel_path)
+        rel_path = (node.get("original_file_path") or "").strip()
+        abs_path = str(project_root / rel_path) if rel_path else ""
 
         audits = model_tests.get(unique_id, [])
         query = node.get("compiled_code") or node.get("raw_code")
-
-        expression = None
-        if query:
-            try:
-                import sqlglot
-                expression = sqlglot.parse_one(query, read=dialect)
-            except Exception:
-                pass
 
         mapped_models[unique_id] = ModelRepresentation(
             name=name,
@@ -127,17 +172,17 @@ def load_dbt_models(
             audits=audits,
             query=query,
             materialized=materialized,
-            expression=expression,
+            expression=None,
             tags=node.get("tags") or [],
             meta={**config_meta, **meta},
+            provider="dbt",
         )
-
 
     # 3. Map sources to ModelRepresentation so graph checks resolve them
     for source_id, source in manifest.get("sources", {}).items():
         name = source.get("name", "")
-        rel_path = source.get("original_file_path", "")
-        abs_path = str(project_root / rel_path)
+        rel_path = (source.get("original_file_path") or "").strip()
+        abs_path = str(project_root / rel_path) if rel_path else ""
 
         mapped_models[source_id] = ModelRepresentation(
             name=name,
@@ -154,7 +199,17 @@ def load_dbt_models(
             materialized="table",
             tags=source.get("tags") or [],
             meta=source.get("meta") or {},
+            provider="dbt",
         )
 
+    logger.debug("Mapped %d models/seeds from dbt manifest", len(mapped_models))
+
+    # Parallelize AST parsing and hydrate model expressions with disk caching
+    precompute_model_asts(
+        mapped_models,
+        project_root=project_root,
+        config=config,
+        max_workers=max_workers,
+    )
 
     return mapped_models

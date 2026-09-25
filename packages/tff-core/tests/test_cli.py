@@ -1,11 +1,12 @@
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tff.core.cli import _detect_provider, _get_runner, main
+from tff.core.cli import _detect_provider, _get_runner, main, mask_sensitive_args
 
 
 def test_detect_provider_dbt(tmp_path: Path):
@@ -120,13 +121,14 @@ def test_main_lint_dbt(
         checks=None,
         dialect="duckdb",
     )
-    mock_render.assert_called_once_with(
-        [],
-        models_checked=5,
-        executed_checks=["rules"],
-        fail_level="error",
-        group_by="model",
-    )
+    assert mock_render.call_count == 1
+    call_args, call_kwargs = mock_render.call_args
+    assert call_args == ([],)
+    assert call_kwargs["models_checked"] == 5
+    assert call_kwargs["executed_checks"] == ["rules"]
+    assert call_kwargs["fail_level"] == "error"
+    assert call_kwargs["group_by"] == "model"
+    assert call_kwargs["duration"] is not None
 
 
 @patch("tff.core.cli._get_runner")
@@ -268,13 +270,14 @@ def test_main_lint_group_by_connascence(
     )
 
     assert exit_code == 0
-    mock_render.assert_called_once_with(
-        [],
-        models_checked=5,
-        executed_checks=["rules"],
-        fail_level="error",
-        group_by="connascence",
-    )
+    assert mock_render.call_count == 1
+    call_args, call_kwargs = mock_render.call_args
+    assert call_args == ([],)
+    assert call_kwargs["models_checked"] == 5
+    assert call_kwargs["executed_checks"] == ["rules"]
+    assert call_kwargs["fail_level"] == "error"
+    assert call_kwargs["group_by"] == "connascence"
+    assert call_kwargs["duration"] is not None
 
 
 def test_cli_main_block(tmp_path: Path):
@@ -429,7 +432,7 @@ def test_info_command_dbt(tmp_path: Path, capsys):
         assert exit_code == 0
         captured = capsys.readouterr()
 
-        assert "TFF Info" in captured.out
+        assert "tff Info" in captured.out
         assert "Project root:" in captured.out
         assert "Provider:" in captured.out
         assert "dbt" in captured.out
@@ -479,10 +482,11 @@ def test_info_command_invalid_config(tmp_path: Path, capsys):
 
 
 def test_argv_fallback_error(capsys):
-    from tff.core.cli import TFFArgumentParser
+    from tff.core.cli import TffArgumentParser, TFFArgumentParser
 
-    parser = TFFArgumentParser(prog="tff")
-    TFFArgumentParser._current_argv = None
+    assert TFFArgumentParser is TffArgumentParser
+    parser = TffArgumentParser(prog="tff")
+    TffArgumentParser._current_argv = None
 
     with patch("sys.argv", ["tff", "lint", "--invalid-arg"]):
         with pytest.raises(SystemExit) as excinfo:
@@ -701,7 +705,7 @@ def test_main_stats_no_logs(tmp_path: Path, capsys):
     exit_code = main(["stats", "--project", project_str])
     assert exit_code == 1
     captured = capsys.readouterr()
-    assert "No TFF run logs found" in captured.err
+    assert "No tff run logs found" in captured.err
 
 
 def test_main_stats(tmp_path: Path, capsys):
@@ -719,7 +723,7 @@ def test_main_stats(tmp_path: Path, capsys):
     exit_code = main(["stats", "--project", project_str])
     assert exit_code == 0
     captured = capsys.readouterr()
-    assert "TFF Project Health Score Trend" in captured.out
+    assert "tff Project Health Score Trend" in captured.out
     assert "Summary History" in captured.out
     assert "92.5%" in captured.out
 
@@ -738,6 +742,8 @@ def test_help_stats_subcommand(capsys):
     captured = capsys.readouterr()
     assert "Show history and trends of fitness checks" in captured.out
     assert "--days" in captured.out
+    assert "-p" in captured.out
+    assert "--project" in captured.out
 
 
 def test_main_stats_variations(tmp_path: Path, capsys):
@@ -766,7 +772,7 @@ def test_main_stats_variations(tmp_path: Path, capsys):
     assert exit_code == 0
     captured = capsys.readouterr()
     assert "No health score data in this timeframe" in captured.out
-    assert "TFF Lint Violations Trend" in captured.out
+    assert "tff Lint Violations Trend" in captured.out
     assert "Summary History" in captured.out
 
     # 2. Test invalid date parsing exception handling in summary table formatting
@@ -1303,5 +1309,648 @@ def test_cli_lint_structured_with_github_annotations(tmp_path: Path, capsys):
         data_json = json.loads(captured_json.out)
         assert data_json["command"] == "lint"
         assert "::warning file=models/staging/stg_customers.sql,line=1::Missing owner attribute" in captured_json.err
+
+
+def test_cli_info_and_lint_with_plugins_and_custom_adapter(tmp_path: Path, capsys):
+    from tff.core.adapter import PipelineAdapter, _REGISTERED_ADAPTERS, register_adapter
+
+    class MyCustomEngineAdapter(PipelineAdapter):
+        @property
+        def provider_name(self) -> str:
+            return "my_custom_engine"
+
+        def is_applicable(self, project_root: Path) -> bool:
+            return True
+
+        def load_models(self, project_root: Path, dialect=None, manifest_path=None):
+            return {}
+
+        def run_checks(self, project_root: Path, config, checks=None, dialect=None, manifest_path=None, models=None):
+            return [], 0, ["custom_rule"]
+
+        def get_diagnostic_files(self, project_root: Path):
+            return [("custom_config.yml", "found")]
+
+    register_adapter("my_custom_engine", MyCustomEngineAdapter)
+    adapter_inst = MyCustomEngineAdapter()
+    assert adapter_inst.provider_name == "my_custom_engine"
+    assert adapter_inst.is_applicable(tmp_path) is True
+    assert adapter_inst.load_models(tmp_path) == {}
+
+    try:
+        # Create fitness_functions.yaml with plugin
+        cfg_file = tmp_path / "fitness_functions.yaml"
+        cfg_file.write_text("plugins:\n  - custom_plugin.py\n", encoding="utf-8")
+        (tmp_path / "custom_plugin.py").write_text("# custom plugin\n", encoding="utf-8")
+
+
+        # 1. Test info command
+        exit_code_info = main([
+            "info",
+            "--project", str(tmp_path),
+            "--provider", "my_custom_engine",
+        ])
+        assert exit_code_info == 0
+        captured_info = capsys.readouterr()
+        assert "my_custom_engine integration" in captured_info.out
+        assert "Plugin:" in captured_info.out
+        assert "custom_plugin.py" in captured_info.out
+        assert "custom_config.yml" in captured_info.out
+
+        # 2. Test lint command with custom provider
+        exit_code_lint = main([
+            "lint",
+            "--project", str(tmp_path),
+            "--provider", "my_custom_engine",
+        ])
+        assert exit_code_lint == 0
+        captured_lint = capsys.readouterr()
+        assert "LINT PASSED" in captured_lint.out
+    finally:
+        _REGISTERED_ADAPTERS.pop("my_custom_engine", None)
+
+
+def test_cli_lint_workers_and_cache_flags(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch):
+    (tmp_path / "dbt_project.yml").touch()
+    (tmp_path / "fitness_functions.yaml").write_text("workers: 1\n", encoding="utf-8")
+    (tmp_path / "target").mkdir()
+    (tmp_path / "target" / "manifest.json").write_text(
+        '{"metadata": {"adapter_type": "duckdb"}, "nodes": {}, "sources": {}}',
+        encoding="utf-8",
+    )
+
+    # 1. Test --workers and --no-cache
+    exit_code = main([
+        "lint",
+        "--project", str(tmp_path),
+        "--provider", "dbt",
+        "--workers", "4",
+        "--no-cache",
+    ])
+    assert exit_code == 0
+
+    # 2. Test --clear-cache
+    exit_code_clear = main([
+        "lint",
+        "--project", str(tmp_path),
+        "--provider", "dbt",
+        "--clear-cache",
+    ])
+    assert exit_code_clear == 0
+    captured = capsys.readouterr()
+    assert "Cleared" in captured.out
+
+    # 3. Test health with --workers and --no-cache
+    exit_code_health = main([
+        "health",
+        "--project", str(tmp_path),
+        "--provider", "dbt",
+        "--workers", "2",
+        "--no-cache",
+    ])
+    assert exit_code_health == 0
+
+    # 4. Test health with --clear-cache
+    exit_code_health_clear = main([
+        "health",
+        "--project", str(tmp_path),
+        "--provider", "dbt",
+        "--clear-cache",
+    ])
+    assert exit_code_health_clear == 0
+
+    # 5. Test main when TFF_NO_CACHE is already set in os.environ (verifies restoration)
+    monkeypatch.setenv("TFF_NO_CACHE", "1")
+    exit_code_env = main(["help"])
+    assert exit_code_env == 0
+    assert os.environ.get("TFF_NO_CACHE") == "1"
+    monkeypatch.delenv("TFF_NO_CACHE")
+
+    # 6. Test with config containing cache_ast: false
+    config_file = tmp_path / "fitness_functions.yaml"
+    config_file.write_text("cache_ast: false\n", encoding="utf-8")
+    exit_code_config_no_cache = main([
+        "lint",
+        "--project", str(tmp_path),
+        "--provider", "dbt",
+    ])
+    assert exit_code_config_no_cache == 0
+
+
+@patch("tff.core.cli._get_runner")
+@patch("tff.core.cli.load_fitness_config")
+@patch("tff.core.cli.render_lint_report")
+def test_cli_debug_flag_root(mock_render, mock_load_config, mock_get_runner, tmp_path: Path):
+    import logging
+
+    mock_runner = MagicMock()
+    mock_runner.run_all_checks.return_value = ([], 1, ["rules"])
+    mock_get_runner.return_value = mock_runner
+    mock_render.return_value = True
+
+    exit_code = main(["--debug", "lint", "--project", str(tmp_path), "--provider", "dbt"])
+    assert exit_code == 0
+    assert logging.getLogger().level == logging.DEBUG
+
+
+@patch("tff.core.cli._get_runner")
+@patch("tff.core.cli.load_fitness_config")
+@patch("tff.core.cli.render_lint_report")
+def test_cli_debug_flag_subcommand(mock_render, mock_load_config, mock_get_runner, tmp_path: Path):
+    import logging
+
+    mock_runner = MagicMock()
+    mock_runner.run_all_checks.return_value = ([], 1, ["rules"])
+    mock_get_runner.return_value = mock_runner
+    mock_render.return_value = True
+
+    exit_code = main(["lint", "--debug", "--project", str(tmp_path), "--provider", "dbt"])
+    assert exit_code == 0
+    assert logging.getLogger().level == logging.DEBUG
+
+
+@patch("tff.core.cli._get_runner")
+@patch("tff.core.cli.load_fitness_config")
+@patch("tff.core.health.render_health_report")
+def test_cli_debug_flag_health(mock_render_health, mock_load_config, mock_get_runner, tmp_path: Path):
+    import logging
+
+    mock_runner = MagicMock()
+    mock_runner.run_all_checks.return_value = ([], 1, ["rules"])
+    mock_get_runner.return_value = mock_runner
+
+    exit_code = main(["health", "--debug", "--project", str(tmp_path), "--provider", "dbt"])
+    assert exit_code == 0
+    assert logging.getLogger().level == logging.DEBUG
+
+
+def test_cli_debug_only():
+    import logging
+
+    exit_code = main(["--debug"])
+    assert exit_code == 0
+    assert logging.getLogger().level == logging.DEBUG
+
+
+def test_cli_debug_env_var(monkeypatch):
+    import logging
+
+    monkeypatch.setenv("TFF_DEBUG", "1")
+    exit_code = main(["help"])
+    assert exit_code == 0
+    assert logging.getLogger().level == logging.DEBUG
+
+
+@patch("tff.core.cli._get_runner")
+@patch("tff.core.cli.load_fitness_config")
+@patch("tff.core.cli.render_lint_report")
+def test_cli_debug_captures_logs(mock_render, mock_load_config, mock_get_runner, tmp_path: Path, capsys):
+    mock_runner = MagicMock()
+    mock_runner.run_all_checks.return_value = ([], 2, ["rules"])
+    mock_get_runner.return_value = mock_runner
+    mock_render.return_value = True
+
+    exit_code = main(["--debug", "lint", "--project", str(tmp_path), "--provider", "dbt"])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "tff v" in captured.err
+    assert "Check execution completed" in captured.err
+
+
+@patch("tff.dbt.cli.run_all_checks")
+@patch("tff.dbt.cli.load_fitness_config")
+@patch("tff.dbt.cli.render_lint_report")
+def test_deprecated_dbt_cli_debug(mock_render, mock_load_config, mock_run_checks, tmp_path: Path):
+    import logging
+    import tff.dbt.cli
+
+    mock_run_checks.return_value = ([], 1, ["rules"])
+    mock_render.return_value = True
+
+    exit_code = tff.dbt.cli.main(["lint", "--debug", "--project", str(tmp_path)])
+    assert exit_code == 0
+    assert logging.getLogger().level == logging.DEBUG
+
+
+@patch("tff.dataform.cli.run_all_checks")
+@patch("tff.dataform.cli.load_fitness_config")
+@patch("tff.dataform.cli.render_lint_report")
+def test_deprecated_dataform_cli_debug(mock_render, mock_load_config, mock_run_checks, tmp_path: Path):
+    import logging
+    import tff.dataform.cli
+
+    mock_run_checks.return_value = ([], 1, ["rules"])
+    mock_render.return_value = True
+
+    exit_code = tff.dataform.cli.main(["lint", "--debug", "--project", str(tmp_path)])
+    assert exit_code == 0
+    assert logging.getLogger().level == logging.DEBUG
+
+
+@patch("tff.sqlmesh.cli.run_all_checks")
+@patch("tff.sqlmesh.cli.load_fitness_config")
+@patch("tff.sqlmesh.cli.render_lint_report")
+def test_deprecated_sqlmesh_cli_debug(mock_render, mock_load_config, mock_run_checks, tmp_path: Path):
+    import logging
+    import tff.sqlmesh.cli
+
+    mock_run_checks.return_value = ([], 1, ["rules"])
+    mock_render.return_value = True
+
+    exit_code = tff.sqlmesh.cli.main(["lint", "--debug", "--project", str(tmp_path)])
+    assert exit_code == 0
+    assert logging.getLogger().level == logging.DEBUG
+
+
+@patch("tff.core.cli._get_adapter")
+def test_cli_get_adapter_error(mock_get_adapter, tmp_path: Path):
+    mock_get_adapter.side_effect = ImportError("Adapter missing")
+    exit_code = main(["lint", "--project", str(tmp_path), "--provider", "dbt"])
+    assert exit_code == 1
+
+
+def test_cli_multi_project_lint(tmp_path: Path):
+    r1 = tmp_path / "repo1"
+    r2 = tmp_path / "repo2"
+    r1.mkdir()
+    r2.mkdir()
+    (r1 / "config.py").touch()
+    (r2 / "config.yaml").touch()
+
+    mock_adapter = MagicMock()
+    mock_adapter.provider_name = "sqlmesh"
+    mock_adapter.run_checks.return_value = ([], 10, ["sqlmesh"])
+
+    with (
+        patch("tff.core.cli._get_adapter", return_value=mock_adapter),
+        patch("tff.core.cli.load_fitness_config", return_value=MagicMock()),
+        patch("tff.core.cli.render_lint_report", return_value=True),
+    ):
+        exit_code = main(["lint", "-p", str(r1), "-p", str(r2)])
+        assert exit_code == 0
+        mock_adapter.run_checks.assert_called_once()
+        _, kwargs = mock_adapter.run_checks.call_args
+        assert kwargs["project_root"] == [r1.resolve(), r2.resolve()]
+
+
+def test_cli_multi_project_conflicting_providers(tmp_path: Path, capsys):
+    r1 = tmp_path / "repo1"
+    r2 = tmp_path / "repo2"
+    r1.mkdir()
+    r2.mkdir()
+    (r1 / "config.py").touch()
+    (r2 / "dbt_project.yml").touch()
+
+    exit_code = main(["lint", "-p", str(r1), "-p", str(r2)])
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "Conflicting pipeline engine providers" in captured.err
+
+
+def test_cli_multi_project_health(tmp_path: Path):
+    r1 = tmp_path / "repo1"
+    r2 = tmp_path / "repo2"
+    r1.mkdir()
+    r2.mkdir()
+    (r1 / "config.py").touch()
+    (r2 / "config.yaml").touch()
+
+    mock_adapter = MagicMock()
+    mock_adapter.provider_name = "sqlmesh"
+    mock_adapter.run_checks.return_value = ([], 10, ["sqlmesh"])
+
+    with (
+        patch("tff.core.cli._get_adapter", return_value=mock_adapter),
+        patch("tff.core.cli.load_fitness_config", return_value=MagicMock()),
+        patch("tff.core.health.calculate_health_scores", return_value=MagicMock()),
+        patch("tff.core.health.render_health_report"),
+    ):
+        exit_code = main(["health", "-p", str(r1), "-p", str(r2), "--no-log"])
+        assert exit_code == 0
+        mock_adapter.run_checks.assert_called_once()
+        _, kwargs = mock_adapter.run_checks.call_args
+        assert kwargs["project_root"] == [r1.resolve(), r2.resolve()]
+
+
+def test_cli_multi_project_info(tmp_path: Path, capsys):
+    r1 = tmp_path / "repo1"
+    r2 = tmp_path / "repo2"
+    r1.mkdir()
+    r2.mkdir()
+    (r1 / "config.py").touch()
+    (r2 / "settings.yaml").touch()
+
+    exit_code = main(["info", "-p", str(r1), "-p", str(r2), "--provider", "sqlmesh"])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "[repo1] config.py" in captured.out
+    assert "[repo2] settings.yaml" in captured.out
+
+
+def test_cli_project_list_attribute(tmp_path: Path):
+    r1 = tmp_path / "repo1"
+    r2 = tmp_path / "repo2"
+    r1.mkdir()
+    r2.mkdir()
+    (r1 / "config.py").touch()
+    (r2 / "config.py").touch()
+
+    with patch("argparse.ArgumentParser.parse_args") as mock_parse_args:
+        mock_args = MagicMock()
+        mock_args.command = "lint"
+        mock_args.projects = None
+        mock_args.project = [r1, r2]
+        mock_args.provider = "sqlmesh"
+        mock_args.config = "fitness_functions.yaml"
+        mock_args.checks = None
+        mock_args.dialect = None
+        mock_args.fix = False
+        mock_args.json = False
+        mock_args.format = "text"
+        mock_args.fail_level = "error"
+        mock_args.group_by = "model"
+        mock_args.github_annotations = False
+        mock_args.junit_xml = None
+        mock_args.no_log = True
+        mock_parse_args.return_value = mock_args
+
+        mock_adapter = MagicMock()
+        mock_adapter.provider_name = "sqlmesh"
+        mock_adapter.run_checks.return_value = ([], 1, ["sqlmesh"])
+
+        with (
+            patch("tff.core.cli._get_adapter", return_value=mock_adapter),
+            patch("tff.core.cli.load_fitness_config", return_value=MagicMock()),
+            patch("tff.core.cli.render_lint_report", return_value=True),
+        ):
+            exit_code = main([])
+            assert exit_code == 0
+            mock_adapter.run_checks.assert_called_once()
+            _, kwargs = mock_adapter.run_checks.call_args
+            assert kwargs["project_root"] == [r1.resolve(), r2.resolve()]
+
+
+def test_cli_multi_project_stats(tmp_path: Path, capsys):
+    r1 = tmp_path / "repo1"
+    r2 = tmp_path / "repo2"
+    r1.mkdir()
+    r2.mkdir()
+    (r1 / ".tff_logs" / "health").mkdir(parents=True)
+    (r2 / ".tff_logs" / "health").mkdir(parents=True)
+
+    from datetime import datetime
+    import json
+    today = datetime.now()
+    with open(r1 / ".tff_logs" / "health" / "h1.log", "w", encoding="utf-8") as f:
+        json.dump({"timestamp": today.astimezone().isoformat(), "overall_score": 90.0, "models_checked": 10}, f)
+    with open(r2 / ".tff_logs" / "health" / "h2.log", "w", encoding="utf-8") as f:
+        json.dump({"timestamp": today.astimezone().isoformat(), "overall_score": 80.0, "models_checked": 10}, f)
+
+    # 1. Text / ASCII output
+    exit_code = main(["stats", "-p", str(r1), "-p", str(r2)])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "tff Project Health Score Trend" in captured.out
+    assert "85.0%" in captured.out
+
+    # 2. JSON output with project_roots
+    exit_code_json = main(["stats", "-p", str(r1), "-p", str(r2), "--json"])
+    assert exit_code_json == 0
+    captured_json = capsys.readouterr()
+    data = json.loads(captured_json.out)
+    assert data["project_root"] == str(r1.resolve())
+    assert data["project_roots"] == [str(r1.resolve()), str(r2.resolve())]
+    assert data["history"][-1]["health_score"] == 85.0
+
+
+def test_cli_check_alias(tmp_path: Path):
+    (tmp_path / "dbt_project.yml").touch()
+    with patch("tff.core.cli.get_adapter") as mock_get_adapter:
+        mock_adapter = MagicMock()
+        mock_adapter.provider_name = "dbt"
+        mock_adapter.run_checks.return_value = ([], 0, [])
+        mock_get_adapter.return_value = mock_adapter
+
+        with patch("tff.core.cli.render_lint_report", return_value=True):
+            exit_code = main(["check", "--project", str(tmp_path)])
+            assert exit_code == 0
+            mock_adapter.run_checks.assert_called_once()
+
+
+def test_mask_sensitive_args_separate_values():
+    raw_args = ["action", "--github-token", "ghp_secret_token_123", "--diff-against-base"]
+    expected = ["action", "--github-token", "***", "--diff-against-base"]
+    assert mask_sensitive_args(raw_args) == expected
+
+
+def test_mask_sensitive_args_equals_values():
+    raw_args = ["action", "--github-token=ghp_secret_token_123", "--diff-against-base"]
+    expected = ["action", "--github-token=***", "--diff-against-base"]
+    assert mask_sensitive_args(raw_args) == expected
+
+
+def test_mask_sensitive_args_case_and_underscores():
+    raw_args = [
+        "--GITHUB-TOKEN=secret1",
+        "--github_token",
+        "secret2",
+        "--api-key",
+        "key123",
+        "--api_key=key456",
+        "--password",
+        "pass1",
+        "--secret=sec1",
+    ]
+    expected = [
+        "--GITHUB-TOKEN=***",
+        "--github_token",
+        "***",
+        "--api-key",
+        "***",
+        "--api_key=***",
+        "--password",
+        "***",
+        "--secret=***",
+    ]
+    assert mask_sensitive_args(raw_args) == expected
+
+
+def test_mask_sensitive_args_suffix_matching():
+    raw_args = [
+        "--my-custom-token",
+        "custom_tok",
+        "--db-password=pass",
+        "--oauth-client-secret",
+        "oauth_sec",
+    ]
+    expected = [
+        "--my-custom-token",
+        "***",
+        "--db-password=***",
+        "--oauth-client-secret",
+        "***",
+    ]
+    assert mask_sensitive_args(raw_args) == expected
+
+
+def test_mask_sensitive_args_access_keys_and_webhooks():
+    raw_args = [
+        "--access-key",
+        "AKIAIOSFODNN7EXAMPLE",
+        "--private-key=my_private_key_content",
+        "--aws-access-key",
+        "secret_aws_key",
+        "--ssh-private-key=ssh_key_secret",
+        "--webhook-secret",
+        "whsec_abc123",
+        "--slack-webhook-url=https://hooks.slack.com/services/T00/B00/X00",
+        "--github-webhook-secret",
+        "gh_hook_sec",
+        "--webhook-url",
+        "https://example.com/webhook",
+    ]
+    expected = [
+        "--access-key",
+        "***",
+        "--private-key=***",
+        "--aws-access-key",
+        "***",
+        "--ssh-private-key=***",
+        "--webhook-secret",
+        "***",
+        "--slack-webhook-url=***",
+        "--github-webhook-secret",
+        "***",
+        "--webhook-url",
+        "***",
+    ]
+    assert mask_sensitive_args(raw_args) == expected
+
+
+def test_mask_sensitive_args_non_sensitive_args():
+    raw_args = [
+        "lint",
+        "--project",
+        "/path/to/project",
+        "--config=fitness_functions.yaml",
+        "--key-column",
+        "user_id",
+        "--primary-key=id",
+        "name=value",
+    ]
+    assert mask_sensitive_args(raw_args) == raw_args
+
+
+def test_mask_sensitive_args_custom_flags():
+    raw_args = ["--internal-cred", "secret_val", "--normal-flag", "normal_val"]
+    masked = mask_sensitive_args(raw_args, sensitive_flags=frozenset({"--internal-cred"}))
+    assert masked == ["--internal-cred", "***", "--normal-flag", "normal_val"]
+
+
+def test_mask_sensitive_args_edge_cases():
+    assert mask_sensitive_args([]) == []
+    # Trailing sensitive flag without value
+    assert mask_sensitive_args(["--github-token"]) == ["--github-token"]
+    # Consecutive sensitive flags
+    raw_args = ["--token", "tok", "--password", "pass"]
+    assert mask_sensitive_args(raw_args) == ["--token", "***", "--password", "***"]
+
+
+def test_cli_debug_logging_masks_github_token(capsys):
+    secret = "ghp_super_secret_token_12345"
+    with patch("tff.core.action.execute_action", return_value=0):
+        exit_code = main(["--debug", "action", "--github-token", secret])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert secret not in captured.err
+    assert "'--github-token', '***'" in captured.err
+
+
+def test_cli_debug_logging_masks_github_token_equals(capsys):
+    secret = "ghp_super_secret_token_67890"
+    with patch("tff.core.action.execute_action", return_value=0):
+        exit_code = main(["--debug", "action", f"--github-token={secret}"])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert secret not in captured.err
+    assert "'--github-token=***'" in captured.err
+
+
+def test_cli_lint_interactive_spinner(tmp_path: Path):
+    (tmp_path / "dbt_project.yml").touch()
+    mock_runner = MagicMock()
+    mock_runner.run_all_checks.return_value = ([], 3, ["rules"])
+
+    with patch("tff.core.cli._get_runner", return_value=mock_runner), \
+         patch("sys.stderr.isatty", return_value=True), \
+         patch.dict(os.environ, {"TERM": "xterm-256color", "CI": ""}, clear=False), \
+         patch("tff.core.cli.render_lint_report", return_value=True) as mock_render:
+        exit_code = main(["lint", "--project", str(tmp_path)])
+        assert exit_code == 0
+        assert mock_render.call_count == 1
+        call_kwargs = mock_render.call_args[1]
+        assert call_kwargs["duration"] is not None
+
+
+def test_cli_lint_autofix_interactive_spinner(tmp_path: Path):
+    (tmp_path / "dbt_project.yml").touch()
+    from tff.core.model import ModelRepresentation
+    from tff.core.report import LintFinding
+
+    finding = LintFinding(
+        check="nomissingowner",
+        severity="error",
+        message="Missing owner",
+        model="user_model",
+        path="models/marts/user_model.sql",
+    )
+    model = ModelRepresentation(
+        name="user_model",
+        path=str(tmp_path / "models/marts/user_model.sql"),
+        dialect="duckdb",
+        is_symbolic=False,
+        is_external=False,
+        columns_to_types={},
+        depends_on=set(),
+        description=None,
+        owner=None,
+        grains=[],
+        audits=[],
+        materialized="table",
+        expression=None,
+        tags=[],
+        meta={},
+        provider="dbt",
+    )
+
+    mock_adapter = MagicMock()
+    mock_adapter.provider_name = "dbt"
+    # First run returns finding, second run returns clean
+    mock_adapter.run_checks.side_effect = [
+        ([finding], 1, ["nomissingowner"]),
+        ([], 1, ["nomissingowner"]),
+    ]
+    mock_adapter.load_models.return_value = {"user_model": model}
+    mock_adapter.apply_metadata_fix.return_value = "Fixed owner"
+
+    with patch("tff.core.cli._get_adapter", return_value=mock_adapter), \
+         patch("tff.core.cli._detect_provider", return_value="dbt"), \
+         patch("sys.stderr.isatty", return_value=True), \
+         patch.dict(os.environ, {"TERM": "xterm-256color", "CI": ""}, clear=False), \
+         patch("tff.core.autofix.apply_autofixes", return_value=["Fixed owner"]), \
+         patch("tff.core.cli.render_lint_report", return_value=True) as mock_render:
+        exit_code = main(["lint", "--project", str(tmp_path), "--fix"])
+        assert exit_code == 0
+        assert mock_adapter.run_checks.call_count == 2
+        assert mock_render.call_count == 1
+        assert mock_render.call_args[1]["duration"] is not None
+
+
+
+
+
+
+
+
 
 

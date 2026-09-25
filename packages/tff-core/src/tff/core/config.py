@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
+
 
 DEFAULT_LAYER_ORDER: list[str] = ["staging", "intermediate", "core", "marts"]
 
@@ -16,9 +24,14 @@ MISSING_CONFIG_NOTICE: str = (
 )
 
 STARTER_CONFIG_YAML: str = """# =============================================================================
-# Transformation Fitness Functions (TFF) Configuration
+# Transformation Fitness Functions (tff) Configuration
 # Documentation: https://github.com/tjirab/tff
 # =============================================================================
+
+# Parallelism and caching options (optional)
+# workers: 4          # Number of worker processes (default: auto, capped at CPU count)
+# cache_ast: true     # Enable persistent AST caching in .tff_cache/ (default: true)
+# cache_dir: ".tff_cache" # Persistent AST cache directory (default: ".tff_cache")
 
 # Define the architectural layer hierarchy (upstream -> downstream).
 # Models in an upstream layer cannot depend on models in a downstream layer.
@@ -62,6 +75,11 @@ checks:
     ignored_values: ["0", "1", ""]
     ignored_punctuation: ["|", " ", "-", "_", "/", ":"]
 
+  # Validate type parity for joined columns to prevent Connascence of Type (CoT)
+  join_type_parity:
+    enabled: true
+    severity: error
+
 # Model-level SQL rules
 rules:
   # Prohibit 'SELECT *' to avoid silent breakage from upstream schema drift
@@ -91,7 +109,6 @@ rules:
   # Monitor SQL complexity (cyclomatic decision points, join count, line count)
   sql_complexity:
     enabled: true
-    warn_only: true
     thresholds:
       decision_points: [15, 25]
       cte_count: [8, 12]
@@ -108,6 +125,11 @@ rules:
     layer_name: marts
     rule: prefix_with_subdirectory
 
+# External plugins and custom rules (paths to Python files or installed packages)
+# plugins:
+#   - "rules/custom_company_rules.py"
+
+
 # Health scoring configuration (weights and penalties)
 # health:
 #   weights:
@@ -123,9 +145,7 @@ rules:
 
 
 class LayersConfig(BaseModel):
-    order: list[str] = Field(
-        default_factory=lambda: list(DEFAULT_LAYER_ORDER)
-    )
+    order: list[str] = Field(default_factory=lambda: list(DEFAULT_LAYER_ORDER))
 
 
 class CheckEnabled(BaseModel):
@@ -134,6 +154,7 @@ class CheckEnabled(BaseModel):
 
 class LayerFilterConfig(BaseModel):
     enabled: bool = True
+    severity: str | None = None
     skip_layers: list[str] = Field(default_factory=list)
     only_layers: list[str] | None = None
 
@@ -169,6 +190,53 @@ class ConnascenceOfValueCheckConfig(LayerFilterConfig):
     ignored_values: list[str] = Field(default_factory=lambda: ["0", "1", ""])
     ignored_punctuation: list[str] = Field(
         default_factory=lambda: ["|", " ", "-", "_", "/", ":"]
+    )
+
+
+class JoinTypeParityCheckConfig(LayerFilterConfig):
+    severity: str = "error"
+    equivalent_types: dict[str, list[str]] = Field(
+        default_factory=lambda: {
+            "text": ["text", "varchar", "string", "char", "nvarchar", "bpchar", "nchar"],
+            "integer": [
+                "int",
+                "integer",
+                "bigint",
+                "smallint",
+                "tinyint",
+                "int2",
+                "int4",
+                "int8",
+                "int16",
+                "int32",
+                "int64",
+                "uint",
+                "ubigint",
+                "usmallint",
+                "utinyint",
+            ],
+            "numeric": ["decimal", "numeric", "number", "fixed", "bignumeric", "bigdecimal"],
+            "float": [
+                "float",
+                "double",
+                "real",
+                "float4",
+                "float8",
+                "double precision",
+                "float64",
+                "float32",
+            ],
+            "timestamp": [
+                "timestamp",
+                "timestamptz",
+                "timestamp_ntz",
+                "timestamp_ltz",
+                "timestamp_tz",
+                "datetime",
+                "date",
+            ],
+            "boolean": ["boolean", "bool"],
+        }
     )
 
 
@@ -255,7 +323,9 @@ class SchemaContractsCheckConfig(LayerFilterConfig):
 
 
 class ChecksConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
     layer_integrity: CheckEnabled = Field(default_factory=CheckEnabled)
+
     custom_exclusions: CustomExclusionsCheckConfig = Field(
         default_factory=CustomExclusionsCheckConfig
     )
@@ -274,8 +344,9 @@ class ChecksConfig(BaseModel):
     connascence_of_value: ConnascenceOfValueCheckConfig = Field(
         default_factory=ConnascenceOfValueCheckConfig
     )
-
-
+    join_type_parity: JoinTypeParityCheckConfig = Field(
+        default_factory=JoinTypeParityCheckConfig
+    )
 
 
 class ClassificationMacrosRuleConfig(LayerFilterConfig):
@@ -290,7 +361,6 @@ class ClassificationMacrosRuleConfig(LayerFilterConfig):
 
 
 class SqlComplexityRuleConfig(LayerFilterConfig):
-    warn_only: bool = True
     thresholds: dict[str, list[int]] = Field(
         default_factory=lambda: {
             "decision_points": [15, 25],
@@ -299,6 +369,33 @@ class SqlComplexityRuleConfig(LayerFilterConfig):
             "line_count": [250, 400],
         }
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_warn_only(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "warn_only" in data:
+            raise ValueError(
+                "'rules.sql_complexity.warn_only' is deprecated and no longer supported. "
+                "To emit warnings only, configure 'severity: warning' under 'rules.sql_complexity'. "
+                "To configure strict thresholds, define [warn, fail] values in 'thresholds'."
+            )
+        return data
+
+    @property
+    def warn_only(self) -> None:
+        raise AttributeError(
+            "'rules.sql_complexity.warn_only' is deprecated and no longer supported. "
+            "To emit warnings only, configure 'severity: warning' under 'rules.sql_complexity'. "
+            "To configure strict thresholds, define [warn, fail] values in 'thresholds'."
+        )
+
+    @warn_only.setter
+    def warn_only(self, value: Any) -> None:
+        raise ValueError(
+            "'rules.sql_complexity.warn_only' is deprecated and no longer supported. "
+            "To emit warnings only, configure 'severity: warning' under 'rules.sql_complexity'. "
+            "To configure strict thresholds, define [warn, fail] values in 'thresholds'."
+        )
 
 
 class MartNamingRuleConfig(LayerFilterConfig):
@@ -350,6 +447,7 @@ class EnvironmentAgnosticReferencesRuleConfig(LayerFilterConfig):
 
 
 class RulesConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
     classification_macros: ClassificationMacrosRuleConfig = Field(
         default_factory=ClassificationMacrosRuleConfig
     )
@@ -420,7 +518,10 @@ class HealthPenaltiesConfig(BaseModel):
     def get_check_error_penalty(self, check: str, is_project_level: bool) -> float:
         norm = check.lower().replace("-", "").replace("_", "").replace(" ", "")
         for k, v in self.checks.items():
-            if k.lower().replace("-", "").replace("_", "").replace(" ", "") == norm and v.error is not None:
+            if (
+                k.lower().replace("-", "").replace("_", "").replace(" ", "") == norm
+                and v.error is not None
+            ):
                 val = v.error
                 if is_project_level and 0.0 < val <= 1.0:
                     return val * 100.0
@@ -432,7 +533,10 @@ class HealthPenaltiesConfig(BaseModel):
     def get_check_warning_penalty(self, check: str, is_project_level: bool) -> float:
         norm = check.lower().replace("-", "").replace("_", "").replace(" ", "")
         for k, v in self.checks.items():
-            if k.lower().replace("-", "").replace("_", "").replace(" ", "") == norm and v.warning is not None:
+            if (
+                k.lower().replace("-", "").replace("_", "").replace(" ", "") == norm
+                and v.warning is not None
+            ):
                 val = v.warning
                 if is_project_level and 0.0 < val <= 1.0:
                     return val * 100.0
@@ -466,10 +570,12 @@ class HealthConfig(BaseModel):
 
 
 class FitnessFunctionsConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
     _project_root: Path = PrivateAttr(default_factory=Path.cwd)
     _config_file_found: bool = PrivateAttr(default=True)
     contract_groups_path: str = "linter_contract_groups.json"
     exclusions_path: str = "linter_exclusions.json"
+    plugins: list[str] = Field(default_factory=list)
     layers: LayersConfig = Field(default_factory=LayersConfig)
     checks: ChecksConfig = Field(default_factory=ChecksConfig)
     rules: RulesConfig = Field(default_factory=RulesConfig)
@@ -477,6 +583,32 @@ class FitnessFunctionsConfig(BaseModel):
     contract_groups: ContractGroupsConfig | None = None
     exclusions: list[CustomExclusionRule] | None = None
     allowed_exceptions: list[AllowedExceptionRule] | None = None
+    workers: int | None = None
+    cache_ast: bool = True
+    cache_dir: str = ".tff_cache"
+
+    @field_validator("workers", mode="before")
+    @classmethod
+    def _validate_workers(cls, v: Any) -> int | None:
+        if v is None:
+            return None
+        val = int(v)
+        if val < 1:
+            raise ValueError(f"workers must be at least 1, got {val}")
+        return val
+
+    @field_validator("plugins", mode="before")
+    @classmethod
+    def _validate_plugins(cls, v: Any) -> list[str]:
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v]
+        if isinstance(v, (list, tuple)):
+            return [str(item) for item in v]
+        raise ValueError(
+            f"Expected list of strings for plugins, got {type(v).__name__}"
+        )
 
     @property
     def config_file_found(self) -> bool:
@@ -494,31 +626,87 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def load_fitness_config(
-    project_root: Path,
+    project_root: Path | Sequence[Path | str] | str,
     config_path: str | Path | None = "fitness_functions.yaml",
     overrides: dict[str, Any] | None = None,
 ) -> FitnessFunctionsConfig:
     """Load fitness config with defaults, yaml file, and optional overrides."""
+    from tff.core.adapter import normalize_project_roots
+
+    roots = normalize_project_roots(project_root)
+    primary_root = roots[0]
+
     data: dict[str, Any] = {}
     config_found = False
 
     if config_path is not None:
         yaml_path = Path(config_path)
         if not yaml_path.is_absolute():
-            yaml_path = project_root / yaml_path
+            found = False
+            for r in roots:
+                candidate = r / yaml_path
+                if candidate.exists():
+                    yaml_path = candidate
+                    found = True
+                    break
+            if not found:
+                yaml_path = primary_root / yaml_path
         if yaml_path.exists():
             config_found = True
-            loaded = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+            if yaml_path.is_dir():
+                import errno
+                from tff.core.exceptions import normalize_os_error
+
+                raise normalize_os_error(
+                    IsADirectoryError(errno.EISDIR, "Is a directory", str(yaml_path)),
+                    path=yaml_path,
+                    operation="read",
+                    expected_type="configuration file",
+                    hint="Expected fitness_functions.yaml to be a file, but encountered a directory.",
+                )
+            try:
+                content = yaml_path.read_text(encoding="utf-8")
+                loaded = yaml.safe_load(content) or {}
+            except yaml.YAMLError as exc:
+                from tff.core.exceptions import TffConfigError
+
+                raise TffConfigError(
+                    f"Failed to parse YAML configuration at '{yaml_path}': {exc}",
+                    path=yaml_path,
+                    hint="Check YAML syntax and formatting in your configuration file.",
+                    original_error=exc,
+                ) from exc
+            except OSError as exc:
+                from tff.core.exceptions import normalize_os_error
+
+                raise normalize_os_error(
+                    exc,
+                    path=yaml_path,
+                    operation="read",
+                    expected_type="configuration file",
+                ) from exc
             if not isinstance(loaded, dict):
-                raise ValueError(f"Expected mapping in {yaml_path}")
+                from tff.core.exceptions import TffConfigError
+
+                raise TffConfigError(
+                    f"Expected mapping in {yaml_path}",
+                    path=yaml_path,
+                    hint="The root of the configuration file must be a key-value mapping.",
+                )
             data = loaded
 
     if overrides:
         data = _deep_merge(data, overrides)
 
     config = FitnessFunctionsConfig.model_validate(data)
-    config._project_root = project_root
+    config._project_root = primary_root
     config._config_file_found = config_found
+
+    if config.plugins:
+        from tff.core.plugins import load_plugins
+
+        load_plugins(config.plugins, project_root=primary_root)
+
     return config
 
 
@@ -544,8 +732,12 @@ def _ensure_under_root(path: Path, root: Path) -> Path:
     try:
         resolved.relative_to(root_resolved)
     except ValueError:
-        raise ValueError(
-            f"Path {path} resolves outside project root {root}"
+        from tff.core.exceptions import TffConfigError
+
+        raise TffConfigError(
+            f"Path {path} resolves outside project root {root}",
+            path=path,
+            hint=f"Ensure path stays within project root '{root}'.",
         ) from None
     return resolved
 

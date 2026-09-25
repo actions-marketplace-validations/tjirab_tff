@@ -8,12 +8,15 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
 from tff.core.model import ModelRepresentation
 from tff.core.utils.jinja import clean_dataform_for_parsing
+
+if TYPE_CHECKING:
+    from tff.core.config import FitnessFunctionsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -58,15 +61,35 @@ def _find_manifest_file(project_root: Path, manifest_path: Path | str | None = N
         p = Path(manifest_path)
         if not p.is_absolute():
             p = project_root / p
+        if p.is_dir():
+            import errno
+            from tff.core.exceptions import normalize_os_error
+
+            raise normalize_os_error(
+                IsADirectoryError(errno.EISDIR, "Is a directory", str(p)),
+                path=p,
+                operation="read",
+                expected_type="Dataform manifest file",
+                provider="dataform",
+                hint=f"Expected '{p}' to be a JSON file, but found a directory.",
+            )
         if p.is_file():
             return p
-        raise FileNotFoundError(f"Specified Dataform manifest not found at: {p}")
+        from tff.core.exceptions import TffManifestNotFoundError
+
+        raise TffManifestNotFoundError(
+            f"Specified Dataform manifest not found at: '{p}'",
+            provider="dataform",
+            path=p,
+            hint="Verify that the manifest file exists and the path is correctly specified.",
+        )
 
     for candidate in CANDIDATE_MANIFEST_FILES:
         candidate_path = project_root / candidate
         if candidate_path.is_file():
             return candidate_path
     return None
+
 
 
 def _compile_via_cli(project_root: Path) -> dict[str, Any] | None:
@@ -292,6 +315,7 @@ def _parse_compiled_graph(
             expression=expression,
             tags=tags,
             meta={**bq_labels},
+            provider="dataform",
         )
 
     # 3. Map declarations (external sources)
@@ -318,6 +342,7 @@ def _parse_compiled_graph(
             materialized="table",
             tags=decl.get("tags") or [],
             meta={},
+            provider="dataform",
         )
 
     # Ensure dependencies that refer to un-prefixed names resolve if possible
@@ -517,6 +542,7 @@ def _load_models_from_sources(
             expression=expression,
             tags=config.get("tags") or [],
             meta=meta,
+            provider="dataform",
         )
 
     # 2. Search for declarations in .js files
@@ -556,6 +582,7 @@ def _load_models_from_sources(
                             materialized="table",
                             tags=decl_info.get("tags") or [],
                             meta={},
+                            provider="dataform",
                         )
             except Exception:
                 pass
@@ -568,8 +595,12 @@ def load_dataform_models(
     project_root: Path,
     manifest_path: Path | str | None = None,
     dialect: str | None = None,
+    max_workers: int | None = None,
+    config: FitnessFunctionsConfig | None = None,
 ) -> dict[str, ModelRepresentation]:
     """Load Dataform models via precompiled JSON, CLI compilation, or direct source parsing."""
+    from tff.core.parallel import precompute_model_asts
+
     settings = _load_settings(project_root)
     if dialect is None:
         warehouse = settings.get("warehouse") or settings.get("defaultLocation")
@@ -581,19 +612,58 @@ def load_dataform_models(
         try:
             with open(manifest_file, encoding="utf-8") as f:
                 data = json.load(f)
-            return _parse_compiled_graph(data, project_root, dialect=dialect)
+            models = _parse_compiled_graph(data, project_root, dialect=dialect)
+            precompute_model_asts(
+                models,
+                project_root=project_root,
+                config=config,
+                max_workers=max_workers,
+            )
+            return models
         except Exception as e:
             if manifest_path:
-                raise e
+                from tff.core.exceptions import TffError, TffManifestError, normalize_os_error
+
+                if isinstance(e, TffError):
+                    raise e
+                if isinstance(e, OSError):
+                    raise normalize_os_error(
+                        e,
+                        path=manifest_file,
+                        operation="read",
+                        expected_type="Dataform manifest file",
+                        provider="dataform",
+                    ) from e
+                raise TffManifestError(
+                    f"Failed to parse Dataform manifest '{manifest_file}': {e}",
+                    provider="dataform",
+                    path=manifest_file,
+                    hint="Ensure the manifest contains valid JSON and Dataform compilation results.",
+                    original_error=e,
+                ) from e
             logger.warning("Failed to parse manifest file %s: %s", manifest_file, e)
 
     # Tier 2: Check for local CLI compilation
     compiled_data = _compile_via_cli(project_root)
     if compiled_data:
         try:
-            return _parse_compiled_graph(compiled_data, project_root, dialect=dialect)
+            models = _parse_compiled_graph(compiled_data, project_root, dialect=dialect)
+            precompute_model_asts(
+                models,
+                project_root=project_root,
+                config=config,
+                max_workers=max_workers,
+            )
+            return models
         except Exception as e:
             logger.debug("Failed to parse CLI compilation output: %s", e)
 
     # Tier 3: Direct static source parsing
-    return _load_models_from_sources(project_root, settings, dialect=dialect)
+    models = _load_models_from_sources(project_root, settings, dialect=dialect)
+    precompute_model_asts(
+        models,
+        project_root=project_root,
+        config=config,
+        max_workers=max_workers,
+    )
+    return models

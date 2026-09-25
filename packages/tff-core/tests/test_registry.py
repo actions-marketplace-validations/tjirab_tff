@@ -584,3 +584,395 @@ def test_sqlmesh_runner_initializes_context_when_missing(tmp_path: Path) -> None
         )
         assert mock_ctx_cls.called
         assert selected == ["sqlmesh"]
+
+
+def test_check_registry_register_rule_and_unregister():
+    from tff.core.registry import CheckRegistry
+    from tff.core.rules.base import Rule
+
+    reg = CheckRegistry()
+
+    class CustomDocRule(Rule):
+        """Custom documentation rule."""
+        name = "custom_doc_rule"
+
+    # Auto-derived metadata
+    c1 = reg.register_rule(CustomDocRule)
+    assert c1.id == "custom_doc_rule"
+    assert c1.label == "Custom documentation rule."
+    assert c1.category == "Custom Rules"
+    assert c1.default_severity == "error"
+    assert reg.get("custom_doc_rule") is c1
+
+    # Explicit metadata and unregister
+    class BareRule(Rule):
+        pass
+
+    c2 = reg.register_rule(
+        BareRule,
+        id="bare_rule",
+        label="Bare Label",
+        category="Governance",
+        default_severity="warning",
+        aliases=("bare_alias",),
+        finding_check_id="bare_finding",
+    )
+    assert c2.id == "bare_rule"
+    assert c2.label == "Bare Label"
+    assert c2.category == "Governance"
+    assert c2.default_severity == "warning"
+    assert reg.get("bare_alias") is c2
+    assert reg.get("bare_finding") is c2
+
+    # Unregister
+    reg.unregister("bare_rule")
+    assert reg.get("bare_rule") is None
+    assert reg.get("bare_alias") is None
+    assert reg.get("bare_finding") is None
+
+    # Unregister nonexistent doesn't fail
+    reg.unregister("nonexistent")
+
+
+def test_is_rule_enabled_in_config():
+    from tff.core.config import FitnessFunctionsConfig
+    from tff.core.registry import is_rule_enabled_in_config
+
+    cfg = FitnessFunctionsConfig()
+
+    # Empty names -> True
+    assert is_rule_enabled_in_config(cfg) is True
+
+    # Unknown rule -> True by default
+    assert is_rule_enabled_in_config(cfg, "unknown_rule") is True
+
+    # Rule configured via model_extra as dict
+    cfg.rules.__pydantic_extra__ = {
+        "custom_rule": {"enabled": False},
+        "bool_rule": False,
+        "dict_true": {"enabled": True},
+        "bool_true": True,
+    }
+    assert is_rule_enabled_in_config(cfg, "custom_rule") is False
+    assert is_rule_enabled_in_config(cfg, "bool_rule") is False
+    assert is_rule_enabled_in_config(cfg, "dict_true") is True
+    assert is_rule_enabled_in_config(cfg, "bool_true") is True
+
+    # Check configured via checks model_extra
+    cfg.checks.__pydantic_extra__ = {
+        "custom_dag_check": {"enabled": False},
+        "bool_dag_check": False,
+    }
+    assert is_rule_enabled_in_config(cfg, "custom_dag_check") is False
+    assert is_rule_enabled_in_config(cfg, "bool_dag_check") is False
+
+    # Config with no rules
+    cfg_empty = FitnessFunctionsConfig()
+    cfg_empty.rules = None  # type: ignore[assignment]
+    cfg_empty.checks = None  # type: ignore[assignment]
+    assert is_rule_enabled_in_config(cfg_empty, "any_rule") is True
+
+
+def test_check_definition_dynamic_severity(tmp_path: Path):
+    from tff.core.config import FitnessFunctionsConfig
+    from tff.core.model import ModelRepresentation
+    from tff.core.registry import CheckDefinition
+    from tff.core.rules.base import Rule, RuleViolation
+
+    class AlwaysFailRule(Rule):
+        name = "always_fail"
+
+        def check_model(self, model: ModelRepresentation):
+            return RuleViolation("Model failed!")
+
+    c = CheckDefinition(
+        id="always_fail",
+        label="Always Fail",
+        category="Test",
+        scope="model",
+        default_severity="error",
+        rule_cls=AlwaysFailRule,
+    )
+
+    sql_file = tmp_path / "model.sql"
+    sql_file.write_text("SELECT 1", encoding="utf-8")
+    models = {"m": ModelRepresentation(name="m", path=str(sql_file), dialect="duckdb")}
+
+    # Default severity is error
+    cfg = FitnessFunctionsConfig()
+    findings = c.run(models, cfg)
+    assert len(findings) == 1
+    assert findings[0].severity == "error"
+
+    # Config override with warning in model_extra dict
+    cfg.rules.__pydantic_extra__ = {"always_fail": {"severity": "warning"}}
+    findings_warn = c.run(models, cfg)
+    assert findings_warn[0].severity == "warning"
+
+
+def test_get_categories_custom():
+    from tff.core.registry import CheckDefinition, CheckRegistry
+
+    reg = CheckRegistry()
+    c = CheckDefinition(
+        id="custom_governance_check",
+        label="Custom Governance",
+        category="Custom Governance Category",
+        scope="model",
+    )
+    reg.register(c)
+    cats = reg.get_categories()
+    assert "Custom Governance Category" in cats
+    assert "custom_governance_check" in cats["Custom Governance Category"]
+
+
+def test_registry_load_entry_points_and_plugins(tmp_path: Path):
+    from tff.core.registry import CheckRegistry
+    from unittest.mock import patch
+
+    reg = CheckRegistry()
+
+    # load_entry_points
+    with patch("importlib.metadata.entry_points", return_value=[]):
+        assert reg.load_entry_points() == []
+
+    # load_plugins
+    plugin_file = tmp_path / "reg_test_plugin.py"
+    plugin_file.write_text(
+        """from tff.core.rules.base import Rule
+class RegistryTestRule(Rule):
+    name = "reg_test_rule"
+    def check_model(self, model):
+        return None
+""",
+        encoding="utf-8",
+    )
+    loaded = reg.load_plugins([plugin_file], project_root=tmp_path)
+    assert len(loaded) == 1
+    assert reg.get("reg_test_rule") is not None
+
+
+def test_registry_run_checks_parallel():
+    reg = CheckRegistry()
+    cfg = FitnessFunctionsConfig()
+
+    class Rule1(Rule):
+        name = "rule_one"
+        def check_model(self, model):
+            return None
+
+    class Rule2(Rule):
+        name = "rule_two"
+        def check_model(self, model):
+            return None
+
+    reg.register_rule(Rule1, id="rule_one")
+    reg.register_rule(Rule2, id="rule_two")
+
+    models = {
+        "m1": ModelRepresentation(name="m1", path="m1.sql", dialect="duckdb"),
+        "m2": ModelRepresentation(name="m2", path="m2.sql", dialect="duckdb"),
+    }
+
+    # Sequential
+    findings_seq, selected_seq = reg.run_checks(
+        models=models,
+        config=cfg,
+        checks=["rule_one", "rule_two"],
+        max_workers=1,
+    )
+    assert findings_seq == []
+    assert selected_seq == ["rule_one", "rule_two"]
+
+    # Parallel with max_workers=2
+    findings_par, selected_par = reg.run_checks(
+        models=models,
+        config=cfg,
+        checks=["rule_one", "rule_two"],
+        max_workers=2,
+    )
+    assert findings_par == []
+    assert selected_par == ["rule_one", "rule_two"]
+
+
+def test_check_definition_run_with_workers():
+    cfg = FitnessFunctionsConfig()
+    models = {"m": ModelRepresentation(name="m", path="m.sql", dialect="duckdb")}
+
+    # Model scope
+    class DummyRule(Rule):
+        name = "dummy"
+        def check_model(self, model):
+            return RuleViolation("violation")
+
+    check_model = CheckDefinition(
+        id="dummy",
+        label="Dummy",
+        category="Test",
+        scope="model",
+        rule_cls=DummyRule,
+    )
+    findings = check_model.run(models, cfg, max_workers=2)
+    assert len(findings) == 1
+
+    # DAG scope with max_workers in signature
+    def collector_with_workers(m, c, max_workers=None):
+        return [LintFinding("dag_check", "warning", "m", "m.sql", "msg")]
+
+    check_dag_workers = CheckDefinition(
+        id="dag_workers",
+        label="DAG Workers",
+        category="Test",
+        scope="dag",
+        collector_fn=collector_with_workers,
+    )
+    findings_dag = check_dag_workers.run(models, cfg, max_workers=2)
+    assert len(findings_dag) == 1
+
+    # DAG scope without max_workers in signature
+    def collector_without_workers(m, c):
+        return [LintFinding("dag_no_workers", "warning", "m", "m.sql", "msg")]
+
+    check_dag_no_workers = CheckDefinition(
+        id="dag_no_workers",
+        label="DAG No Workers",
+        category="Test",
+        scope="dag",
+        collector_fn=collector_without_workers,
+    )
+    findings_dag2 = check_dag_no_workers.run(models, cfg, max_workers=2)
+    assert len(findings_dag2) == 1
+
+
+def test_check_definition_get_severity_overrides():
+    import yaml
+    from tff.core.config import FitnessFunctionsConfig
+
+    data = yaml.safe_load("""
+rules:
+  ban_select_star:
+    enabled: true
+    severity: warning
+checks:
+  duplicate_ctes:
+    enabled: true
+    severity: error
+""")
+    cfg = FitnessFunctionsConfig.model_validate(data)
+
+    # Model rule with override in rules section
+    c_rule = registry.get("ban_select_star")
+    assert c_rule is not None
+    assert c_rule.get_severity(cfg) == "warning"
+
+    # DAG check with override in checks section
+    c_check = registry.get("duplicate_ctes")
+    assert c_check is not None
+    assert c_check.get_severity(cfg) == "error"
+
+
+def test_run_model_rule_propagates_chunk_size() -> None:
+    from unittest.mock import patch
+
+    models = {
+        "m1": ModelRepresentation(name="m1", path="models/m1.sql", dialect="duckdb"),
+        "m2": ModelRepresentation(name="m2", path="models/m2.sql", dialect="duckdb"),
+    }
+
+    with patch("tff.core.parallel.run_parallel_model_rule") as mock_parallel:
+        mock_parallel.return_value = []
+        findings = run_model_rule(
+            BanSelectStar,
+            models,
+            severity="warning",
+            check_name="dummy_check",
+            max_workers=4,
+            chunk_size=10,
+        )
+        assert findings == []
+        mock_parallel.assert_called_once_with(
+            rule_cls=BanSelectStar,
+            models=list(models.values()),
+            severity="warning",
+            check_name="dummy_check",
+            config=None,
+            max_workers=4,
+            chunk_size=10,
+        )
+
+
+def test_check_definition_run_propagates_chunk_size() -> None:
+    from unittest.mock import patch
+
+    check = CheckDefinition(
+        id="dummy_rule",
+        label="Dummy Rule",
+        category="Test",
+        scope="model",
+        rule_cls=BanSelectStar,
+    )
+    models = {
+        "m1": ModelRepresentation(name="m1", path="models/m1.sql", dialect="duckdb"),
+    }
+    cfg = FitnessFunctionsConfig()
+
+    with patch("tff.core.parallel.run_parallel_model_rule") as mock_parallel:
+        mock_parallel.return_value = []
+        findings = check.run(models, cfg, max_workers=2, chunk_size=5)
+        assert findings == []
+        mock_parallel.assert_called_once_with(
+            rule_cls=BanSelectStar,
+            models=list(models.values()),
+            severity="error",
+            check_name="dummy_rule",
+            config=cfg,
+            max_workers=2,
+            chunk_size=5,
+        )
+
+
+def test_run_model_rule_with_chunk_size_execution(tmp_path: Path) -> None:
+    class BanFooRule(Rule):
+        def check_model(self, model: ModelRepresentation) -> RuleViolation | None:
+            if "foo" in model.name:
+                return RuleViolation("Contains foo")
+            return None
+
+    sql_file = tmp_path / "model.sql"
+    sql_file.write_text("SELECT 1", encoding="utf-8")
+
+    models = {
+        f"m_{i}": ModelRepresentation(
+            name=f"foo_{i}" if i % 2 == 0 else f"bar_{i}",
+            path=str(sql_file),
+            dialect="duckdb",
+        )
+        for i in range(25)
+    }
+
+    # Test run_model_rule with chunk_size
+    findings = run_model_rule(
+        BanFooRule,
+        models,
+        severity="error",
+        check_name="ban_foo",
+        max_workers=2,
+        chunk_size=5,
+    )
+    assert len(findings) == 13
+
+    # Test CheckDefinition.run with chunk_size
+    check = CheckDefinition(
+        id="ban_foo",
+        label="Ban Foo",
+        category="Test",
+        scope="model",
+        rule_cls=BanFooRule,
+    )
+    cfg = FitnessFunctionsConfig()
+    findings_check = check.run(models, cfg, max_workers=2, chunk_size=5)
+    assert len(findings_check) == 13
+
+
+
+

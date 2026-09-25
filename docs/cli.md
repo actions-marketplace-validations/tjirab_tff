@@ -1,6 +1,6 @@
 # CLI Reference & Usage Guide
 
-Transformation Fitness Functions (**TFF**) provides a unified, zero-config command-line interface (`tff`) to run architectural fitness functions, compute project health scores, generate documentation dashboards, and integrate with CI/CD quality gates.
+Transformation Fitness Functions (**tff**) provides a unified, zero-config command-line interface (`tff`) to run architectural fitness functions, compute project health scores, generate documentation dashboards, and integrate with CI/CD quality gates.
 
 ---
 
@@ -23,13 +23,17 @@ The CLI provides the following subcommands:
 
 ## 2. Global Conventions & Defaults
 
-* **Zero-Config Fallback**: If no `fitness_functions.yaml` is present, TFF automatically infers standard architectural layer conventions (`staging` &rarr; `intermediate` &rarr; `core` &rarr; `marts`) and runs all baseline rules.
-* **Auto-Discovery**: TFF automatically detects the project engine (`dbt`, `SQLMesh`, or `Dataform`) by scanning configuration files in the target directory.
+* **Zero-Config Fallback**: If no `fitness_functions.yaml` is present, tff automatically infers standard architectural layer conventions (`staging` &rarr; `intermediate` &rarr; `core` &rarr; `marts`) and runs all baseline rules.
+* **Auto-Discovery**: tff automatically detects the project engine (`dbt`, `SQLMesh`, or `Dataform`) by scanning configuration files in the target directory.
+* **Parallel Execution**: AST parsing, duplicate CTE fingerprinting, and model rule checks execute across a worker pool in parallel (`--workers`, `TFF_WORKERS`, or `workers:` in config). Worker tasks are dynamically batched to minimize `ThreadPoolExecutor` scheduling overhead (configurable via `TFF_CHUNK_SIZE`).
+* **Persistent AST Caching**: Precomputed ASTs are persistently cached under `.tff_cache/ast` keyed by SQLGlot version, SQL dialect, and SQL SHA-256 hash for sub-second repeat runs. Disable with `--no-cache` or clear with `--clear-cache`.
 * **Local Run Logging**: Executions of `tff lint` and `tff health` automatically save run metrics to `.tff_logs/` in JSON format (retained for 60 days). Disable anytime with `--no-log` or `export TFF_NO_LOG=1`.
+* **Debug Logging**: Inspect internal operations and troubleshoot pipeline detection, AST caching, and check execution by passing `--debug` (e.g. `tff --debug lint` or `tff lint --debug`) or setting `export TFF_DEBUG=1`.
 * **Exit Codes**:
   * `0`: Success (all checks passed, health score at or above threshold).
-  * `1`: Quality failure (violations found at or above fail-level, or health score below threshold).
+  * `1`: Quality failure (violations found at or above fail-level, or health score below threshold) or runtime error.
   * `2`: CLI usage or argument parsing error.
+  * `130`: Execution aborted by user (`Ctrl+C` / `SIGINT`).
 
 ---
 
@@ -45,7 +49,7 @@ tff lint [options]
 
 | Option | Type / Choices | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--project PATH` | Directory Path | `.` (current dir) | Project root directory. |
+| `--project PATH`, `-p PATH` | Directory Path | `.` (current dir) | Project root directory (can be specified multiple times for multi-repo projects). |
 | `--config PATH` | File Path | `fitness_functions.yaml` | Path to fitness functions config (relative to project root). |
 | `--provider` | `auto`, `dbt`, `sqlmesh`, `dataform` | `auto` | Pipeline engine provider (auto-detected if omitted). |
 | `--checks CHECKS` | Comma-separated string | (all enabled) | Specific checks to run (e.g. `layer_integrity,ban_select_star`). |
@@ -53,12 +57,16 @@ tff lint [options]
 | `--group-by` | `model`, `connascence` | `model` | How to group violations in the console report. |
 | `--dialect DIALECT` | String | (auto-inferred) | SQL dialect of models (e.g. `duckdb`, `snowflake`, `bigquery`). |
 | `--manifest PATH` | File Path | (auto-discovered) | Path to precompiled manifest (dbt `manifest.json` or Dataform `compilation_result.json`). |
-| `--fix` | Flag | `false` | Automatically fix simple violations (e.g. rewrite positional `GROUP BY`/`ORDER BY` and scaffold missing metadata). |
+| `--fix` | Flag | `false` | Automatically fix simple violations (e.g. rewrite positional `GROUP BY`/`ORDER BY`, lift nested subqueries in final `SELECT` to CTEs, and scaffold missing metadata). |
 | `--format` | `text`, `json`, `sarif`, `github` | `text` | Output format to stdout. |
 | `--json` | Flag | `false` | Shorthand for `--format json`. |
 | `--github-annotations` | Flag | (auto if CI) | Emit GitHub Actions workflow commands (`::error` / `::warning`) to stderr. |
 | `--junit-xml PATH` | File Path | (none) | Write JUnit XML test report for CI results tabs (GitLab, Azure DevOps, Bitbucket). |
+| `--workers NUM` | Integer | (auto / CPU count) | Number of worker processes for parallel model loading, AST parsing, and CTE analysis (or set `TFF_WORKERS`). Task chunk size for rule evaluation can be tuned via `TFF_CHUNK_SIZE`. |
+| `--no-cache` | Flag | `false` | Disable disk-based AST caching in `.tff_cache/`. |
+| `--clear-cache` | Flag | `false` | Clear the persistent `.tff_cache/` directory before running. |
 | `--no-log` | Flag | `false` | Disable writing execution logs to `.tff_logs/lint/`. |
+| `--debug` | Flag | `false` | Enable verbose debug logging output to stderr. |
 
 ### Examples
 
@@ -93,7 +101,7 @@ tff health [options]
 
 | Option | Type / Choices | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--project PATH` | Directory Path | `.` (current dir) | Project root directory. |
+| `--project PATH`, `-p PATH` | Directory Path | `.` (current dir) | Project root directory (can be specified multiple times for multi-repo projects). |
 | `--config PATH` | File Path | `fitness_functions.yaml` | Path to fitness functions config (relative to project root). |
 | `--provider` | `auto`, `dbt`, `sqlmesh`, `dataform` | `auto` | Pipeline engine provider. |
 | `--fail-under SCORE` | Float (`0.0` - `100.0`) | `0.0` | Exit with code `1` if overall health score is below this threshold. |
@@ -101,8 +109,12 @@ tff health [options]
 | `--group-by` | `connascence`, `domain` | `connascence` | Group breakdown by connascence category or domain folder. |
 | `--dialect DIALECT` | String | (auto-inferred) | SQL dialect of models. |
 | `--manifest PATH` | File Path | (auto-discovered) | Path to precompiled manifest. |
+| `--workers NUM` | Integer | (auto / CPU count) | Number of worker processes for parallel model loading and AST parsing. |
+| `--no-cache` | Flag | `false` | Disable disk-based AST caching in `.tff_cache/`. |
+| `--clear-cache` | Flag | `false` | Clear the persistent `.tff_cache/` directory before running. |
 | `--json` | Flag | `false` | Output results in JSON format to stdout. |
 | `--no-log` | Flag | `false` | Disable writing execution logs to `.tff_logs/health/`. |
+| `--debug` | Flag | `false` | Enable verbose debug logging output to stderr. |
 
 ### Examples
 
@@ -146,6 +158,7 @@ tff action [options]
 | `--annotations` / `--no-annotations` | Flag | `true` | Emit GitHub Actions workflow command annotations. |
 | `--pr-number NUM` | Integer | (auto-detected) | Pull request number (auto-inferred from `$GITHUB_EVENT_PATH`). |
 | `--repo OWNER/REPO` | String | (auto-detected) | GitHub repository full name (auto-inferred from `$GITHUB_REPOSITORY`). |
+| `--workers NUM` | Integer | (auto / CPU count) | Number of worker processes for parallel model loading and AST parsing. |
 | `--json` | Flag | `false` | Output final results as JSON to stdout. |
 
 ### Examples
@@ -172,12 +185,13 @@ tff docs [options]
 
 | Option | Type / Choices | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--project PATH` | Directory Path | `.` | Project root directory. |
+| `--project PATH`, `-p PATH` | Directory Path | `.` (current dir) | Project root directory (can be specified multiple times for multi-repo projects). |
 | `--output PATH`, `-o` | File Path | `tff_report.html` | Destination path for generated HTML file. |
 | `--config PATH` | File Path | `fitness_functions.yaml` | Path to fitness functions config. |
 | `--provider` | `auto`, `dbt`, `sqlmesh`, `dataform` | `auto` | Pipeline engine provider. |
 | `--dialect DIALECT` | String | (auto-inferred) | SQL dialect of models. |
 | `--manifest PATH` | File Path | (auto-discovered) | Path to precompiled manifest. |
+| `--workers NUM` | Integer | (auto / CPU count) | Number of worker processes for parallel model loading and AST parsing. |
 | `--no-log` | Flag | `false` | Disable writing execution logs. |
 
 ### Examples
@@ -231,7 +245,7 @@ tff stats [options]
 
 | Option | Type / Choices | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--project PATH` | Directory Path | `.` | Project root directory. |
+| `--project PATH`, `-p PATH` | Directory Path | `.` (current dir) | Project root directory (can be specified multiple times for multi-repo projects). |
 | `--days DAYS` | Integer | `7` | Number of days of historical execution logs to analyze. |
 | `--json` | Flag | `false` | Output stats summary as JSON to stdout. |
 
@@ -262,7 +276,7 @@ tff info [options]
 
 | Option | Type / Choices | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--project PATH` | Directory Path | `.` | Project root directory. |
+| `--project PATH`, `-p PATH` | Directory Path | `.` (current dir) | Project root directory (can be specified multiple times for multi-repo projects). |
 | `--config PATH` | File Path | `fitness_functions.yaml` | Path to fitness functions config. |
 | `--provider` | `auto`, `dbt`, `sqlmesh`, `dataform` | `auto` | Pipeline engine provider. |
 
@@ -288,12 +302,67 @@ tff [subcommand] --help
 
 ## 11. Output Formats & Integrations
 
-TFF supports multiple structured output formats for seamless CI/CD and tool integration:
+tff supports multiple structured output formats for seamless CI/CD and tool integration:
 
 | Format | CLI Option | Primary Target | Description |
 | :--- | :--- | :--- | :--- |
-| **Terminal Text** | (default) | Local developers, CI terminal | Rich colored ASCII tables, violation callouts, and recommendations. |
+| **Terminal Text** | (default) | Local developers, CI terminal | Rich colored ASCII tables, violation callouts, recommendations, and clickable OSC-8 documentation hyperlinks. |
 | **JSON** | `--format json` or `--json` | `jq`, custom telemetry, scripts | Pure JSON output of findings, health scores, and metrics. |
 | **SARIF v2.1.0** | `--format sarif` | GitHub Code Scanning | OASIS standard format for GitHub Security Alerts and PR file annotations. |
 | **GitHub Annotations**| `--format github` or `--github-annotations` | GitHub Actions Runners | Emits `::error` and `::warning` workflow commands to annotate changed lines in PRs. |
 | **JUnit XML** | `--junit-xml PATH` | GitLab CI, Azure DevOps, Bitbucket | Standard XML test report rendered natively in CI pipeline test tabs. |
+
+---
+
+## 12. Error Diagnostics & Stream Discipline
+
+tff provides human-readable diagnostic reporting to prevent raw stack traces during normal CLI usage while preserving stream integrity for automation:
+
+### Diagnostic Blocks
+When domain errors occur (e.g. invalid configuration syntax, missing manifest files, or model resolution errors), tff outputs a structured 3-part diagnostic block strictly to `stderr`:
+1. **Error Summary**: What went wrong (`✖ Error: ...`).
+2. **Context Metadata**: Bulleted contextual metadata such as `• Model:`, `• Path:`, `• Rule:`, and `• Provider:`.
+3. **Remediation Hint**: Actionable steps to resolve the issue (`• Hint: ...`).
+
+### Stream Discipline
+All error diagnostics, warnings, and progress indicators are routed exclusively to `stderr`. When using structured outputs (`--json` or `--format json`), `stdout` remains clean, valid JSON suitable for piping directly into `jq` or downstream tools.
+
+### Debug Mode & Unexpected Errors
+* **Normal Mode**: Unexpected runtime crashes display a polite summary with a link to the issue tracker and instructions on enabling debug mode.
+* **Debug Mode**: Passing `--debug` (e.g. `tff --debug lint` or `tff lint --debug`) or setting `export TFF_DEBUG=1` reveals full Rich-formatted stack traces for in-depth troubleshooting.
+
+---
+
+## 13. Environment Variables
+
+tff supports environment variables for configuring runtime concurrency, batch chunk sizes, AST caching, logging, and debugging across local and CI environments:
+
+| Environment Variable | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `TFF_WORKERS` / `TFF_MAX_WORKERS` | Integer | (auto / CPU count) | Number of worker processes / threads for parallel model loading, AST parsing, and rule evaluation. |
+| `TFF_CHUNK_SIZE` | Integer | (dynamic formula) | Task chunk size for batching models in parallel rule execution across `ThreadPoolExecutor`. |
+| `TFF_NO_CACHE` / `TFF_DISABLE_CACHE` | Boolean (`1`, `true`) | `false` | Disables disk-based AST caching in `.tff_cache/`. |
+| `TFF_CACHE_DIR` | Directory Path | `.tff_cache` | Custom directory path for AST cache files. |
+| `TFF_NO_LOG` | Boolean (`1`, `true`) | `false` | Disables saving execution run logs to `.tff_logs/`. |
+| `TFF_DEBUG` | Boolean (`1`, `true`) | `false` | Enables verbose debug logging and full stack traces. |
+
+### Parallel Rule Batching (`TFF_CHUNK_SIZE`)
+
+When evaluating model-level rules across large repositories (>1,000 models), creating individual tasks per model can introduce thread pool scheduling and synchronization overhead. `tff` batches eligible models into task chunks for concurrent execution across worker threads:
+
+* **Dynamic Default Formula**:
+  When `TFF_CHUNK_SIZE` is unset or invalid, the chunk size is calculated dynamically:
+  ```python
+  max(1, min(100, len(eligible_models) // (pool_size * 4)))
+  ```
+  This divides eligible models into approximately 4 task batches per worker thread to ensure even thread load balancing, bounded between a minimum of 1 and a maximum of 100 models per batch.
+
+* **Tuning in CI or Local Environments**:
+  You can configure `TFF_CHUNK_SIZE` in CI or local environments to tune throughput:
+  ```bash
+  # Tune batch size for high-volume repositories (>1,000 models)
+  export TFF_CHUNK_SIZE=50
+  tff lint
+  ```
+  To evaluate models individually without batching, set `TFF_CHUNK_SIZE=1`.
+

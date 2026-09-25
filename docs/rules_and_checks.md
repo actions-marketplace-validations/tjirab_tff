@@ -1,17 +1,61 @@
 # Rules and Checks Reference
 
-TFF runs two categories of quality guardrails: **Architectural Checks** and **Linter Rules**. All of these are configured in the `fitness_functions.yaml` file in the root of your project.
+tff runs two categories of quality guardrails: **Architectural Checks** and **Linter Rules**. All of these are configured in the `fitness_functions.yaml` file in the root of your project.
 
 ---
 
 ## 🛠️ Auto-Fixer (`--fix`)
 
-TFF includes a built-in auto-fixer that can automatically resolve simple violations. By running `tff lint --fix`, TFF will modify your source files to fix the following issues:
+tff includes a built-in auto-fixer that can automatically resolve simple violations. By running `tff lint --fix`, tff will modify your source files to fix the following issues:
 
-*   **[No Positional GROUP BY/ORDER BY](#no-positional-group-byorder-by-no_positional_group_by_or_order_by)** (`nopositionalgroupbyororderby`): Rewrites integer positional references in `GROUP BY` and `ORDER BY` clauses to explicit column names or select aliases using AST modification.
+*   **[No Positional GROUP BY/ORDER BY](#no-positional-group-byorder-by-no_positional_group_by_or_order_by-auto-fixable)** (`nopositionalgroupbyororderby`): Rewrites integer positional references in `GROUP BY` and `ORDER BY` clauses to explicit column names or select aliases using AST modification.
+*   **[Nested Subqueries in Final SELECT](#sql-complexity-sql_complexity)** (`sqlcomplexity`): Refactors inline subqueries in `FROM (SELECT ...) alias` and `JOIN (SELECT ...) alias` clauses of the final `SELECT` statement into named Common Table Expressions (`WITH alias AS (...)`).
 *   **Metadata (`nomissingowner`, `nomissingdescription`)**:
     *   **dbt**: Automatically appends or scaffolds `schema.yml` metadata configs with `"TODO: Add owner"` and `"TODO: Add description"` templates.
     *   **SQLMesh**: Inline-updates the `MODEL` block in the model `.sql` file to add `owner` and `description` headers.
+    *   **Dataform**: Injects `description: "TODO: Add description"` and `bigquery: { labels: { owner: "TODO: Add owner" } }` inside `.sqlx` `config { ... }` blocks, or scaffolds a minimal `config { ... }` header if absent.
+
+---
+
+## ⚡ Performance: Parallel Traversal & AST Caching
+
+For enterprise DAGs consisting of hundreds or thousands of transformation models, tff provides multi-core parallelism and persistent disk-based caching:
+
+* **Parallel Model Loading & Parsing**: AST parsing is dispatched across a pool of worker processes (`ProcessPoolExecutor`) during model loading.
+* **Parallel Duplicate CTE Fingerprinting**: CTE extraction, AST normalization, and cryptographic hashing run concurrently across models.
+* **Persistent AST Caching**: Precomputed ASTs are cached in `.tff_cache/ast` keyed by SQLGlot version, target dialect, and model SQL SHA-256 hash. Repeat evaluations achieve sub-second execution speeds.
+* **Threaded Rule Execution**: Model-level rules and check definitions run concurrently via thread pools (`run_parallel_model_rule`). Models are dynamically batched to minimize worker thread scheduling overhead.
+
+### Configuration in `fitness_functions.yaml`
+
+```yaml
+# Root configuration options:
+workers: 4              # Optional: number of worker processes (default: auto, capped at CPU count)
+cache_ast: true         # Optional: toggle persistent AST caching (default: true)
+cache_dir: ".tff_cache" # Optional: persistent cache directory (default: ".tff_cache")
+```
+
+You can also override these on the CLI via `--workers <N>`, `--no-cache`, and `--clear-cache`, or via the `TFF_WORKERS` environment variable.
+
+### Task Batch Tuning (`TFF_CHUNK_SIZE`)
+
+When evaluating model-level rules across large repositories (>1,000 models), creating individual tasks per model can introduce thread pool scheduling and synchronization overhead. `tff` automatically groups eligible models into task batches:
+
+* **Dynamic Default Formula**:
+  When `TFF_CHUNK_SIZE` is unset, the batch chunk size is calculated dynamically:
+  ```python
+  max(1, min(100, len(eligible_models) // (pool_size * 4)))
+  ```
+  This creates approximately 4 batches per worker thread to ensure even thread load balancing, bounded between a minimum of 1 and a maximum of 100 models per batch.
+
+* **Environment Variable Override**:
+  You can set `TFF_CHUNK_SIZE` in CI or local environments to tune batch sizes for your workload:
+  ```bash
+  # Tune batch size for high-volume repositories in CI or local runs
+  export TFF_CHUNK_SIZE=50
+  tff lint
+  ```
+  Setting `TFF_CHUNK_SIZE=1` reverts to single-model execution per task.
 
 ---
 
@@ -115,7 +159,7 @@ Architectural checks evaluate the structure, dependencies, and layout of your en
   * **Domain**: Prefix a tag with `domain:`, e.g., `domain:finance`, or define a `domain` key in model metadata.
 
   **Example (Functional Theme Layout)**:
-  Assume a model is located at `models/finance/payments_cleared.sql`. Since `finance` is not in your configured `layers.order`, TFF's directory parser cannot determine the layer automatically. You can explicitly tag/annotate it:
+  Assume a model is located at `models/finance/payments_cleared.sql`. Since `finance` is not in your configured `layers.order`, tff's directory parser cannot determine the layer automatically. You can explicitly tag/annotate it:
   
   * **dbt (`schema.yml`)**:
     ```yaml
@@ -299,6 +343,7 @@ Architectural checks evaluate the structure, dependencies, and layout of your en
 * **What it checks**:
   * Identifies "Connascence of Algorithm" by flagging duplicate or near-identical transformation logic inside CTEs across different models.
   * CTEs are parsed, canonicalized using `sqlglot` to ignore whitespace/formatting differences, and hashed.
+  * CTE extraction and fingerprinting run concurrently across a parallel worker pool for high-performance traversal on large DAGs.
   * Only "complex" CTEs are checked. A CTE is complex if it has a minimum AST node count and contains a structural element (`JOIN`, `WHERE`, `GROUP BY`, `HAVING`, `WINDOW`, `CASE`, or `IF`).
 * **How to configure**:
   Defined under `checks.duplicate_ctes` in `fitness_functions.yaml`.
@@ -362,11 +407,61 @@ Architectural checks evaluate the structure, dependencies, and layout of your en
      -- Downstream models
      SELECT * FROM {{ ref('stg_users') }} WHERE is_premium
      ```
-  2. **Project-Level Variables**: Define the value as a project variable in `dbt_project.yml` and reference it via Jinja:
+  2. **Classification Macros**: Encapsulate the comparison predicate or status value into a reusable macro, transforming Connascence of Value into weaker Connascence of Name:
+     ```sql
+     -- dbt macro or SQLMesh @macro
+     SELECT * FROM {{ ref('dim_users') }} WHERE {{ is_premium_tier('status') }}
+     ```
+  3. **Project-Level Variables**: Define the value as a project variable (e.g. in `dbt_project.yml` or SQLMesh config) for environment configurations or global thresholds, and reference it via Jinja:
      ```sql
      SELECT * FROM {{ ref('stg_users') }} WHERE status = '{{ var("premium_tier_name") }}'
      ```
-  3. **Mapping Tables (Seeds)**: For larger sets of constants (e.g., list of VIP email domains), load them via a seed CSV and perform a `JOIN` or `WHERE IN (SELECT ... FROM {{ ref('seed') }})`.
+  4. **Mapping Tables (Seeds)**: For larger sets of constants or multi-attribute categories (e.g., list of VIP email domains, country code lookups), load them via a seed CSV and perform a `JOIN` or `WHERE IN (SELECT ... FROM {{ ref('seed') }})`.
+
+---
+
+### Join Type Parity (`join_type_parity`)
+
+* **What it checks**:
+  * Validates data type parity for joined columns across SQL queries to eliminate **Connascence of Type (CoT)**.
+  * Walks join condition expressions (`ON left.col = right.col` and `USING (col)`), extracts columns on both sides, resolves their data types from project model metadata, and flags any incompatible type mismatches.
+  * Honors explicit casts (e.g. `CAST(id AS VARCHAR) = user_id`) and recognizes dialect-equivalent type families (e.g. `VARCHAR` $\leftrightarrow$ `TEXT`, `INT` $\leftrightarrow$ `BIGINT`).
+
+* **Why it matters (The "Why")**:
+  Joining columns with mismatching data types (e.g. `VARCHAR` joined to `INTEGER`) causes dynamic type casting overhead across every processed row, disables database index and partition scans, or leads to runtime execution failures. It introduces **Connascence of Type (CoT)** where models are tightly and invisibly coupled to upstream internal type representations.
+
+* **How to configure**:
+  Defined under `checks.join_type_parity` in `fitness_functions.yaml`:
+  ```yaml
+  checks:
+    join_type_parity:
+      enabled: true
+      severity: error                # 'error' or 'warning'
+      skip_layers: [staging]          # Optional: layers to skip
+      equivalent_types:              # Optional: custom equivalent type families
+        text: [text, varchar, string, char, nvarchar]
+        integer: [int, integer, bigint, smallint, tinyint]
+        numeric: [decimal, numeric, number]
+        float: [float, double, real]
+        timestamp: [timestamp, timestamptz, timestamp_ntz, datetime]
+  ```
+
+* **Example Violation**:
+  ```sql
+  -- users.id is INT, orders.user_id is VARCHAR
+  SELECT u.name, o.amount
+  FROM raw.users u
+  JOIN raw.orders o ON u.id = o.user_id;  -- Flags CoT: INT compared with VARCHAR
+  ```
+
+* **How to Resolve**:
+  1. **Align Upstream Schema (Recommended)**: Cast or define the column with the correct canonical type in the upstream staging model.
+  2. **Explicit Casting**: If disparate types are intentional, add an explicit `CAST` at the join condition:
+     ```sql
+     SELECT u.name, o.amount
+     FROM raw.users u
+     JOIN raw.orders o ON CAST(u.id AS VARCHAR) = o.user_id;
+     ```
 
 ---
 
@@ -460,14 +555,13 @@ For SQLMesh projects, these rules run dynamically inside SQLMesh (e.g., `sqlmesh
     * `join_count`: Number of `JOIN` statements.
     * `line_count`: Total lines of code (ignoring empty lines and SQLMesh `MODEL` blocks).
     * `decision_points`: Number of logical conditional statements (`CASE`, `IF` and boolean operators `AND`/`OR` in `WHERE` clauses).
-    * `nested_subquery_in_final_select`: Warns if a subquery is nested in the final SELECT statement FROM clause.
+    * `nested_subquery_in_final_select`: Warns if a subquery is nested in the final SELECT statement FROM or JOIN clauses. (Auto-fixable via `tff lint --fix`)
 * **How to configure**:
   Defined under `rules.sql_complexity` in `fitness_functions.yaml`.
   ```yaml
   rules:
     sql_complexity:
       enabled: true
-      warn_only: true
       thresholds:
         decision_points: [15, 25]  # [warn_threshold, fail_threshold]
         cte_count: [8, 12]
@@ -475,8 +569,9 @@ For SQLMesh projects, these rules run dynamically inside SQLMesh (e.g., `sqlmesh
         line_count: [250, 400]
   ```
   * **SQLMesh Rule Name**: `sqlcomplexity`
-  * `warn_only` (bool, default: `true`): If `true`, metrics exceeding warning limits but under failure limits raise warnings only.
-  * `thresholds`: Map of metric to `[warn_threshold, fail_threshold]` integer pairs.
+  * `thresholds`: Map of metric to `[warn_threshold, fail_threshold]` integer pairs. Exceeding `warn_threshold` raises a warning; exceeding `fail_threshold` raises an error.
+  * `severity` (string, optional, default: `"error"`): Overall rule severity override (`"warning"` or `"error"`). Set to `"warning"` if you want all complexity breaches to be emitted as warnings only and never fail the run.
+  * *Note*: The legacy `warn_only` setting is deprecated and no longer supported; use `severity: warning` or threshold pairs instead.
 
 ---
 
@@ -592,7 +687,7 @@ For SQLMesh projects, these rules run dynamically inside SQLMesh (e.g., `sqlmesh
 
 ## 3. Health Scoring Configuration
 
-TFF calculates an overall architecture health score (0–100) aggregated from all executed checks. By default, every check carries equal weight (`1.0`), and failures subtract penalties proportionally (an error penalty of `1.0` and warning penalty of `0.5` per affected model; or `100.0` error and `50.0` warning for project-level checks).
+tff calculates an overall architecture health score (0–100) aggregated from all executed checks. By default, every check carries equal weight (`1.0`), and failures subtract penalties proportionally (an error penalty of `1.0` and warning penalty of `0.5` per affected model; or `100.0` error and `50.0` warning for project-level checks).
 
 You can configure custom weights and failure penalties under the `health:` section in `fitness_functions.yaml`.
 
@@ -653,4 +748,133 @@ health:
 3. **Overall Health Score**:
    The weighted average across all active checks:
    $$\text{Overall Score} = \frac{\sum (\text{score}_i \times \text{weight}_i)}{\sum \text{weight}_i}$$
+
+---
+
+## 4. Custom Plugins & Extensions
+
+tff provides an extensible plugin architecture that enables teams to implement proprietary fitness rules, custom architectural DAG checks, and third-party pipeline adapters without modifying `tff-core`.
+
+> [!TIP]
+> For a complete, step-by-step authoring guide with AST traversal, DAG collector functions, and custom adapter scaffolding, see the dedicated [Extending tff Guide](extending_tff.md).
+
+### Overview
+
+Plugins can be registered through two mechanisms:
+1. **Python Package Entry Points**: Distributed Python packages exposing `tff.rules` and `tff.adapters` entry points are discovered automatically when installed in your Python environment.
+2. **Configuration File Plugins**: Local Python scripts or installed modules declared under the `plugins:` list in `fitness_functions.yaml`.
+
+```yaml
+# fitness_functions.yaml
+plugins:
+  - rules/my_custom_rules.py
+  - my_company_tff_plugin
+
+rules:
+  company_naming_convention:
+    enabled: true
+    severity: error
+    prefix: "corp_"
+```
+
+### Authoring Custom Rules
+
+To define a custom model-level rule, inherit from `tff.core.rules.base.Rule` and implement `check_model`:
+
+```python
+# rules/my_custom_rules.py
+from tff.core.model import ModelRepresentation
+from tff.core.rules.base import Rule, RuleViolation
+
+class CompanyNamingRule(Rule):
+    """Enforce that production models follow internal company naming standards."""
+    name = "company_naming_convention"
+    category = "Internal Standards"
+    default_severity = "error"
+
+    def check_model(self, model: ModelRepresentation) -> RuleViolation | None:
+        cfg = self.get_rule_config() or {}
+        prefix = cfg.get("prefix", "corp_") if isinstance(cfg, dict) else getattr(cfg, "prefix", "corp_")
+
+        if not model.name.startswith(prefix):
+            return self.violation(f"Model '{model.name}' must start with required prefix '{prefix}'.")
+        return None
+```
+
+tff automatically discovers and registers any `Rule` subclasses found within files or modules listed in `plugins:`. Custom configuration options can be retrieved dynamically via `self.get_rule_config()`.
+
+#### Module Registration Hooks (Optional)
+
+If you prefer explicit control, you can define a `register` or `register_rules` hook function in your plugin module:
+
+```python
+from tff.core.registry import CheckDefinition, CheckRegistry
+
+def register(registry: CheckRegistry) -> list[CheckDefinition]:
+    return [
+        CheckDefinition(
+            id="custom_dag_check",
+            label="Custom DAG Validation",
+            category="Custom",
+            scope="dag",
+            collector_module="my_plugin.collector",
+            collector_func_name="run_dag_check",
+        )
+    ]
+```
+
+### Authoring Custom Pipeline Adapters
+
+Third-party adapters allow tff to analyze non-standard data pipelines or internal orchestration frameworks. Subclass `tff.core.adapter.PipelineAdapter`:
+
+```python
+from pathlib import Path
+from tff.core.adapter import PipelineAdapter, register_adapter
+from tff.core.model import ModelRepresentation
+
+class MyCustomEngineAdapter(PipelineAdapter):
+    @property
+    def provider_name(self) -> str:
+        return "custom_engine"
+
+    def is_applicable(self, project_root: Path) -> bool:
+        """Return True if project_root contains this engine's project definition."""
+        return (project_root / "custom_pipeline.yml").is_file()
+
+    def load_models(self, project_root: Path, dialect=None, manifest_path=None) -> dict[str, ModelRepresentation]:
+        # Parse and return ModelRepresentation mapping
+        return {}
+
+    def run_checks(self, project_root: Path, config, checks=None, dialect=None, manifest_path=None, models=None):
+        # Run checks or delegate to CheckRegistry
+        return [], 0, []
+```
+
+To register the adapter, either:
+- Expose it in a plugin file/module (auto-discovered),
+- Define `register_adapters()` in your plugin module, or
+- Call `register_adapter("custom_engine", MyCustomEngineAdapter)`.
+
+### Registering via Python Package Entry Points
+
+For installable libraries (e.g. distributed via PyPI or internal wheels), configure entry points in `pyproject.toml`:
+
+```toml
+[project.entry-points."tff.rules"]
+company_naming = "my_package.rules:CompanyNamingRule"
+custom_checks = "my_package.rules:register"
+
+[project.entry-points."tff.adapters"]
+custom_engine = "my_package.adapter:MyCustomEngineAdapter"
+```
+
+Once installed, tff discovers and registers these rules and adapters automatically without requiring explicit `plugins:` configuration in `fitness_functions.yaml`.
+
+### Inspecting Plugins and Adapters
+
+You can inspect registered plugins and adapters using the `tff info` command:
+
+```bash
+tff info
+```
 

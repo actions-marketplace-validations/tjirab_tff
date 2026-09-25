@@ -13,6 +13,8 @@ from tff.core.logs import (
     collect_stats,
     render_ascii_chart,
     is_logging_disabled,
+    is_debug_enabled,
+    setup_cli_logging,
 )
 
 
@@ -70,6 +72,10 @@ def test_get_lint_json_data():
     data_warn_fail = get_lint_json_data(only_warnings, models_checked=3, fail_level="warning")
     assert data_warn_fail["passed"] is False
 
+    # Test with duration
+    data_duration = get_lint_json_data(findings, models_checked=5, fail_level="error", duration=0.4567)
+    assert data_duration["duration_seconds"] == 0.457
+
 
 def test_get_health_json_data():
     scores = {
@@ -111,6 +117,11 @@ def test_get_health_json_data():
     assert data["enabled_checks"] == ["banselectstar", "nomissingowner"]
     assert len(data["findings"]) == 1
     assert data["findings"][0]["check"] == "nomissingowner"
+    assert "duration_seconds" not in data
+
+    # Test with duration
+    data_dur = get_health_json_data(scores, models_checked=10, duration=0.8888)
+    assert data_dur["duration_seconds"] == 0.889
 
 
 def test_save_log_and_pruning(tmp_path: Path):
@@ -249,6 +260,12 @@ def test_render_ascii_chart():
     assert "●" in chart_down
     assert "╮" in chart_down or "╰" in chart_down or "│" in chart_down
 
+    # Test date labels are spaced cleanly without collisions (col_spacing=8)
+    multi_dates = ["2026-07-01", "2026-07-02", "2026-07-03"]
+    multi_values = [10.0, 20.0, 30.0]
+    chart_multi = render_ascii_chart(multi_values, multi_dates, height=4)
+    assert "Jul 01  Jul 02  Jul 03  " in chart_multi
+
 
 def test_collect_stats_corrupt_files(tmp_path: Path):
     health_dir = tmp_path / ".tff_logs" / "health"
@@ -265,6 +282,59 @@ def test_collect_stats_corrupt_files(tmp_path: Path):
     # Collect stats (should pass without raising exceptions, and return empty list since no valid logs exist)
     stats = collect_stats(tmp_path, days=7)
     assert stats == []
+
+
+def test_collect_stats_multiple_project_roots(tmp_path: Path):
+    r1 = tmp_path / "repo1"
+    r2 = tmp_path / "repo2"
+    r1.mkdir()
+    r2.mkdir()
+
+    # Empty roots return empty list
+    assert collect_stats([r1, r2], days=7) == []
+
+    import json
+    # Setup directories
+    (r1 / ".tff_logs" / "health").mkdir(parents=True)
+    (r1 / ".tff_logs" / "lint").mkdir(parents=True)
+    (r2 / ".tff_logs" / "health").mkdir(parents=True)
+    (r2 / ".tff_logs" / "lint").mkdir(parents=True)
+
+    today = datetime.now()
+    # repo1 log: score 80.0, models_checked 10, errors 1, warnings 2
+    with open(r1 / ".tff_logs" / "health" / "h1.log", "w", encoding="utf-8") as f:
+        json.dump({"timestamp": today.astimezone().isoformat(), "overall_score": 80.0, "models_checked": 10}, f)
+    with open(r1 / ".tff_logs" / "lint" / "l1.log", "w", encoding="utf-8") as f:
+        json.dump({"timestamp": today.astimezone().isoformat(), "errors_count": 1, "warnings_count": 2}, f)
+
+    # repo2 log: score 100.0, models_checked 10, errors 2, warnings 1
+    with open(r2 / ".tff_logs" / "health" / "h2.log", "w", encoding="utf-8") as f:
+        json.dump({"timestamp": today.astimezone().isoformat(), "overall_score": 100.0, "models_checked": 10}, f)
+    with open(r2 / ".tff_logs" / "lint" / "l2.log", "w", encoding="utf-8") as f:
+        json.dump({"timestamp": today.astimezone().isoformat(), "errors_count": 2, "warnings_count": 1}, f)
+
+    stats = collect_stats([r1, r2], days=1)
+    assert len(stats) == 1
+    # Aggregated health score: (80*10 + 100*10) / 20 = 90.0
+    assert stats[0]["health_score"] == 90.0
+    # Aggregated errors: 1 + 2 = 3
+    assert stats[0]["errors_count"] == 3
+    # Aggregated warnings: 2 + 1 = 3
+    assert stats[0]["warnings_count"] == 3
+
+    # Test when models_checked is not present
+    r3 = tmp_path / "repo3"
+    r4 = tmp_path / "repo4"
+    r3.mkdir()
+    r4.mkdir()
+    (r3 / ".tff_logs" / "health").mkdir(parents=True)
+    (r4 / ".tff_logs" / "health").mkdir(parents=True)
+    with open(r3 / ".tff_logs" / "health" / "h.log", "w", encoding="utf-8") as f:
+        json.dump({"timestamp": today.astimezone().isoformat(), "overall_score": 70.0}, f)
+    with open(r4 / ".tff_logs" / "health" / "h.log", "w", encoding="utf-8") as f:
+        json.dump({"timestamp": today.astimezone().isoformat(), "overall_score": 90.0}, f)
+    stats2 = collect_stats([r3, r4], days=1)
+    assert stats2[0]["health_score"] == 80.0
 
 
 def test_is_logging_disabled(monkeypatch):
@@ -295,6 +365,44 @@ def test_save_log_env_disabled(tmp_path: Path, monkeypatch):
     res = save_log(tmp_path, "lint", {"test": "data"})
     assert res is None
     assert not (tmp_path / ".tff_logs").exists()
+
+
+def test_is_debug_enabled(monkeypatch):
+    import argparse
+
+    monkeypatch.delenv("TFF_DEBUG", raising=False)
+    assert not is_debug_enabled()
+
+    monkeypatch.setenv("TFF_DEBUG", "1")
+    assert is_debug_enabled()
+
+    monkeypatch.setenv("TFF_DEBUG", "true")
+    assert is_debug_enabled()
+
+    monkeypatch.setenv("TFF_DEBUG", "yes")
+    assert is_debug_enabled()
+
+    monkeypatch.setenv("TFF_DEBUG", "0")
+    assert not is_debug_enabled()
+
+    monkeypatch.delenv("TFF_DEBUG")
+    # With args
+    ns = argparse.Namespace(debug=True)
+    assert is_debug_enabled(ns)
+
+    ns_false = argparse.Namespace(debug=False)
+    assert not is_debug_enabled(ns_false)
+
+
+def test_setup_cli_logging():
+    import logging
+
+    setup_cli_logging(debug=True)
+    assert logging.getLogger().level == logging.DEBUG
+
+    setup_cli_logging(debug=False)
+    assert logging.getLogger().level == logging.ERROR
+
 
 
 

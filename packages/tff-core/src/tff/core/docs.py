@@ -5,42 +5,56 @@ from __future__ import annotations
 import json
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from tff.core.config import load_fitness_config
 from tff.core.health import calculate_health_scores
 from tff.core.logs import collect_stats, get_health_json_data, save_log
+from tff.core.registry import registry
 from tff.core.utils.paths import model_path_relative
 
 
 def generate_docs_dashboard(
-    project_root: Path,
+    project_root: Path | Sequence[Path | str] | str,
     output_path: Path | None = None,
     provider: str = "auto",
     dialect: str | None = None,
     config_path: str = "fitness_functions.yaml",
     manifest_path: str | Path | None = None,
     no_log: bool = False,
+    workers: int | None = None,
 ) -> Path:
     """Run checks, compile, and output a standalone interactive HTML dashboard."""
+    from tff.core.adapter import normalize_project_roots
+
+    roots = normalize_project_roots(project_root)
+    primary_root = roots[0]
+
     # 1. Load config
-    config = load_fitness_config(project_root, config_path=config_path)
+    config = load_fitness_config(roots, config_path=config_path)
+    if workers is not None:
+        config.workers = workers
 
     # 2. Get adapter
+    if provider == "auto":
+        from tff.core.adapter import detect_provider
+
+        provider = detect_provider(roots)
+
     from tff.core.cli import _get_adapter
 
     adapter = _get_adapter(provider)
 
     # 3. Load models mapping
     models = adapter.load_models(
-        project_root=project_root,
+        project_root=roots,
         dialect=dialect,
         manifest_path=manifest_path,
     )
 
     # 4. Run all checks reusing preloaded models
     findings, models_checked, executed_checks = adapter.run_checks(
-        project_root=project_root,
+        project_root=roots,
         config=config,
         dialect=dialect,
         manifest_path=manifest_path,
@@ -50,10 +64,10 @@ def generate_docs_dashboard(
     # 5. Calculate scores and save health log
     scores = calculate_health_scores(findings, models_checked, config, provider)
     json_data = get_health_json_data(scores, models_checked)
-    save_log(project_root, "health", json_data, no_log=no_log)
+    save_log(primary_root, "health", json_data, no_log=no_log)
 
     # 6. Collect history (60 days)
-    history = collect_stats(project_root, days=60)
+    history = collect_stats(roots, days=60)
     if not history:
         history = [
             {
@@ -128,6 +142,7 @@ def generate_docs_dashboard(
         "project_findings": project_findings,
         "history": history,
         "provider": provider,
+        "docs_urls": registry.get_docs_urls(),
         "generated_at": json_data["timestamp"],
     }
 
@@ -137,10 +152,11 @@ def generate_docs_dashboard(
     )
 
     if output_path is None:
-        output_path = project_root / "tff_report.html"
+        output_path = primary_root / "tff_report.html"
     else:
+        output_path = Path(output_path)
         if not output_path.is_absolute():
-            output_path = project_root / output_path
+            output_path = primary_root / output_path
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
@@ -154,7 +170,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>TFF Health & Documentation Dashboard</title>
+  <title>tff Health & Documentation Dashboard</title>
   
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
@@ -181,7 +197,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- Header -->
   <header class="bg-slate-900 text-white px-6 py-4 flex items-center justify-between shadow-md shrink-0">
     <div class="flex items-center space-x-3">
-      <div class="text-2xl font-black tracking-wider text-cyan-400">TFF</div>
+      <div class="text-2xl font-black tracking-wider text-cyan-400">tff</div>
       <div class="h-6 w-[1px] bg-slate-700"></div>
       <h1 class="text-lg font-bold tracking-tight">Fitness Functions Dashboard</h1>
       <span class="bg-cyan-500/10 text-cyan-400 px-2 py-0.5 rounded text-xs font-semibold capitalize" id="provider-badge">...</span>
@@ -901,7 +917,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           
           const label = document.createElement('div');
           label.className = `font-extrabold uppercase tracking-wider text-[9px] mb-0.5 opacity-80`;
-          label.textContent = f.check;
+          const checkUrl = (TFF_DATA.docs_urls && TFF_DATA.docs_urls[f.check]) || '';
+          if (checkUrl) {
+            label.innerHTML = `<a href="${checkUrl}" target="_blank" rel="noopener noreferrer" class="hover:underline">${f.check} ↗</a>`;
+          } else {
+            label.textContent = f.check;
+          }
           box.appendChild(label);
           
           const msg = document.createElement('div');
@@ -1006,7 +1027,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           item.className = `p-3 rounded-lg border text-xs ${
             isErr ? 'bg-rose-50 text-rose-800 border-rose-100' : 'bg-amber-50 text-amber-800 border-amber-100'
           }`;
-          item.innerHTML = `<div class="font-extrabold uppercase text-[9px] tracking-wider mb-0.5 opacity-80">${f.check}</div><div>${f.message}</div>`;
+          const checkUrl = (TFF_DATA.docs_urls && TFF_DATA.docs_urls[f.check]) || '';
+          const checkHeader = checkUrl
+            ? `<a href="${checkUrl}" target="_blank" rel="noopener noreferrer" class="hover:underline">${f.check} ↗</a>`
+            : f.check;
+          item.innerHTML = `<div class="font-extrabold uppercase text-[9px] tracking-wider mb-0.5 opacity-80">${checkHeader}</div><div>${f.message}</div>`;
           projContainer.appendChild(item);
         });
       }
@@ -1034,7 +1059,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           const modelCell = `<td class="px-6 py-4 font-bold text-slate-800">${model.name}</td>`;
           
           // Check/Rule Name Cell
-          const checkCell = `<td class="px-6 py-4 text-xs font-mono text-slate-500">${f.check}</td>`;
+          const checkUrl = (TFF_DATA.docs_urls && TFF_DATA.docs_urls[f.check]) || '';
+          const checkContent = checkUrl
+            ? `<a href="${checkUrl}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation();" class="text-indigo-600 hover:text-indigo-800 hover:underline font-mono text-xs">${f.check} ↗</a>`
+            : `<span class="text-xs font-mono text-slate-500">${f.check}</span>`;
+          const checkCell = `<td class="px-6 py-4">${checkContent}</td>`;
           
           // Detail message Cell
           const msgCell = `<td class="px-6 py-4 text-slate-600 break-words max-w-md">${f.message}</td>`;

@@ -209,6 +209,38 @@ def test_run_all_checks(tmp_path: Path):
     assert len(findings_subset) > 0
 
 
+def test_run_all_checks_with_no_cache(tmp_path: Path):
+    target_dir = tmp_path / "target"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    manifest_file = target_dir / "manifest.json"
+    manifest_data = {
+        "nodes": {
+            "model.my_project.stg_users": {
+                "resource_type": "model",
+                "name": "stg_users",
+                "original_file_path": "models/staging/stg_users.sql",
+                "columns": {},
+                "config": {},
+                "meta": {},
+                "raw_code": "SELECT 1 AS id",
+                "depends_on": {"nodes": []},
+            }
+        },
+        "sources": {},
+        "metadata": {"adapter_type": "duckdb"},
+    }
+    manifest_file.write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    config = FitnessFunctionsConfig(cache_ast=False)
+    findings, checked, _ = run_all_checks(
+        project_root=tmp_path,
+        config=config,
+    )
+    assert checked == 1
+    # Verify .tff_cache was not created
+    assert not (tmp_path / ".tff_cache").exists()
+
+
 def test_dbt_metadata_checks_coverage(tmp_path: Path):
     target_dir = tmp_path / "target"
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -447,6 +479,107 @@ def test_example_minimal_dbt_project_with_example_config():
     assert models_checked == 4
     layer_violations = [f for f in findings if f.check == "layer_integrity"]
     assert len(layer_violations) == 0
+
+
+def test_load_dbt_models_empty_original_file_path(tmp_path: Path):
+    target_dir = tmp_path / "target"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    manifest_file = target_dir / "manifest.json"
+
+    manifest_data = {
+        "nodes": {
+            "model.pkg.empty_path": {
+                "resource_type": "model",
+                "name": "empty_path",
+                "original_file_path": "",
+                "columns": {},
+                "depends_on": {"nodes": []},
+            },
+            "model.pkg.whitespace_path": {
+                "resource_type": "model",
+                "name": "whitespace_path",
+                "original_file_path": "   ",
+                "columns": {},
+                "depends_on": {"nodes": []},
+            },
+            "model.pkg.missing_path": {
+                "resource_type": "model",
+                "name": "missing_path",
+                "columns": {},
+                "depends_on": {"nodes": []},
+            },
+        },
+        "sources": {
+            "source.pkg.empty_source": {
+                "resource_type": "source",
+                "name": "empty_source",
+                "original_file_path": "",
+            },
+            "source.pkg.missing_source": {
+                "resource_type": "source",
+                "name": "missing_source",
+            },
+        },
+        "metadata": {
+            "adapter_type": "duckdb",
+        },
+    }
+    manifest_file.write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    models = load_dbt_models(tmp_path)
+    assert models["model.pkg.empty_path"].path == ""
+    assert models["model.pkg.whitespace_path"].path == ""
+    assert models["model.pkg.missing_path"].path == ""
+    assert models["source.pkg.empty_source"].path == ""
+    assert models["source.pkg.missing_source"].path == ""
+
+
+def test_dbt_dependency_empty_original_file_path_runs_environment_agnostic_references(tmp_path: Path):
+    target_dir = tmp_path / "target"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    manifest_file = target_dir / "manifest.json"
+
+    manifest_data = {
+        "nodes": {
+            "model.dep_pkg.clean_node": {
+                "resource_type": "model",
+                "name": "clean_node",
+                "original_file_path": "",
+                "compiled_code": "SELECT 1 AS id",
+                "columns": {},
+                "depends_on": {"nodes": []},
+            },
+            "model.dep_pkg.banned_node": {
+                "resource_type": "model",
+                "name": "banned_node",
+                "original_file_path": "",
+                "compiled_code": "SELECT * FROM prod_db.raw.tbl",
+                "columns": {},
+                "depends_on": {"nodes": []},
+            },
+        },
+        "sources": {},
+        "metadata": {
+            "adapter_type": "duckdb",
+        },
+    }
+    manifest_file.write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    config = FitnessFunctionsConfig()
+    config.rules.environment_agnostic_references.enabled = True
+    config.rules.environment_agnostic_references.banned_environments = ["prod"]
+
+    findings, models_checked, selected = run_all_checks(
+        project_root=tmp_path,
+        config=config,
+    )
+
+    assert models_checked == 2
+    env_findings = [f for f in findings if f.check == "environmentagnosticreferences"]
+    assert len(env_findings) == 1
+    assert env_findings[0].model == "banned_node"
+    assert "prod_db" in env_findings[0].message
+
 
 
 

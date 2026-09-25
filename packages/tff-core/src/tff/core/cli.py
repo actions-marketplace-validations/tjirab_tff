@@ -6,17 +6,23 @@ import argparse
 import importlib
 import importlib.metadata
 import logging
+import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
-from tff.core.adapter import PipelineAdapter, detect_provider, get_adapter
+from rich.console import Console
+from rich.markup import escape
+
+from tff.core.adapter import PipelineAdapter, detect_provider, get_adapter, normalize_project_roots
 from tff.core.config import (
     MISSING_CONFIG_NOTICE,
     init_fitness_config,
     load_fitness_config,
     resolve_project_path,
 )
+from tff.core.exceptions import TffError
+from tff.core.logs import is_debug_enabled, setup_cli_logging
 from tff.core.report import render_lint_report
 
 if TYPE_CHECKING:
@@ -24,13 +30,96 @@ if TYPE_CHECKING:
     from tff.core.model import ModelRepresentation
     from tff.core.report import LintFinding
 
+logger = logging.getLogger("tff.core.cli")
+
 try:
     __version__ = importlib.metadata.version("tff-core")
 except Exception:
     __version__ = "0.7.0"
 
 
-def _detect_provider(project_root: Path) -> str:
+def render_cli_error(error: TffError | Exception, console: Console | None = None) -> None:
+    """Render a structured error diagnostic block to stderr using rich.
+
+    Formats user-facing errors cleanly into three parts:
+      1. What happened: "✖ Error: <message>"
+      2. Context metadata: "• Model:", "• Path:", "• Rule:", etc.
+      3. Remediation hint: "• Hint: <hint>"
+
+    Args:
+        error: The domain exception or error to render.
+        console: Optional Rich Console (defaults to Console(stderr=True)).
+    """
+    if console is None:
+        console = Console(stderr=True)
+
+    message = getattr(error, "message", None) or str(error)
+    if not message:
+        message = "An unknown error occurred."
+    console.print(f"[bold red]✖ Error:[/bold red] {escape(message)}")
+
+    details = getattr(error, "details", {})
+    if not isinstance(details, dict):
+        details = {}
+
+    bullets: list[tuple[str, Any]] = []
+
+    model = (
+        getattr(error, "model_name", None)
+        or details.get("model")
+        or details.get("model_name")
+    )
+    if model:
+        bullets.append(("Model", model))
+
+    path = getattr(error, "path", None) or details.get("path")
+    if path:
+        bullets.append(("Path", path))
+
+    rule = (
+        details.get("rule")
+        or details.get("rule_name")
+        or details.get("check")
+    )
+    if rule:
+        bullets.append(("Rule", rule))
+
+    provider = getattr(error, "provider", None) or details.get("provider")
+    if provider:
+        bullets.append(("Provider", provider))
+
+    operation = getattr(error, "operation", None) or details.get("operation")
+    if operation:
+        bullets.append(("Operation", operation))
+
+    ignored_keys = {
+        "model",
+        "model_name",
+        "path",
+        "rule",
+        "rule_name",
+        "check",
+        "provider",
+        "operation",
+        "errno",
+        "original_error",
+        "expected_type",
+    }
+    for k, v in details.items():
+        if k not in ignored_keys and v is not None:
+            label = k.replace("_", " ").title()
+            bullets.append((label, v))
+
+    for label, val in bullets:
+        console.print(f"  [dim]•[/dim] [bold]{label}:[/bold] {escape(str(val))}")
+
+    hint = getattr(error, "hint", None)
+    if hint:
+        console.print(f"  [dim]•[/dim] [bold cyan]Hint:[/bold cyan] {escape(hint)}")
+
+
+
+def _detect_provider(project_root: Path | Sequence[Path]) -> str:
     """Detect whether a project is dbt, SQLMesh, or Dataform."""
     return detect_provider(project_root)
 
@@ -81,40 +170,43 @@ class _MockRunnerAdapter(PipelineAdapter):
 
     def load_models(
         self,
-        project_root: Path,
+        project_root: Path | Sequence[Path],
         dialect: str | None = None,
         manifest_path: str | Path | None = None,
     ) -> dict[str, Any]:
+        roots = normalize_project_roots(project_root)
         if self._provider == "dbt":
             from tff.dbt.manifest import load_dbt_models
 
-            return load_dbt_models(project_root, dialect=dialect)
+            return load_dbt_models(roots[0], dialect=dialect)
         elif self._provider == "dataform":
             from tff.dataform.manifest import load_dataform_models
 
             return load_dataform_models(
-                project_root, manifest_path=manifest_path, dialect=dialect
+                roots[0], manifest_path=manifest_path, dialect=dialect
             )
         elif self._provider == "sqlmesh":
             from sqlmesh.core.context import Context
             from tff.sqlmesh.loader import FitnessLoader
             from tff.sqlmesh.runner import map_sqlmesh_context_models
 
-            context = Context(paths=[str(project_root)], loader=FitnessLoader)
+            context = Context(paths=[str(r) for r in roots], loader=FitnessLoader)
             return map_sqlmesh_context_models(context)
         return {}
 
     def run_checks(
         self,
-        project_root: Path,
+        project_root: Path | Sequence[Path],
         config: FitnessFunctionsConfig,
         checks: list[str] | None = None,
         dialect: str | None = None,
         manifest_path: str | Path | None = None,
         models: dict[str, ModelRepresentation] | None = None,
     ) -> tuple[list[LintFinding], int, list[str]]:
+        roots = normalize_project_roots(project_root)
+        root_arg = roots[0] if len(roots) == 1 else roots
         kwargs: dict[str, Any] = {
-            "project_root": project_root,
+            "project_root": root_arg,
             "config": config,
             "checks": checks,
         }
@@ -159,46 +251,52 @@ class _MockRunnerAdapter(PipelineAdapter):
             )
         return None
 
-    def get_diagnostic_files(self, project_root: Path) -> list[tuple[str, str]]:
-        if self._provider == "dbt":
-            dbt_project = project_root / "dbt_project.yml"
-            manifest = project_root / "target" / "manifest.json"
-            dbt_project_status = (
-                "[green]found[/green]" if dbt_project.exists() else "[red]missing[/red]"
-            )
-            manifest_status = (
-                "[green]found[/green]" if manifest.exists() else "[red]missing[/red]"
-            )
-            return [
-                ("dbt_project.yml", f"{dbt_project} ({dbt_project_status})"),
-                ("manifest.json", f"{manifest} ({manifest_status})"),
-            ]
-        elif self._provider == "sqlmesh":
-            config_py = project_root / "config.py"
-            settings_yaml = project_root / "settings.yaml"
-            config_py_status = (
-                "[green]found[/green]" if config_py.exists() else "[red]missing[/red]"
-            )
-            settings_yaml_status = (
-                "[green]found[/green]"
-                if settings_yaml.exists()
-                else "[red]missing[/red]"
-            )
-            return [
-                ("config.py", f"{config_py} ({config_py_status})"),
-                ("settings.yaml", f"{settings_yaml} ({settings_yaml_status})"),
-            ]
-        return []
+    def get_diagnostic_files(
+        self, project_root: Path | Sequence[Path]
+    ) -> list[tuple[str, str]]:
+        roots = normalize_project_roots(project_root)
+        results: list[tuple[str, str]] = []
+        for r in roots:
+            prefix = f"[{r.name}] " if len(roots) > 1 else ""
+            if self._provider == "dbt":
+                dbt_project = r / "dbt_project.yml"
+                manifest = r / "target" / "manifest.json"
+                dbt_project_status = (
+                    "[green]found[/green]" if dbt_project.exists() else "[red]missing[/red]"
+                )
+                manifest_status = (
+                    "[green]found[/green]" if manifest.exists() else "[red]missing[/red]"
+                )
+                results.append((f"{prefix}dbt_project.yml", f"{dbt_project} ({dbt_project_status})"))
+                results.append((f"{prefix}manifest.json", f"{manifest} ({manifest_status})"))
+            elif self._provider == "sqlmesh":
+                config_py = r / "config.py"
+                settings_yaml = r / "settings.yaml"
+                config_py_status = (
+                    "[green]found[/green]" if config_py.exists() else "[red]missing[/red]"
+                )
+                settings_yaml_status = (
+                    "[green]found[/green]"
+                    if settings_yaml.exists()
+                    else "[red]missing[/red]"
+                )
+                results.append((f"{prefix}config.py", f"{config_py} ({config_py_status})"))
+                results.append((f"{prefix}settings.yaml", f"{settings_yaml} ({settings_yaml_status})"))
+        return results
 
 
 def _get_adapter(provider: str) -> PipelineAdapter:
     """Load and return the adapter instance for the specified provider, wrapping test mocks if present."""
-    runner = _get_runner(provider)
-    from unittest.mock import Mock
+    try:
+        runner = _get_runner(provider)
+        from unittest.mock import Mock
 
-    if isinstance(runner, Mock):
-        return _MockRunnerAdapter(provider, runner)
+        if isinstance(runner, Mock):
+            return _MockRunnerAdapter(provider, runner)
+    except Exception:
+        pass
     return get_adapter(provider)
+
 
 
 def _parse_checks(value: str | None) -> list[str] | None:
@@ -207,7 +305,7 @@ def _parse_checks(value: str | None) -> list[str] | None:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
-class TFFArgumentParser(argparse.ArgumentParser):
+class TffArgumentParser(argparse.ArgumentParser):
     _current_argv: list[str] | None = None
 
     def error(self, message: str) -> None:
@@ -217,13 +315,13 @@ class TFFArgumentParser(argparse.ArgumentParser):
         hint_cmd = self.prog
         # If the prog is already subcommand-specific (e.g. 'tff lint'), use it.
         # Otherwise, check the arguments to see if a subcommand was targetted.
-        if hint_cmd == "tff" and TFFArgumentParser._current_argv is not None:
-            for sub in ("lint", "health", "info", "help", "stats", "docs", "init"):
-                if sub in TFFArgumentParser._current_argv:
+        if hint_cmd == "tff" and TffArgumentParser._current_argv is not None:
+            for sub in ("lint", "check", "health", "info", "help", "stats", "docs", "init", "action"):
+                if sub in TffArgumentParser._current_argv:
                     hint_cmd = f"tff {sub}"
                     break
         elif hint_cmd == "tff":
-            for sub in ("lint", "health", "info", "help", "stats", "docs", "init"):
+            for sub in ("lint", "check", "health", "info", "help", "stats", "docs", "init", "action"):
                 if sub in sys.argv:
                     hint_cmd = f"tff {sub}"
                     break
@@ -232,7 +330,99 @@ class TFFArgumentParser(argparse.ArgumentParser):
         self.exit(2)
 
 
-def main(argv: list[str] | None = None) -> int:
+# Backward compatibility alias
+TFFArgumentParser = TffArgumentParser
+
+SENSITIVE_ARG_FLAGS: frozenset[str] = frozenset(
+    {
+        "--github-token",
+        "--token",
+        "--auth-token",
+        "--access-token",
+        "--access-key",
+        "--private-key",
+        "--secret",
+        "--client-secret",
+        "--password",
+        "--api-key",
+    }
+)
+
+SENSITIVE_ARG_SUFFIXES: tuple[str, ...] = (
+    "-token",
+    "-secret",
+    "-password",
+    "-api-key",
+    "-access-key",
+    "-private-key",
+    "-webhook-secret",
+    "-webhook-url",
+)
+
+
+def _is_sensitive_flag(
+    flag: str,
+    sensitive_flags: frozenset[str] | set[str] | None = None,
+) -> bool:
+    """Return True if the flag matches known sensitive CLI argument patterns."""
+    if not flag.startswith("-"):
+        return False
+    norm_flag = flag.lower().replace("_", "-")
+    if sensitive_flags is not None and (
+        flag in sensitive_flags or norm_flag in sensitive_flags
+    ):
+        return True
+    if norm_flag in SENSITIVE_ARG_FLAGS:
+        return True
+    return any(norm_flag.endswith(suffix) for suffix in SENSITIVE_ARG_SUFFIXES)
+
+
+def mask_sensitive_args(
+    args_list: Sequence[str],
+    sensitive_flags: frozenset[str] | set[str] | None = None,
+) -> list[str]:
+    """Sanitize sensitive flag values from command-line argument lists for safe logging.
+
+    Masks sensitive values passed either separately (e.g. ``--github-token <val>`` ->
+    ``['--github-token', '***']``) or joined with an equals sign (e.g.
+    ``--github-token=<val>`` -> ``['--github-token=***']``).
+
+    Args:
+        args_list: Raw sequence of command-line argument strings.
+        sensitive_flags: Optional custom set of flag names to treat as sensitive.
+
+    Returns:
+        A new list of strings with sensitive values masked with '***'.
+    """
+    sanitized: list[str] = []
+    i = 0
+    n = len(args_list)
+
+    while i < n:
+        arg = args_list[i]
+        if arg.startswith("-") and "=" in arg:
+            flag, sep, _val = arg.partition("=")
+            if _is_sensitive_flag(flag, sensitive_flags):
+                sanitized.append(f"{flag}=***")
+                i += 1
+                continue
+
+        if _is_sensitive_flag(arg, sensitive_flags):
+            sanitized.append(arg)
+            if i + 1 < n:
+                sanitized.append("***")
+                i += 2
+            else:
+                i += 1
+            continue
+
+        sanitized.append(arg)
+        i += 1
+
+    return sanitized
+
+
+def _main_impl(argv: list[str] | None = None) -> int:
     if argv is None:
         args_list = sys.argv[1:]
     else:
@@ -240,9 +430,22 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args_list:
         args_list = ["help"]
+    elif all(arg.startswith("-") for arg in args_list) and not any(
+        arg in ("-h", "--help", "-v", "--version") for arg in args_list
+    ):
+        args_list = ["help"] + args_list
 
-    TFFArgumentParser._current_argv = args_list
-    parser = TFFArgumentParser(
+    TffArgumentParser._current_argv = args_list
+
+    debug_parent = argparse.ArgumentParser(add_help=False)
+    debug_parent.add_argument(
+        "--debug",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Enable verbose debug logging output",
+    )
+
+    parser = TffArgumentParser(
         prog="tff",
         description=f"tff {__version__} - Run Transformation Fitness Function (tff) checks",
     )
@@ -252,16 +455,30 @@ def main(argv: list[str] | None = None) -> int:
         action="version",
         version=f"tff {__version__}",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable verbose debug logging output",
+    )
     subparsers = parser.add_subparsers(
-        dest="command", required=True, parser_class=TFFArgumentParser
+        dest="command", required=True, parser_class=TffArgumentParser
     )
 
-    lint_parser = subparsers.add_parser("lint", help="Run all enabled fitness checks")
+    lint_parser = subparsers.add_parser(
+        "lint",
+        aliases=["check"],
+        parents=[debug_parent],
+        help="Run all enabled fitness checks (alias: check)",
+    )
     lint_parser.add_argument(
         "--project",
+        "-p",
+        action="append",
+        dest="projects",
         type=Path,
-        default=Path.cwd(),
-        help="Project root directory (default: current directory)",
+        default=None,
+        help="Project root directory (can be specified multiple times; default: current directory)",
     )
     lint_parser.add_argument(
         "--config",
@@ -288,10 +505,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     lint_parser.add_argument(
         "--provider",
-        choices=["auto", "dbt", "sqlmesh", "dataform"],
         default="auto",
         help="Pipeline engine provider (default: auto-detected)",
     )
+
     lint_parser.add_argument(
         "--dialect",
         default=None,
@@ -336,15 +553,34 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Disable saving run execution logs to .tff_logs/",
     )
+    lint_parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel worker processes for model loading and AST traversal",
+    )
+    lint_parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable disk-based AST caching",
+    )
+    lint_parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Clear persistent AST disk cache before execution",
+    )
 
     health_parser = subparsers.add_parser(
-        "health", help="Show project health report and scores"
+        "health", parents=[debug_parent], help="Show project health report and scores"
     )
     health_parser.add_argument(
         "--project",
+        "-p",
+        action="append",
+        dest="projects",
         type=Path,
-        default=Path.cwd(),
-        help="Project root directory (default: current directory)",
+        default=None,
+        help="Project root directory (can be specified multiple times; default: current directory)",
     )
     health_parser.add_argument(
         "--config",
@@ -353,10 +589,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     health_parser.add_argument(
         "--provider",
-        choices=["auto", "dbt", "sqlmesh", "dataform"],
         default="auto",
         help="Pipeline engine provider (default: auto-detected)",
     )
+
     health_parser.add_argument(
         "--dialect",
         default=None,
@@ -401,18 +637,38 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Disable saving run execution logs to .tff_logs/",
     )
+    health_parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel worker processes for model loading and AST traversal",
+    )
+    health_parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable disk-based AST caching",
+    )
+    health_parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Clear persistent AST disk cache before execution",
+    )
 
     # Info subcommand
     info_parser = subparsers.add_parser(
         "info",
+        parents=[debug_parent],
         help="Show configuration and environment information",
         description="Show configuration and environment information",
     )
     info_parser.add_argument(
         "--project",
+        "-p",
+        action="append",
+        dest="projects",
         type=Path,
-        default=Path.cwd(),
-        help="Project root directory (default: current directory)",
+        default=None,
+        help="Project root directory (can be specified multiple times; default: current directory)",
     )
     info_parser.add_argument(
         "--config",
@@ -421,22 +677,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     info_parser.add_argument(
         "--provider",
-        choices=["auto", "dbt", "sqlmesh", "dataform"],
         default="auto",
         help="Pipeline engine provider (default: auto-detected)",
     )
 
+
     # Stats subcommand
     stats_parser = subparsers.add_parser(
         "stats",
+        parents=[debug_parent],
         help="Show history and trends of fitness checks",
         description="Show history and trends of fitness checks",
     )
     stats_parser.add_argument(
         "--project",
+        "-p",
+        action="append",
+        dest="projects",
         type=Path,
-        default=Path.cwd(),
-        help="Project root directory (default: current directory)",
+        default=None,
+        help="Project root directory (can be specified multiple times; default: current directory)",
     )
     stats_parser.add_argument(
         "--days",
@@ -453,14 +713,18 @@ def main(argv: list[str] | None = None) -> int:
     # Docs subcommand
     docs_parser = subparsers.add_parser(
         "docs",
+        parents=[debug_parent],
         help="Generate HTML documentation and health dashboard",
         description="Generate HTML documentation and health dashboard",
     )
     docs_parser.add_argument(
         "--project",
+        "-p",
+        action="append",
+        dest="projects",
         type=Path,
-        default=Path.cwd(),
-        help="Project root directory (default: current directory)",
+        default=None,
+        help="Project root directory (can be specified multiple times; default: current directory)",
     )
     docs_parser.add_argument(
         "--config",
@@ -469,10 +733,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     docs_parser.add_argument(
         "--provider",
-        choices=["auto", "dbt", "sqlmesh", "dataform"],
         default="auto",
         help="Pipeline engine provider (default: auto-detected)",
     )
+
     docs_parser.add_argument(
         "--dialect",
         default=None,
@@ -496,10 +760,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Disable saving run execution logs to .tff_logs/",
     )
+    docs_parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel worker processes for model loading and AST traversal",
+    )
 
     # Init subcommand
     init_parser = subparsers.add_parser(
         "init",
+        parents=[debug_parent],
         help="Scaffold an annotated starter fitness_functions.yaml configuration file",
         description="Scaffold an annotated starter fitness_functions.yaml configuration file in the project directory",
     )
@@ -519,8 +790,9 @@ def main(argv: list[str] | None = None) -> int:
     # Action subcommand
     action_parser = subparsers.add_parser(
         "action",
-        help="Run TFF GitHub Action pipeline (health scoring, baseline comparison, PR comment)",
-        description="Run TFF checks, compare against base branch, emit GitHub annotations, and create/update PR comments",
+        parents=[debug_parent],
+        help="Run tff GitHub Action pipeline (health scoring, baseline comparison, PR comment)",
+        description="Run tff checks, compare against base branch, emit GitHub annotations, and create/update PR comments",
     )
     action_parser.add_argument(
         "--project",
@@ -530,10 +802,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     action_parser.add_argument(
         "--provider",
-        choices=["auto", "dbt", "sqlmesh", "dataform"],
         default="auto",
         help="Pipeline engine provider (default: auto-detected)",
     )
+
     action_parser.add_argument(
         "--config",
         default="fitness_functions.yaml",
@@ -628,19 +900,34 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Output results in JSON format to stdout",
     )
+    action_parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of parallel worker processes for model loading and AST traversal",
+    )
 
-    help_parser = subparsers.add_parser("help", help="Show help details for a command")
+    help_parser = subparsers.add_parser("help", parents=[debug_parent], help="Show help details for a command")
     help_parser.add_argument(
         "subcommand",
         nargs="?",
-        choices=["lint", "health", "info", "stats", "docs", "init", "action"],
+        choices=["lint", "check", "health", "info", "stats", "docs", "init", "action"],
         help="Specific command to get help for",
     )
 
     args = parser.parse_args(args_list)
 
+    is_debug = is_debug_enabled(args)
+    setup_cli_logging(debug=is_debug)
+    logger.debug(
+        "tff v%s initialized with command: %s (args: %s)",
+        __version__,
+        args.command,
+        mask_sensitive_args(args_list),
+    )
+
     if args.command == "help":
-        if args.subcommand == "lint":
+        if args.subcommand in ("lint", "check"):
             lint_parser.print_help()
         elif args.subcommand == "health":
             health_parser.print_help()
@@ -658,13 +945,29 @@ def main(argv: list[str] | None = None) -> int:
             parser.print_help()
         return 0
 
-    # Register target project's virtualenv site-packages if present
-    if hasattr(args, "project") and args.project:
-        import site
+    # Normalize project roots
+    project_roots: list[Path] = []
+    projects_val = getattr(args, "projects", None)
+    project_val = getattr(args, "project", None)
+    if isinstance(projects_val, (list, tuple)) and projects_val:
+        project_roots = [Path(p).resolve() for p in projects_val]
+    elif isinstance(project_val, (list, tuple)) and project_val:
+        project_roots = [Path(p).resolve() for p in project_val]
+    elif isinstance(project_val, (str, Path)):
+        project_roots = [Path(project_val).resolve()]
+    else:
+        project_roots = [Path.cwd()]
 
-        project_root = Path(args.project).resolve()
+    # Preserve backward compatibility
+    args.projects = project_roots
+    args.project = project_roots[0]
+    project_root = project_roots[0]
+
+    # Register target projects' virtualenv site-packages if present
+    import site
+    for root in project_roots:
         for venv_name in (".venv", "venv", "env"):
-            venv_dir = project_root / venv_name
+            venv_dir = root / venv_name
             if venv_dir.is_dir():
                 # Unix
                 libs_dir = venv_dir / "lib"
@@ -679,16 +982,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "info":
         # Run info command: show diagnostics
-        from rich.console import Console
         from rich.table import Table
         import importlib.metadata as metadata
 
         console = Console()
-        project_root = args.project.resolve()
         provider = args.provider
         if provider == "auto":
             try:
-                provider = _detect_provider(project_root)
+                provider = _detect_provider(project_roots)
             except Exception as e:
                 console.print(f"[red]Error detecting provider: {e}[/red]")
                 return 1
@@ -700,16 +1001,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         config_exists = resolved_config.is_file()
         logo = (
-            " [cyan]████████╗[/cyan][green]███████╗███████╗[/green]\n"
-            " [cyan]╚══██╔══╝[/cyan][green]██╔════╝██╔════╝[/green]\n"
-            " [cyan]   ██║   [/cyan][green]█████╗  █████╗  [/green]\n"
-            " [cyan]   ██║   [/cyan][green]██╔══╝  ██╔══╝  [/green]\n"
-            " [cyan]   ██║   [/cyan][green]██║     ██║     [/green]\n"
-            " [cyan]   ╚═╝   [/cyan][green]╚═╝     ╚═╝     [/green]"
+            " [cyan]            [/cyan][green]▄███▄   ▄███▄   [/green]\n"
+            " [cyan]    ██      [/cyan][green]██  ▀   ██  ▀   [/green]\n"
+            " [cyan]█████████[/cyan][green]█████████████████[/green]\n"
+            " [cyan]    ██      [/cyan][green]██      ██      [/green]\n"
+            " [cyan]    ██      [/cyan][green]██      ██      [/green]\n"
+            " [cyan]    ██▄▄▄   [/cyan][green]██      ██      [/green]"
         )
         console.print(logo)
         console.print()
-        console.print("[bold cyan]● TFF Info[/bold cyan]")
+        console.print("[bold cyan]● tff Info[/bold cyan]")
         table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
         table.add_column()
         table.add_column()
@@ -743,9 +1044,14 @@ def main(argv: list[str] | None = None) -> int:
                     "  [bold]Exclusions:[/bold]",
                     f"{exclusions_path} ({exclusions_status})",
                 )
+                if hasattr(cfg, "plugins") and cfg.plugins:
+                    for p in cfg.plugins:
+                        table.add_row("  [bold]Plugin:[/bold]", str(p))
             except Exception as e:
+
                 console.print(f"[yellow]Failed to load config: {e}[/yellow]")
         console.print(table)
+
 
         console.print("\n[bold cyan]● Adapter Versions[/bold cyan]")
         target_site_packages = []
@@ -808,7 +1114,15 @@ def main(argv: list[str] | None = None) -> int:
         ver_table.add_row(
             "  [bold]dataform integration[/bold]", f"{tff_ver} [dim](core)[/dim]"
         )
+        from tff.core.adapter import get_available_providers
+
+        for prov in get_available_providers():
+            if prov not in ("dbt", "sqlmesh", "dataform"):
+                ver_table.add_row(
+                    f"  [bold]{prov} integration[/bold]", "[cyan]plugin[/cyan]"
+                )
         console.print(ver_table)
+
 
         try:
             adapter = _get_adapter(provider)
@@ -820,22 +1134,23 @@ def main(argv: list[str] | None = None) -> int:
         prov_table.add_column()
         prov_table.add_column()
 
-        for label, val in adapter.get_diagnostic_files(project_root):
-            prov_table.add_row(f"  [bold]{label}[/bold]", val)
+        from rich.markup import escape
+
+        for label, val in adapter.get_diagnostic_files(project_roots):
+            prov_table.add_row(f"  [bold]{escape(label)}[/bold]", val)
         if prov_table.row_count > 0:
             console.print("\n[bold cyan]● Provider Files[/bold cyan]")
             console.print(prov_table)
         return 0
 
     if args.command == "stats":
-        project_root = args.project.resolve()
         from tff.core.logs import collect_stats, render_ascii_chart
         from datetime import datetime
         import json
 
-        history = collect_stats(project_root, args.days)
+        history = collect_stats(project_roots, args.days)
         if not history:
-            print("No TFF run logs found under .tff_logs/.", file=sys.stderr)
+            print("No tff run logs found under .tff_logs/.", file=sys.stderr)
             print(
                 "Please run 'tff lint' or 'tff health' to generate reports first.",
                 file=sys.stderr,
@@ -843,13 +1158,16 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         if args.json:
+            result_payload: dict[str, Any] = {
+                "project_root": str(project_root),
+                "days": args.days,
+                "history": history,
+            }
+            if len(project_roots) > 1:
+                result_payload["project_roots"] = [str(p) for p in project_roots]
             print(
                 json.dumps(
-                    {
-                        "project_root": str(project_root),
-                        "days": args.days,
-                        "history": history,
-                    },
+                    result_payload,
                     indent=2,
                 )
             )
@@ -862,10 +1180,8 @@ def main(argv: list[str] | None = None) -> int:
         warnings = [item["warnings_count"] for item in history]
 
         # 1. Health Score Trend
-        from rich.console import Console
-
         console = Console()
-        console.print("[bold cyan]● TFF Project Health Score Trend[/bold cyan]")
+        console.print("[bold cyan]● tff Project Health Score Trend[/bold cyan]")
         has_health_data = any(h is not None for h in health_scores)
         if has_health_data:
             chart = render_ascii_chart(
@@ -878,7 +1194,7 @@ def main(argv: list[str] | None = None) -> int:
 
         # 2. Lint Violations Trend
         console.print(
-            "[bold cyan]● TFF Lint Violations Trend (Errors & Warnings)[/bold cyan]"
+            "[bold cyan]● tff Lint Violations Trend (Errors & Warnings)[/bold cyan]"
         )
         has_lint_data = any(
             e is not None or w is not None for e, w in zip(errors, warnings)
@@ -952,19 +1268,22 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "docs":
-        project_root = args.project.resolve()
         provider = args.provider
         if provider == "auto":
             try:
-                provider = _detect_provider(project_root)
+                provider = _detect_provider(project_roots)
             except ValueError as e:
                 print(f"Error: {e}", file=sys.stderr)
                 return 1
 
         from tff.core.docs import generate_docs_dashboard
 
+        target_project_root = (
+            project_roots if len(project_roots) > 1 else project_root
+        )
+
         docs_kwargs: dict[str, Any] = {
-            "project_root": project_root,
+            "project_root": target_project_root,
             "output_path": args.output,
             "provider": provider,
             "dialect": args.dialect,
@@ -974,10 +1293,14 @@ def main(argv: list[str] | None = None) -> int:
             docs_kwargs["no_log"] = True
         if getattr(args, "manifest", None) is not None:
             docs_kwargs["manifest_path"] = args.manifest
+        if getattr(args, "workers", None) is not None:
+            docs_kwargs["workers"] = args.workers
         try:
             output_file = generate_docs_dashboard(**docs_kwargs)
             print(f"Successfully generated HTML dashboard at: {output_file}")
             return 0
+        except TffError:
+            raise
         except Exception as e:
             print(f"Error generating dashboard: {e}", file=sys.stderr)
             return 1
@@ -994,6 +1317,8 @@ def main(argv: list[str] | None = None) -> int:
         except FileExistsError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
+        except TffError:
+            raise
         except Exception as e:
             print(f"Error creating configuration file: {e}", file=sys.stderr)
             return 1
@@ -1003,40 +1328,70 @@ def main(argv: list[str] | None = None) -> int:
 
         return execute_action(args)
 
-    if args.command in ("lint", "health"):
-        logging.basicConfig(level=logging.ERROR)
-        project_root = args.project.resolve()
+    if args.command in ("lint", "check", "health"):
+        logger.debug("Project root directories: %s", project_roots)
 
         # 1. Determine provider
         provider = args.provider
         if provider == "auto":
             try:
-                provider = _detect_provider(project_root)
+                provider = _detect_provider(project_roots)
+                logger.debug("Auto-detected provider: %s", provider)
             except ValueError as e:
+                logger.debug("Provider auto-detection error: %s", e)
                 print(f"Error: {e}", file=sys.stderr)
                 return 1
+        else:
+            logger.debug("Using specified provider: %s", provider)
 
         # 2. Get adapter (checks adapter availability)
         try:
             adapter = _get_adapter(provider)
+            logger.debug("Loaded pipeline adapter: %s", adapter.provider_name)
         except (ImportError, ValueError) as e:
+            logger.debug("Failed to load adapter: %s", e)
             print(f"Error: {e}", file=sys.stderr)
             return 1
 
         # 3. Load config
         try:
+            logger.debug("Loading config from %s (project: %s)", args.config, project_root)
             config = load_fitness_config(
                 project_root,
                 config_path=args.config,
             )
+            logger.debug("Loaded config: %s", config)
+        except TffError:
+            raise
         except Exception as e:
+            logger.debug("Failed to load config: %s", e)
             print(f"Error loading configuration: {e}", file=sys.stderr)
             return 1
 
         if not getattr(config, "_config_file_found", True) and not getattr(args, "json", False):
             print(MISSING_CONFIG_NOTICE, file=sys.stderr)
 
-        if args.command == "lint":
+        if getattr(args, "workers", None) is not None:
+            config.workers = args.workers
+            logger.debug("Set config.workers to %d from CLI flag", args.workers)
+        if getattr(args, "no_cache", False):
+            config.cache_ast = False
+            os.environ["TFF_NO_CACHE"] = "1"
+            logger.debug("AST caching disabled via --no-cache")
+        elif not getattr(config, "cache_ast", True):
+            os.environ["TFF_NO_CACHE"] = "1"
+            logger.debug("AST caching disabled via config")
+
+        if getattr(args, "clear_cache", False):
+            from tff.core.ast_cache import clear_ast_cache
+
+            custom_cache = getattr(config, "cache_dir", None) if config else None
+            cleared = clear_ast_cache(project_root=project_root, custom_dir=custom_cache)
+            logger.debug("Cleared %d AST cache files", cleared)
+            if not getattr(args, "json", False):
+                print(f"Cleared {cleared} AST cache file(s).")
+
+        if args.command in ("lint", "check"):
             checks = _parse_checks(args.checks)
         else:
             checks = None  # Always run all checks for health report
@@ -1049,23 +1404,69 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         manifest_path = getattr(args, "manifest", None)
+        logger.debug(
+            "Running %s checks with adapter '%s' (checks=%s, dialect=%s, manifest=%s)",
+            args.command,
+            adapter.provider_name,
+            checks,
+            args.dialect,
+            manifest_path,
+        )
+
+        is_interactive = (
+            sys.stderr.isatty()
+            and not getattr(args, "json", False)
+            and getattr(args, "format", None) not in ("json", "sarif", "github")
+            and os.environ.get("TERM") != "dumb"
+            and os.environ.get("CI") not in ("1", "true")
+        )
+
+        import time
+
+        start_time = time.perf_counter()
         try:
-            findings, models_checked, executed_checks = adapter.run_checks(
-                project_root=project_root,
-                config=config,
-                checks=checks,
-                dialect=args.dialect,
-                manifest_path=manifest_path,
+            if is_interactive:
+                from rich.status import Status
+
+                with Status(
+                    f"Evaluating fitness functions with {adapter.provider_name}...",
+                    console=Console(stderr=True),
+                ):
+                    findings, models_checked, executed_checks = adapter.run_checks(
+                        project_root=project_roots,
+                        config=config,
+                        checks=checks,
+                        dialect=args.dialect,
+                        manifest_path=manifest_path,
+                    )
+            else:
+                findings, models_checked, executed_checks = adapter.run_checks(
+                    project_root=project_roots,
+                    config=config,
+                    checks=checks,
+                    dialect=args.dialect,
+                    manifest_path=manifest_path,
+                )
+            execution_duration = time.perf_counter() - start_time
+            logger.debug(
+                "Check execution completed in %.2fs: evaluated %d model(s), executed %s, found %d violation(s)",
+                execution_duration,
+                models_checked,
+                executed_checks,
+                len(findings),
             )
+        except TffError:
+            raise
         except Exception as e:
+            logger.debug("Error executing checks: %s", e)
             print(f"Error executing checks: {e}", file=sys.stderr)
             return 1
 
         # Apply auto-fixes if --fix is set
-        if args.command == "lint" and getattr(args, "fix", False) and findings:
+        if args.command in ("lint", "check") and getattr(args, "fix", False) and findings:
             try:
                 models = adapter.load_models(
-                    project_root=project_root,
+                    project_root=project_roots,
                     dialect=args.dialect,
                     manifest_path=manifest_path,
                 )
@@ -1078,23 +1479,40 @@ def main(argv: list[str] | None = None) -> int:
             if models:
                 from tff.core.autofix import apply_autofixes
 
-                fix_logs = apply_autofixes(project_root, adapter, findings, models)
+                fix_logs = apply_autofixes(project_roots, adapter, findings, models)
                 if fix_logs:
                     if not args.json:
-                        from rich.console import Console
-
                         console = Console(stderr=True)
                         for log in fix_logs:
                             console.print(f"[green]✓[/green] {log}")
                     # Re-run checks to get the final state of the files
                     try:
-                        findings, models_checked, executed_checks = adapter.run_checks(
-                            project_root=project_root,
-                            config=config,
-                            checks=checks,
-                            dialect=args.dialect,
-                            manifest_path=manifest_path,
-                        )
+                        rerun_start = time.perf_counter()
+                        if is_interactive:
+                            from rich.status import Status
+
+                            with Status(
+                                f"Re-evaluating fitness functions with {adapter.provider_name}...",
+                                console=Console(stderr=True),
+                            ):
+                                findings, models_checked, executed_checks = adapter.run_checks(
+                                    project_root=project_roots,
+                                    config=config,
+                                    checks=checks,
+                                    dialect=args.dialect,
+                                    manifest_path=manifest_path,
+                                )
+                        else:
+                            findings, models_checked, executed_checks = adapter.run_checks(
+                                project_root=project_roots,
+                                config=config,
+                                checks=checks,
+                                dialect=args.dialect,
+                                manifest_path=manifest_path,
+                            )
+                        execution_duration = time.perf_counter() - rerun_start
+                    except TffError:
+                        raise
                     except Exception as e:
                         print(
                             f"Error executing checks after autofix: {e}",
@@ -1102,7 +1520,7 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         return 1
 
-        if args.command == "lint":
+        if args.command in ("lint", "check"):
             # 5. Render report
             from tff.core.logs import get_lint_json_data, save_log
             from tff.core.formatters import (
@@ -1111,9 +1529,13 @@ def main(argv: list[str] | None = None) -> int:
                 generate_sarif_report,
             )
             import json
-            import os
 
-            json_data = get_lint_json_data(findings, models_checked, args.fail_level)
+            json_data = get_lint_json_data(
+                findings,
+                models_checked,
+                args.fail_level,
+                duration=execution_duration,
+            )
             save_log(
                 project_root,
                 "lint",
@@ -1172,7 +1594,9 @@ def main(argv: list[str] | None = None) -> int:
                     executed_checks=executed_checks,
                     fail_level=args.fail_level,  # type: ignore[arg-type]
                     group_by=args.group_by,  # type: ignore[arg-type]
+                    duration=execution_duration,
                 )
+            logger.debug("Lint report finished: passed=%s", passed)
             return 0 if passed else 1
         else:
             # health command
@@ -1211,7 +1635,11 @@ def main(argv: list[str] | None = None) -> int:
                 if scoped_models_count is not None
                 else models_checked
             )
-            json_data = get_health_json_data(scores, effective_models_checked)
+            json_data = get_health_json_data(
+                scores,
+                effective_models_checked,
+                duration=execution_duration,
+            )
             save_log(
                 project_root,
                 "health",
@@ -1222,9 +1650,16 @@ def main(argv: list[str] | None = None) -> int:
             if args.json:
                 print(json.dumps(json_data, indent=2))
             else:
-                render_health_report(scores, config, provider, group_by=group_by)
+                render_health_report(
+                    scores,
+                    config,
+                    provider,
+                    group_by=group_by,
+                    duration=execution_duration,
+                )
 
             overall_score = scores["overall_score"]
+            logger.debug("Overall project health score: %.2f%% (fail_under=%.1f%%)", overall_score, args.fail_under)
             if args.fail_under > 0.0 and overall_score < args.fail_under:
                 if not args.json:
                     print(
@@ -1235,6 +1670,43 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     return 1
+
+
+def _is_debug_requested(argv: list[str] | None = None) -> bool:
+    """Return True if --debug was passed in argv or TFF_DEBUG=1 is set."""
+    if is_debug_enabled():
+        return True
+    args_list = sys.argv[1:] if argv is None else argv
+    return "--debug" in args_list
+
+
+def main(argv: list[str] | None = None) -> int:
+    orig_tff_no_cache = os.environ.get("TFF_NO_CACHE")
+    console = Console(stderr=True)
+    debug = _is_debug_requested(argv)
+    try:
+        try:
+            return _main_impl(argv)
+        except TffError as err:
+            render_cli_error(err, console=console)
+            return 1
+        except KeyboardInterrupt:
+            console.print("Aborted by user.")
+            return 130
+        except Exception as exc:
+            if debug:
+                console.print_exception()
+            else:
+                console.print(f"[bold red]✖ Unexpected Error:[/bold red] {escape(str(exc))}")
+                console.print("  [dim]•[/dim] Please report this issue at: https://github.com/tjirab/tff/issues")
+                console.print("  [dim]•[/dim] [bold cyan]Hint:[/bold cyan] Re-run with [bold]--debug[/bold] or set [bold]TFF_DEBUG=1[/bold] to display the full traceback.")
+            return 1
+    finally:
+        if orig_tff_no_cache is None:
+            os.environ.pop("TFF_NO_CACHE", None)
+        else:
+            os.environ["TFF_NO_CACHE"] = orig_tff_no_cache
+
 
 
 if __name__ == "__main__":

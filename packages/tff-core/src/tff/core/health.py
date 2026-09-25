@@ -302,6 +302,7 @@ def render_health_report(
     console: Console | None = None,
     *,
     group_by: str = "connascence",
+    duration: float | None = None,
 ) -> None:
     """Render a beautiful CLI health report using rich.
 
@@ -312,6 +313,8 @@ def render_health_report(
         connascence category.  ``"domain"`` groups by the path segment
         directly under ``models/`` and optionally a sub-domain, e.g.
         ``models/sources``, ``models/marts/marketing``.
+    duration:
+        Execution duration in seconds (optional).
     """
     console = console or Console()
     
@@ -323,14 +326,18 @@ def render_health_report(
     
     score_color = "green" if overall_score >= 90 else "yellow" if overall_score >= 70 else "red"
     
+    panel_info = f"Active checks: {len(enabled_checks)}  ·  Categories: {sum(1 for v in category_scores.values() if v is not None)}"
+    if duration is not None:
+        panel_info += f"  ·  Duration: {duration:.2f}s"
+
     score_panel = Panel(
         Text.assemble(
             ("Overall Project Health Score: ", "bold white"),
             (f"{overall_score:.1f}%", f"bold {score_color}"),
             ("\n", ""),
-            (f"Active checks: {len(enabled_checks)}  ·  Categories: {sum(1 for v in category_scores.values() if v is not None)}", "dim")
+            (panel_info, "dim")
         ),
-        title=f"[bold {score_color}]TFF PROJECT HEALTH REPORT[/bold {score_color}]",
+        title=f"[bold {score_color}]tff PROJECT HEALTH REPORT[/bold {score_color}]",
         border_style=score_color,
         padding=(1, 2),
     )
@@ -395,6 +402,36 @@ def render_health_report(
         _render_health_by_connascence(scores, enabled_checks, check_scores, check_findings, console)
 
 
+def _format_health_check_desc(
+    icon_markup: str,
+    check: str,
+    label: str,
+    weight_str: str = "",
+    disabled: bool = False,
+) -> Text:
+    """Format check description column with status icon, label, and OSC-8 hyperlink if available."""
+    docs_url = registry.get_docs_url(check)
+    desc = Text()
+    if disabled:
+        desc.append("  - ", style="dim")
+        desc.append(label, style=f"dim link {docs_url}" if docs_url else "dim")
+        desc.append("\n    (", style="dim")
+        desc.append(check, style=f"dim link {docs_url}" if docs_url else "dim")
+        desc.append(")", style="dim")
+        return desc
+
+    desc.append("  ")
+    desc.append_text(Text.from_markup(icon_markup))
+    desc.append(" ")
+    desc.append(label, style=f"link {docs_url}" if docs_url else None)
+    desc.append("\n    (", style="dim")
+    desc.append(check, style=f"dim link {docs_url}" if docs_url else "dim")
+    if weight_str:
+        desc.append(weight_str, style="dim")
+    desc.append(")", style="dim")
+    return desc
+
+
 def _render_health_by_connascence(
     scores: dict[str, Any],
     enabled_checks: set[str],
@@ -405,11 +442,6 @@ def _render_health_by_connascence(
     """Render detailed breakdown grouped by connascence category."""
     console.print("[bold cyan]Detailed Breakdown by Check[/bold cyan]")
 
-    table = Table(box=None, show_header=False, padding=(0, 2, 0, 0))
-    table.add_column()
-    table.add_column(width=22, no_wrap=True)
-    table.add_column(no_wrap=True)
-
     check_weights = scores.get("check_weights", {})
     first_cat = True
     for cat_name, cat_checks in CATEGORIES.items():
@@ -419,10 +451,15 @@ def _render_health_by_connascence(
             continue
 
         if not first_cat:
-            table.add_row("", "", "")
+            console.print()
         first_cat = False
 
-        table.add_row(Text.from_markup(f"[bold cyan]● {cat_name}[/bold cyan]"), "", "")
+        console.print(f"[bold cyan]● {cat_name}[/bold cyan]")
+
+        table = Table(box=None, show_header=False, padding=(0, 2, 0, 0))
+        table.add_column(min_width=38)
+        table.add_column(width=22, no_wrap=True)
+        table.add_column(no_wrap=True)
 
         for check in cat_checks:
             label = CHECK_LABELS.get(check, check)
@@ -453,14 +490,16 @@ def _render_health_by_connascence(
 
                 weight = check_weights.get(check, 1.0)
                 weight_str = f" · weight: {weight:g}" if weight != 1.0 else ""
-                check_desc = Text.from_markup(f"  {icon} {label}\n    [dim]({check}{weight_str})[/dim]")
+                check_desc = _format_health_check_desc(icon, check, label, weight_str=weight_str)
                 bar = make_progress_bar(score, width=10)
                 score_cell = Text.from_markup(f"{bar} {score_text}")
 
                 table.add_row(check_desc, score_cell, Text.from_markup(violation_text))
             else:
-                check_desc = Text.from_markup(f"  [dim]- {label}\n    ({check})[/dim]")
+                check_desc = _format_health_check_desc("-", check, label, disabled=True)
                 table.add_row(check_desc, Text("Disabled", style="dim"), "")
+
+        console.print(table)
 
     # Print other checks if any
     all_known_checks: set[str] = set()
@@ -469,8 +508,13 @@ def _render_health_by_connascence(
     unknown_enabled = [c for c in enabled_checks if c not in all_known_checks]
     if unknown_enabled:
         if not first_cat:
-            table.add_row("", "", "")
-        table.add_row(Text.from_markup("[bold cyan]● Other Checks[/bold cyan]"), "", "")
+            console.print()
+        console.print("[bold cyan]● Other Checks[/bold cyan]")
+
+        table = Table(box=None, show_header=False, padding=(0, 2, 0, 0))
+        table.add_column(min_width=38)
+        table.add_column(width=22, no_wrap=True)
+        table.add_column(no_wrap=True)
 
         for check in unknown_enabled:
             label = CHECK_LABELS.get(check, check)
@@ -498,13 +542,14 @@ def _render_health_by_connascence(
 
             weight = check_weights.get(check, 1.0)
             weight_str = f" · weight: {weight:g}" if weight != 1.0 else ""
-            check_desc = Text.from_markup(f"  {icon} {label}\n    [dim]({check}{weight_str})[/dim]")
+            check_desc = _format_health_check_desc(icon, check, label, weight_str=weight_str)
             bar = make_progress_bar(score, width=10)
             score_cell = Text.from_markup(f"{bar} {score_text}")
 
             table.add_row(check_desc, score_cell, Text.from_markup(violation_text))
 
-    console.print(table)
+        console.print(table)
+
     console.print()
 
 
@@ -608,7 +653,7 @@ def _render_health_by_domain(
         console.print(header_line)
 
         table = Table(box=None, show_header=False, padding=(0, 2, 0, 0))
-        table.add_column()
+        table.add_column(min_width=38)
         table.add_column(width=22, no_wrap=True)
         table.add_column(no_wrap=True)
 
@@ -646,7 +691,7 @@ def _render_health_by_domain(
                     parts.append(f"{warnings} warning{'s' if warnings != 1 else ''}")
                 violation_text = f"[dim]({', '.join(parts)})[/dim]"
 
-            check_desc = Text.from_markup(f"  {icon} {label}\n    [dim]({check})[/dim]")
+            check_desc = _format_health_check_desc(icon, check, label)
             bar = make_progress_bar(local_score, width=10)
             score_cell = Text.from_markup(f"{bar} {score_text}")
             table.add_row(check_desc, score_cell, Text.from_markup(violation_text))

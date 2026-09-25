@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from tff.core.config import (
     DEFAULT_LAYER_ORDER,
@@ -179,7 +180,10 @@ def test_schema_contract_models_parsing():
     # ColumnParityGroup with string shorthand members
     group = ColumnParityGroup(
         reference="models/ref.sql",
-        members=["models/m1.sql", {"file": "models/m2.sql", "substitutions": {"x": "y"}}],
+        members=[
+            "models/m1.sql",
+            {"file": "models/m2.sql", "substitutions": {"x": "y"}},
+        ],
     )
     assert len(group.members) == 2
     assert group.members[0].file == "models/m1.sql"
@@ -282,7 +286,11 @@ def test_context_deprecation():
         assert retrieved is cfg
         clear_ff_config()
 
-        messages = [str(item.message) for item in w if issubclass(item.category, DeprecationWarning)]
+        messages = [
+            str(item.message)
+            for item in w
+            if issubclass(item.category, DeprecationWarning)
+        ]
         assert any("set_ff_config() is deprecated" in msg for msg in messages)
         assert any("get_ff_config() is deprecated" in msg for msg in messages)
         assert any("clear_ff_config() is deprecated" in msg for msg in messages)
@@ -385,46 +393,210 @@ health:
     assert config.health.penalties.project_warning == 15.0
 
     # Negative weights rejected
-    with pytest.raises(ValueError, match="Weight for 'layer_integrity' must be non-negative"):
-        FitnessFunctionsConfig.model_validate({
-            "health": {"weights": {"layer_integrity": -1.0}}
-        })
+    with pytest.raises(
+        ValueError, match="Weight for 'layer_integrity' must be non-negative"
+    ):
+        FitnessFunctionsConfig.model_validate(
+            {"health": {"weights": {"layer_integrity": -1.0}}}
+        )
 
-    with pytest.raises(ValueError, match="Weight for 'Dynamic Coupling' must be non-negative"):
-        FitnessFunctionsConfig.model_validate({
-            "health": {"category_weights": {"Dynamic Coupling": -0.5}}
-        })
+    with pytest.raises(
+        ValueError, match="Weight for 'Dynamic Coupling' must be non-negative"
+    ):
+        FitnessFunctionsConfig.model_validate(
+            {"health": {"category_weights": {"Dynamic Coupling": -0.5}}}
+        )
 
     # Negative penalty rejected
     with pytest.raises(ValueError):
-        FitnessFunctionsConfig.model_validate({
-            "health": {"penalties": {"error": -1.0}}
-        })
+        FitnessFunctionsConfig.model_validate(
+            {"health": {"penalties": {"error": -1.0}}}
+        )
 
     # Non-dict weights / category_weights validator coverage
-    health_empty = FitnessFunctionsConfig.model_validate({
-        "health": {"weights": None, "category_weights": None}
-    })
+    health_empty = FitnessFunctionsConfig.model_validate(
+        {"health": {"weights": None, "category_weights": None}}
+    )
     assert health_empty.health.weights == {}
 
     with pytest.raises(Exception):
-        FitnessFunctionsConfig.model_validate({
-            "health": {"weights": "not-a-dict"}
-        })
+        FitnessFunctionsConfig.model_validate({"health": {"weights": "not-a-dict"}})
 
     # Check penalties with ratio for project-level check
-    ratio_cfg = FitnessFunctionsConfig.model_validate({
-        "health": {
-            "penalties": {
-                "checks": {
-                    "layer_integrity": {"error": 0.25, "warning": 0.10}
+    ratio_cfg = FitnessFunctionsConfig.model_validate(
+        {
+            "health": {
+                "penalties": {
+                    "checks": {"layer_integrity": {"error": 0.25, "warning": 0.10}}
                 }
             }
         }
-    })
-    assert ratio_cfg.health.penalties.get_check_error_penalty("layer_integrity", is_project_level=True) == 25.0
-    assert ratio_cfg.health.penalties.get_check_warning_penalty("layer_integrity", is_project_level=True) == 10.0
+    )
+    assert (
+        ratio_cfg.health.penalties.get_check_error_penalty(
+            "layer_integrity", is_project_level=True
+        )
+        == 25.0
+    )
+    assert (
+        ratio_cfg.health.penalties.get_check_warning_penalty(
+            "layer_integrity", is_project_level=True
+        )
+        == 10.0
+    )
 
 
+def test_fitness_config_plugins(tmp_path: Path):
+    from tff.core.config import (
+        FitnessFunctionsConfig,
+        STARTER_CONFIG_YAML,
+        load_fitness_config,
+    )
+    from tff.core.registry import registry
+
+    # 1. plugins as list
+    cfg1 = FitnessFunctionsConfig(plugins=["plugin1.py", "plugin2.py"])
+    assert cfg1.plugins == ["plugin1.py", "plugin2.py"]
+
+    # 2. plugins as single string normalized
+    cfg2 = FitnessFunctionsConfig.model_validate({"plugins": "single_plugin.py"})
+    assert cfg2.plugins == ["single_plugin.py"]
+
+    # 3. plugins as None normalized to empty list
+    cfg3 = FitnessFunctionsConfig.model_validate({"plugins": None})
+    assert cfg3.plugins == []
+
+    # Invalid plugins type raises ValidationError
+    with pytest.raises(ValidationError):
+        FitnessFunctionsConfig.model_validate({"plugins": 123})
+
+    # 4. STARTER_CONFIG_YAML contains plugins comment
+    assert "# plugins:" in STARTER_CONFIG_YAML
+
+    # 5. load_fitness_config triggers plugin loading
+    plugin_file = tmp_path / "cfg_test_plugin.py"
+    plugin_file.write_text(
+        """from tff.core.rules.base import Rule
+class CfgTestRule(Rule):
+    name = "cfg_test_rule"
+    def check_model(self, model):
+        return None
+""",
+        encoding="utf-8",
+    )
+
+    yaml_file = tmp_path / "fitness_functions.yaml"
+    yaml_file.write_text(
+        f"""plugins:
+  - "{plugin_file.name}"
+""",
+        encoding="utf-8",
+    )
+
+    loaded_cfg = load_fitness_config(tmp_path)
+    assert loaded_cfg.plugins == [plugin_file.name]
+    assert registry.get("cfg_test_rule") is not None
 
 
+def test_rule_get_rule_config():
+    from tff.core.config import FitnessFunctionsConfig
+    from tff.core.rules.base import Rule
+
+    class TestCustomRule(Rule):
+        name = "test_custom_rule"
+
+    cfg = FitnessFunctionsConfig.model_validate(
+        {
+            "rules": {
+                "test_custom_rule": {"threshold": 42, "enabled": True},
+                "other_rule": {"threshold": 100},
+            }
+        }
+    )
+
+    rule = TestCustomRule(config=cfg)
+    rule_cfg = rule.get_rule_config()
+    assert rule_cfg == {"threshold": 42, "enabled": True}
+
+    # Match via explicit rule_name
+    assert rule.get_rule_config("other_rule") == {"threshold": 100}
+
+    # Unknown rule config returns None
+    assert rule.get_rule_config("nonexistent_rule") is None
+
+    # Builtin rule name (e.g. ban_select_star) returns direct attribute
+    assert rule.get_rule_config("ban_select_star") is cfg.rules.ban_select_star
+
+    # Rule without config
+    rule_bare = TestCustomRule()
+    rule_bare._config = None
+    rule_bare.config.rules = None  # type: ignore[assignment]
+    assert rule_bare.get_rule_config() is None
+
+
+def test_config_workers_and_cache():
+    cfg = FitnessFunctionsConfig(workers=4, cache_ast=False, cache_dir=".custom_cache")
+    assert cfg.workers == 4
+    assert cfg.cache_ast is False
+    assert cfg.cache_dir == ".custom_cache"
+
+    # String converted to int
+    cfg_str = FitnessFunctionsConfig(workers="2")
+    assert cfg_str.workers == 2
+
+    # None allowed
+    cfg_none = FitnessFunctionsConfig(workers=None)
+    assert cfg_none.workers is None
+
+    # Invalid workers < 1 raises ValidationError
+    with pytest.raises(ValidationError, match="workers must be at least 1"):
+        FitnessFunctionsConfig(workers=0)
+
+
+def test_sql_complexity_warn_only_in_yaml_raises_error(tmp_path: Path) -> None:
+    yaml_path = tmp_path / "fitness_functions.yaml"
+    yaml_path.write_text(
+        """
+rules:
+  sql_complexity:
+    enabled: true
+    warn_only: true
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValidationError,
+        match="rules.sql_complexity.warn_only' is deprecated and no longer supported",
+    ):
+        load_fitness_config(tmp_path)
+
+
+def test_load_fitness_config_multiple_project_roots(tmp_path: Path) -> None:
+    r1 = tmp_path / "repo1"
+    r2 = tmp_path / "repo2"
+    r1.mkdir()
+    r2.mkdir()
+
+    # Case 1: config file in second root
+    cfg_file = r2 / "fitness_functions.yaml"
+    cfg_file.write_text("workers: 5\n", encoding="utf-8")
+
+    cfg = load_fitness_config([r1, r2])
+    assert cfg._config_file_found is True
+    assert cfg.workers == 5
+    assert cfg._project_root == r1.resolve()
+
+    # Case 2: config file in first root takes precedence
+    (r1 / "fitness_functions.yaml").write_text("workers: 3\n", encoding="utf-8")
+    cfg2 = load_fitness_config([r1, r2])
+    assert cfg2._config_file_found is True
+    assert cfg2.workers == 3
+
+    # Case 3: config file not found in any root
+    r3 = tmp_path / "repo3"
+    r4 = tmp_path / "repo4"
+    r3.mkdir()
+    r4.mkdir()
+    cfg3 = load_fitness_config([r3, r4])
+    assert cfg3._config_file_found is False
+    assert cfg3._project_root == r3.resolve()

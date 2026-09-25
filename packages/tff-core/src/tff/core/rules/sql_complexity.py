@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 import sqlglot.expressions as exp
 from sqlglot import parse_one
@@ -55,7 +54,10 @@ def has_nested_subquery_in_final_select(expression: exp.Expression) -> bool:
     for node in final_select.find_all(exp.Subquery):
         parent = node.parent
         while parent and parent is not final_select:
-            if isinstance(parent, exp.From):
+            if (
+                isinstance(parent, (exp.From, exp.Join))
+                and parent.parent is final_select
+            ):
                 return True
             parent = parent.parent
     return False
@@ -118,6 +120,7 @@ def format_violations(
 
 class SqlComplexity(Rule):
     """Warn when SQL models exceed complexity thresholds (CTE/JOIN/decision points/lines)."""
+
     name = "sqlcomplexity"
 
     def check_model(self, model: ModelRepresentation) -> RuleViolation | None:
@@ -134,19 +137,15 @@ class SqlComplexity(Rule):
         if not rule_config.should_run(layer):
             return None
 
-        sql = model.query
+        sql = model.get_sql()
         if sql is None:
-            path = Path(model.path)
-            if path.suffix != ".sql" or not path.exists():
-                return None
-            try:
-                sql = path.read_text(encoding="utf-8")
-            except Exception:
-                return None
+            return None
 
         metrics = analyze_sql(sql, dialect=model.dialect, parsed=model.ast)
         violations = format_violations(
-            metrics, str(model.name), rule_config.thresholds
+            metrics,
+            str(model.name),
+            rule_config.thresholds,
         )
         if violations:
             return self.violation(violations)
