@@ -199,7 +199,7 @@ def generate_sarif_report(
                 "tool": {
                     "driver": {
                         "name": "tff",
-                        "version": tool_version or "0.7.0",
+                        "version": tool_version or "0.25.0",
                         "informationUri": "https://github.com/tjirab/tff",
                         "rules": sarif_rules,
                     }
