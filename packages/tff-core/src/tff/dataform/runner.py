@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Sequence
 
 from tff.core.config import FitnessFunctionsConfig, load_fitness_config
 from tff.core.model import ModelRepresentation
@@ -23,11 +24,12 @@ CHECK_COLLECTORS = {
 def collect_dataform_rules_findings(
     models: dict[str, ModelRepresentation],
     config: FitnessFunctionsConfig | None = None,
+    chunk_size: int | None = None,
 ) -> list[LintFinding]:
     """Collect findings for all registered model-level rules."""
     findings: list[LintFinding] = []
     for rule_def in registry.model_rules():
-        findings.extend(rule_def.run(models, config=config))
+        findings.extend(rule_def.run(models, config=config, chunk_size=chunk_size))
     return findings
 
 
@@ -36,17 +38,20 @@ def _check_enabled(config: FitnessFunctionsConfig, check_name: str) -> bool:
 
 
 def run_all_checks(
-    project_root: Path | None = None,
+    project_root: Path | Sequence[Path] | None = None,
     config: FitnessFunctionsConfig | None = None,
     checks: list[str] | None = None,
     dialect: str | None = None,
     manifest_path: str | Path | None = None,
     models: dict[str, ModelRepresentation] | None = None,
     workers: int | None = None,
+    scoped_models: set[str] | None = None,
+    chunk_size: int | None = None,
 ) -> tuple[list[LintFinding], int, list[str]]:
     project_root = project_root or Path.cwd()
     if config is None:
-        config = load_fitness_config(project_root)
+        first_root = project_root[0] if isinstance(project_root, (list, tuple)) else project_root
+        config = load_fitness_config(Path(first_root))
 
     resolved_workers = workers if workers is not None else getattr(config, "workers", None)
 
@@ -66,11 +71,16 @@ def run_all_checks(
         checks=checks,
         provider="dataform",
         max_workers=resolved_workers,
+        scoped_models=scoped_models,
+        chunk_size=chunk_size,
     )
 
-    # Count of non-external, non-symbolic models checked
-    models_checked = sum(
-        1 for m in models.values() if not m.is_external and not m.is_symbolic
-    )
+    if scoped_models is not None:
+        models_checked = len(scoped_models)
+    else:
+        # Count of non-external, non-symbolic models checked
+        models_checked = sum(
+            1 for m in models.values() if not m.is_external and not m.is_symbolic
+        )
 
     return findings, models_checked, selected

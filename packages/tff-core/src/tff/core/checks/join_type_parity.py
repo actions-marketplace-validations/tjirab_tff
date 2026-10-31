@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 import re
 from typing import TYPE_CHECKING
 
@@ -59,16 +60,25 @@ DEFAULT_EQUIVALENT_TYPES: dict[str, set[str]] = {
 }
 
 
+_RE_PARENS = re.compile(r"\(.*?\)")
+_RE_BRACKETS = re.compile(r"\[\]")
+
+
+@lru_cache(maxsize=512)
+def _normalize_type_str(s: str) -> str:
+    s = s.strip().lower()
+    s = _RE_PARENS.sub("", s).strip()
+    s = _RE_BRACKETS.sub("", s).strip()
+    return s
+
+
 def normalize_type_string(raw_type: str | exp.DataType | None) -> str:
     """Normalize raw SQL data type string (e.g. VARCHAR(255) -> varchar)."""
     if raw_type is None:
         return ""
     if isinstance(raw_type, exp.DataType):
         raw_type = raw_type.sql()
-    s = str(raw_type).strip().lower()
-    s = re.sub(r"\(.*?\)", "", s).strip()
-    s = re.sub(r"\[\]", "", s).strip()
-    return s
+    return _normalize_type_str(str(raw_type))
 
 
 def are_types_equivalent(
@@ -173,14 +183,42 @@ class ModelTypeResolver:
         return self._lookup.get(parts[-1], {}).get(clean_col)
 
 
+_STRING_FUNCTIONS = (
+    exp.Lower,
+    exp.Upper,
+    exp.Trim,
+    exp.Concat,
+    exp.ConcatWs,
+    exp.Substring,
+    exp.DPipe,
+    exp.ToChar,
+)
+
+_TEMPORAL_TIMESTAMP_FUNCTIONS = (
+    exp.DateTrunc,
+    exp.TimestampTrunc,
+    exp.DatetimeTrunc,
+    exp.Timestamp,
+    exp.TsOrDsToTimestamp,
+    exp.Datetime,
+    exp.CurrentTimestamp,
+)
+
+_TEMPORAL_DATE_FUNCTIONS = (
+    exp.Date,
+    exp.TsOrDsToDate,
+    exp.CurrentDate,
+)
+
+
 def resolve_expression_type(
-    expr: exp.Expression,
+    expr: exp.Expression | None,
     scope: Scope,
     resolver: ModelTypeResolver,
     depth: int = 0,
 ) -> str | None:
     """Infer or look up the data type of an expression in a given AST Scope."""
-    if depth > 10:
+    if expr is None or depth > 10:
         return None
 
     if isinstance(expr, exp.Cast):
@@ -194,6 +232,54 @@ def resolve_expression_type(
 
     if isinstance(expr, exp.Paren):
         return resolve_expression_type(expr.this, scope, resolver, depth + 1)
+
+    if isinstance(expr, _STRING_FUNCTIONS):
+        return "text"
+
+    if isinstance(expr, _TEMPORAL_DATE_FUNCTIONS):
+        return "date"
+
+    if isinstance(expr, _TEMPORAL_TIMESTAMP_FUNCTIONS):
+        return "timestamp"
+
+    if isinstance(expr, exp.Coalesce):
+        args = [expr.this] if expr.this is not None else []
+        args.extend(expr.expressions)
+        for arg in args:
+            arg_type = resolve_expression_type(arg, scope, resolver, depth + 1)
+            if arg_type is not None:
+                return arg_type
+        return None
+
+    if isinstance(expr, exp.If):
+        true_expr = expr.args.get("true")
+        if true_expr is not None:
+            res = resolve_expression_type(true_expr, scope, resolver, depth + 1)
+            if res is not None:
+                return res
+        false_expr = expr.args.get("false")
+        if false_expr is not None:
+            res = resolve_expression_type(false_expr, scope, resolver, depth + 1)
+            if res is not None:
+                return res
+        return None
+
+    if isinstance(expr, exp.Case):
+        for if_node in expr.args.get("ifs") or []:
+            true_expr = if_node.args.get("true") if hasattr(if_node, "args") else None
+            if true_expr is not None:
+                res = resolve_expression_type(true_expr, scope, resolver, depth + 1)
+                if res is not None:
+                    return res
+        default_expr = expr.args.get("default")
+        if default_expr is not None:
+            return resolve_expression_type(default_expr, scope, resolver, depth + 1)
+        return None
+
+    if isinstance(expr, (exp.Nullif, exp.Abs)):
+        if expr.this is not None:
+            return resolve_expression_type(expr.this, scope, resolver, depth + 1)
+        return None
 
     if isinstance(expr, exp.Column):
         col_name = expr.name.lower()

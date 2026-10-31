@@ -12,23 +12,33 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
+from pydantic import ValidationError
 from rich.console import Console
 from rich.markup import escape
 
-from tff.core.adapter import PipelineAdapter, detect_provider, get_adapter, normalize_project_roots
+from tff.core.adapter import (
+    PipelineAdapter,
+    detect_provider,
+    get_adapter,
+    normalize_project_roots,
+)
 from tff.core.config import (
     MISSING_CONFIG_NOTICE,
     init_fitness_config,
     load_fitness_config,
     resolve_project_path,
 )
-from tff.core.exceptions import TffError
+from tff.core.exceptions import (
+    TffDependencyError,
+    TffError,
+    TffProviderError,
+    normalize_validation_error,
+)
 from tff.core.logs import is_debug_enabled, setup_cli_logging
 from tff.core.registry import CheckDefinition, normalize_check_name, registry
-from tff.core.report import render_lint_report
+from tff.core.report import normalize_model_name, render_lint_report
 
 if TYPE_CHECKING:
-    from tff.core.config import FitnessFunctionsConfig
     from tff.core.model import ModelRepresentation
     from tff.core.report import LintFinding
 
@@ -37,16 +47,20 @@ logger = logging.getLogger("tff.core.cli")
 try:
     __version__ = importlib.metadata.version("tff-core")
 except Exception:
-    __version__ = "0.7.0"
+    __version__ = "0.25.0"
 
 
-def render_cli_error(error: TffError | Exception, console: Console | None = None) -> None:
+def render_cli_error(
+    error: TffError | Exception,
+    console: Console | None = None,
+    debug: bool = False,
+) -> None:
     """Render a structured error diagnostic block to stderr using rich.
 
     Formats user-facing errors cleanly into three parts:
-      1. What happened: "✖ Error: <message>"
-      2. Context metadata: "• Model:", "• Path:", "• Rule:", etc.
-      3. Remediation hint: "• Hint: <hint>"
+      1. What happened: "FAIL Error: <message>"
+      2. Context metadata: "● Model:", "● Path:", "● Rule:", etc.
+      3. Remediation hint: "● Hint: <hint>"
 
     Args:
         error: The domain exception or error to render.
@@ -58,7 +72,7 @@ def render_cli_error(error: TffError | Exception, console: Console | None = None
     message = getattr(error, "message", None) or str(error)
     if not message:
         message = "An unknown error occurred."
-    console.print(f"[bold red]✖ Error:[/bold red] {escape(message)}")
+    console.print(f"[bold red]FAIL Error:[/bold red] {escape(message)}")
 
     details = getattr(error, "details", {})
     if not isinstance(details, dict):
@@ -77,6 +91,13 @@ def render_cli_error(error: TffError | Exception, console: Console | None = None
     path = getattr(error, "path", None) or details.get("path")
     if path:
         bullets.append(("Path", path))
+
+    project_root = getattr(error, "project_root", None) or details.get("project_root")
+    if project_root:
+        if isinstance(project_root, (list, tuple)):
+            bullets.append(("Project Root", ", ".join(str(p) for p in project_root)))
+        else:
+            bullets.append(("Project Root", str(project_root)))
 
     rule = (
         details.get("rule")
@@ -98,6 +119,8 @@ def render_cli_error(error: TffError | Exception, console: Console | None = None
         "model",
         "model_name",
         "path",
+        "project_root",
+        "package_hint",
         "rule",
         "rule_name",
         "check",
@@ -113,191 +136,107 @@ def render_cli_error(error: TffError | Exception, console: Console | None = None
             bullets.append((label, v))
 
     for label, val in bullets:
-        console.print(f"  [dim]•[/dim] [bold]{label}:[/bold] {escape(str(val))}")
+        console.print(f"  [dim]●[/dim] [bold]{label}:[/bold] {escape(str(val))}")
 
     hint = getattr(error, "hint", None)
     if hint:
-        console.print(f"  [dim]•[/dim] [bold cyan]Hint:[/bold cyan] {escape(hint)}")
+        console.print(f"  [dim]●[/dim] [bold blue]Hint:[/bold blue] {escape(str(hint))}")
 
 
 
-def _detect_provider(project_root: Path | Sequence[Path]) -> str:
+def _detect_provider(
+    project_root: Path | Sequence[Path], config_path: str | Path | None = None
+) -> str:
     """Detect whether a project is dbt, SQLMesh, or Dataform."""
-    return detect_provider(project_root)
-
-
-def _get_runner(provider: str) -> Any:
-    """Load and return the runner module for the specified provider."""
-    if provider == "dbt":
-        try:
-            return importlib.import_module("tff.dbt.runner")
-        except ImportError as e:
-            raise ImportError(
-                "dbt project detected, but tff is not installed with dbt support.\n"
-                'Please install it using: pip install "tff-core[dbt]" or uv add "tff-core[dbt]"'
-            ) from e
-    elif provider == "sqlmesh":
-        try:
-            return importlib.import_module("tff.sqlmesh.runner")
-        except ImportError as e:
-            raise ImportError(
-                "SQLMesh project detected, but tff is not installed with sqlmesh support.\n"
-                'Please install it using: pip install "tff-core[sqlmesh]" or uv add "tff-core[sqlmesh]"'
-            ) from e
-    elif provider == "dataform":
-        try:
-            return importlib.import_module("tff.dataform.runner")
-        except ImportError as e:
-            raise ImportError(
-                "Dataform project detected, but tff is not installed with dataform support.\n"
-                'Please install it using: pip install "tff-core[dataform]" or uv add "tff-core[dataform]"'
-            ) from e
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
-
-class _MockRunnerAdapter(PipelineAdapter):
-    """Fallback adapter wrapping a mock runner for backwards-compatibility with existing tests."""
-
-    def __init__(self, provider: str, mock_runner: Any) -> None:
-        self._provider = provider
-        self._runner = mock_runner
-
-    @property
-    def provider_name(self) -> str:
-        return self._provider
-
-    def is_applicable(self, project_root: Path) -> bool:
-        return True
-
-    def load_models(
-        self,
-        project_root: Path | Sequence[Path],
-        dialect: str | None = None,
-        manifest_path: str | Path | None = None,
-    ) -> dict[str, Any]:
-        roots = normalize_project_roots(project_root)
-        if self._provider == "dbt":
-            from tff.dbt.manifest import load_dbt_models
-
-            return load_dbt_models(roots[0], dialect=dialect)
-        elif self._provider == "dataform":
-            from tff.dataform.manifest import load_dataform_models
-
-            return load_dataform_models(
-                roots[0], manifest_path=manifest_path, dialect=dialect
-            )
-        elif self._provider == "sqlmesh":
-            from sqlmesh.core.context import Context
-            from tff.sqlmesh.loader import FitnessLoader
-            from tff.sqlmesh.runner import map_sqlmesh_context_models
-
-            context = Context(paths=[str(r) for r in roots], loader=FitnessLoader)
-            return map_sqlmesh_context_models(context)
-        return {}
-
-    def run_checks(
-        self,
-        project_root: Path | Sequence[Path],
-        config: FitnessFunctionsConfig,
-        checks: list[str] | None = None,
-        dialect: str | None = None,
-        manifest_path: str | Path | None = None,
-        models: dict[str, ModelRepresentation] | None = None,
-    ) -> tuple[list[LintFinding], int, list[str]]:
-        roots = normalize_project_roots(project_root)
-        root_arg = roots[0] if len(roots) == 1 else roots
-        kwargs: dict[str, Any] = {
-            "project_root": root_arg,
-            "config": config,
-            "checks": checks,
-        }
-        if self._provider == "dbt":
-            kwargs["dialect"] = dialect
-            if models is not None:
-                kwargs["models"] = models
-        elif self._provider == "dataform":
-            kwargs["dialect"] = dialect
-            kwargs["manifest_path"] = manifest_path
-            if models is not None:
-                kwargs["models"] = models
-        elif self._provider == "sqlmesh":
-            if models is not None:
-                kwargs["models"] = models
-        return self._runner.run_all_checks(**kwargs)
-
-    def apply_metadata_fix(
-        self,
-        project_root: Path,
-        abs_path: Path,
-        model_name: str,
-        missing_owner: bool,
-        missing_description: bool,
-    ) -> str | None:
-        if self._provider == "dbt":
-            from tff.core.autofix import fix_dbt_metadata
-
-            return fix_dbt_metadata(
-                abs_path=abs_path,
-                model_name=model_name,
-                missing_owner=missing_owner,
-                missing_description=missing_description,
-            )
-        elif self._provider == "sqlmesh":
-            from tff.core.autofix import fix_sqlmesh_metadata
-
-            return fix_sqlmesh_metadata(
-                abs_path=abs_path,
-                missing_owner=missing_owner,
-                missing_description=missing_description,
-            )
-        return None
-
-    def get_diagnostic_files(
-        self, project_root: Path | Sequence[Path]
-    ) -> list[tuple[str, str]]:
-        roots = normalize_project_roots(project_root)
-        results: list[tuple[str, str]] = []
-        for r in roots:
-            prefix = f"[{r.name}] " if len(roots) > 1 else ""
-            if self._provider == "dbt":
-                dbt_project = r / "dbt_project.yml"
-                manifest = r / "target" / "manifest.json"
-                dbt_project_status = (
-                    "[green]found[/green]" if dbt_project.exists() else "[red]missing[/red]"
-                )
-                manifest_status = (
-                    "[green]found[/green]" if manifest.exists() else "[red]missing[/red]"
-                )
-                results.append((f"{prefix}dbt_project.yml", f"{dbt_project} ({dbt_project_status})"))
-                results.append((f"{prefix}manifest.json", f"{manifest} ({manifest_status})"))
-            elif self._provider == "sqlmesh":
-                config_py = r / "config.py"
-                settings_yaml = r / "settings.yaml"
-                config_py_status = (
-                    "[green]found[/green]" if config_py.exists() else "[red]missing[/red]"
-                )
-                settings_yaml_status = (
-                    "[green]found[/green]"
-                    if settings_yaml.exists()
-                    else "[red]missing[/red]"
-                )
-                results.append((f"{prefix}config.py", f"{config_py} ({config_py_status})"))
-                results.append((f"{prefix}settings.yaml", f"{settings_yaml} ({settings_yaml_status})"))
-        return results
+    return detect_provider(project_root, config_path=config_path)
 
 
 def _get_adapter(provider: str) -> PipelineAdapter:
-    """Load and return the adapter instance for the specified provider, wrapping test mocks if present."""
-    try:
-        runner = _get_runner(provider)
-        from unittest.mock import Mock
-
-        if isinstance(runner, Mock):
-            return _MockRunnerAdapter(provider, runner)
-    except Exception:
-        pass
+    """Load and return the adapter instance for the specified provider."""
     return get_adapter(provider)
+
+
+def _convert_to_provider_error(
+    exc: Exception,
+    *,
+    provider: str | None = None,
+    project_roots: Path | Sequence[Path] | None = None,
+) -> TffProviderError:
+    """Convert an arbitrary exception into a structured TffProviderError."""
+    if isinstance(exc, TffProviderError):
+        return exc
+
+    raw_msg = getattr(exc, "message", None) or str(exc)
+    hint = getattr(exc, "hint", None)
+    if not hint and "\n" in raw_msg:
+        parts = raw_msg.split("\n", 1)
+        msg = parts[0].strip()
+        candidate_hint = parts[1].strip()
+        if candidate_hint.startswith("Hint: "):
+            hint = candidate_hint[6:].strip()
+        elif candidate_hint.startswith("Please "):
+            hint = candidate_hint[7:].strip()
+            hint = hint[0].upper() + hint[1:]
+        else:
+            hint = candidate_hint
+    else:
+        msg = raw_msg
+        if not hint:
+            if provider:
+                hint = f"Check provider '{provider}' configuration or install the required adapter plugin."
+            else:
+                hint = "Please run this command from your project root, or specify the provider explicitly using the --provider option."
+
+    return TffProviderError(
+        msg,
+        hint=hint,
+        provider=provider,
+        project_root=project_roots,
+        original_error=exc,
+    )
+
+
+def _convert_to_dependency_error(
+    exc: Exception,
+    *,
+    provider: str | None = None,
+    project_roots: Path | Sequence[Path] | None = None,
+) -> TffDependencyError:
+    """Convert an arbitrary exception into a structured TffDependencyError."""
+    if isinstance(exc, TffDependencyError):
+        return exc
+
+    raw_msg = getattr(exc, "message", None) or str(exc)
+    hint = getattr(exc, "hint", None)
+    if not hint and "\n" in raw_msg:
+        parts = raw_msg.split("\n", 1)
+        msg = parts[0].strip()
+        candidate_hint = parts[1].strip()
+        if candidate_hint.startswith("Hint: "):
+            hint = candidate_hint[6:].strip()
+        elif candidate_hint.startswith("Please "):
+            hint = candidate_hint[7:].strip()
+            hint = hint[0].upper() + hint[1:]
+        else:
+            hint = candidate_hint
+    else:
+        msg = raw_msg
+        if not hint:
+            if provider:
+                pkg = f"tff-core[{provider}]"
+                hint = f'Please install it using: pip install "{pkg}" or uv add "{pkg}"'
+            else:
+                hint = "Please install the missing dependency."
+
+    pkg_hint = getattr(exc, "package_hint", None) or (f"tff-core[{provider}]" if provider else None)
+    return TffDependencyError(
+        msg,
+        hint=hint,
+        provider=provider,
+        project_root=project_roots,
+        package_hint=pkg_hint,
+        original_error=exc,
+    )
 
 
 
@@ -305,6 +244,85 @@ def _parse_checks(value: str | None) -> list[str] | None:
     if not value:
         return None
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _inject_target_venv(project_roots: Sequence[Path]) -> list[str]:
+    """Discover target projects' virtualenv site-packages, register them via site.addsitedir, and return their paths."""
+    import site
+
+    target_site_packages: list[str] = []
+    for root in project_roots:
+        for venv_name in (".venv", "venv", "env"):
+            venv_dir = root / venv_name
+            if venv_dir.is_dir():
+                # Unix
+                libs_dir = venv_dir / "lib"
+                if libs_dir.is_dir():
+                    for p in libs_dir.glob("python*/site-packages"):
+                        if p.is_dir():
+                            site.addsitedir(str(p))
+                            target_site_packages.append(str(p))
+                # Windows
+                win_lib = venv_dir / "Lib" / "site-packages"
+                if win_lib.is_dir():
+                    site.addsitedir(str(win_lib))
+                    target_site_packages.append(str(win_lib))
+    return target_site_packages
+
+
+def _get_package_version(
+    pkg: str, target_site_packages: Sequence[str] | None = None
+) -> str:
+    """Retrieve installed version of a package from target virtualenv or active Python environment."""
+    import importlib.metadata as metadata
+
+    try:
+        if target_site_packages:
+            pkg_norm = pkg.lower().replace("_", "-")
+            dists = metadata.distributions(path=target_site_packages)
+            for dist in dists:
+                name = dist.metadata.get("Name")
+                if name and name.lower().replace("_", "-") == pkg_norm:
+                    return dist.version
+            return "not installed"
+        return metadata.version(pkg)
+    except Exception:
+        return "not installed"
+
+
+def _get_sqlmesh_info(
+    target_site_packages: Sequence[str] | None = None,
+) -> tuple[bool, str | None]:
+    """Check if sqlmesh is available and return (is_available, version_or_none)."""
+    import importlib.util
+
+    try:
+        has_sqlmesh = importlib.util.find_spec("sqlmesh") is not None
+    except Exception:
+        has_sqlmesh = False
+
+    if not has_sqlmesh:
+        return False, None
+
+    ver = _get_package_version("sqlmesh", target_site_packages)
+    return True, ver if ver != "not installed" else None
+
+
+def _format_provider_status_display(
+    provider: str,
+    target_site_packages: Sequence[str] | None = None,
+) -> str:
+    """Return formatted status string for the provider (e.g. 'dbt (core)', 'sqlmesh (sqlmesh 0.236.2 enabled)')."""
+    if provider in ("dbt", "dataform"):
+        return f"{provider} [dim](core)[/dim]"
+    if provider == "sqlmesh":
+        has_sqlmesh, sqlmesh_ver = _get_sqlmesh_info(target_site_packages)
+        if has_sqlmesh:
+            if sqlmesh_ver:
+                return f"sqlmesh [dim](sqlmesh {sqlmesh_ver} enabled)[/dim]"
+            return "sqlmesh [dim](sqlmesh extra enabled)[/dim]"
+        return "sqlmesh [dim red](not enabled - install 'tff-core[sqlmesh]')[/dim red]"
+    return f"{provider} [dim](plugin)[/dim]"
 
 
 class TffArgumentParser(argparse.ArgumentParser):
@@ -464,9 +482,9 @@ def _explain_single_check(check: CheckDefinition, console: Console | None = None
     if console is None:
         console = Console()
 
-    console.print(f"[bold cyan]{check.id}[/bold cyan] [dim]({check.category})[/dim]")
+    console.print(f"[bold]{check.id}[/bold] [dim]({check.category})[/dim]")
     width = min(console.width if console.width else 80, 78)
-    console.print("[dim]" + "─" * width + "[/dim]")
+    console.print("─" * width, style="dim")
 
     sev_label = "Error (Default)" if check.default_severity == "error" else "Warning (Default)"
     sev_style = "bold red" if check.default_severity == "error" else "bold yellow"
@@ -509,6 +527,11 @@ def _explain_single_check(check: CheckDefinition, console: Console | None = None
     if check.docs_url:
         console.print(f"\n[bold]Documentation:[/bold] [link={check.docs_url}]{check.docs_url}[/link]")
 
+    if check.id in ("sqlcomplexity", "sql_complexity"):
+        console.print("\n[bold]Model Inspection:[/bold]")
+        console.print("To inspect decision points in a specific model, run:")
+        console.print("  [bold cyan]tff explain sqlcomplexity --model <model_name>[/bold cyan]")
+
 
 def _render_rules_table(
     checks: list[CheckDefinition],
@@ -516,19 +539,20 @@ def _render_rules_table(
     console: Console | None = None,
 ) -> None:
     """Render a tabular catalog of checks with categories, severities, and descriptions."""
-    from rich import box
     from rich.table import Table
 
     if console is None:
         console = Console()
 
     header_text = title or "Available Fitness Checks & Rules"
-    console.print(f"[bold cyan]● {header_text}[/bold cyan]\n")
+    width = min(console.width if console.width else 80, 78)
+    console.print(f"[bold]{header_text}[/bold]")
+    console.print("─" * width, style="dim")
 
     table = Table(
-        box=box.SIMPLE,
+        box=None,
         show_header=True,
-        header_style="bold cyan",
+        header_style="bold dim",
         padding=(0, 2, 0, 0),
     )
     table.add_column("Rule / Check", style="bold", no_wrap=True)
@@ -540,7 +564,7 @@ def _render_rules_table(
     for check in checks:
         sev_style = "bold red" if check.default_severity == "error" else "bold yellow"
         sev_label = "error" if check.default_severity == "error" else "warning"
-        fixable_label = "[green]✓[/green]" if check.is_fixable else "·"
+        fixable_label = "[green]PASS[/green]" if check.is_fixable else "·"
         table.add_row(
             check.id,
             check.category,
@@ -550,20 +574,285 @@ def _render_rules_table(
         )
 
     console.print(table)
-    console.print("\n[dim]For detailed remediation guidance, try 'tff explain <rule_name>'[/dim]")
+    console.print("─" * width, style="dim")
+    console.print("[dim]For detailed remediation guidance, try 'tff explain <rule_name>'[/dim]")
+
+
+def _find_model_by_name(
+    models: dict[str, ModelRepresentation], name: str
+) -> ModelRepresentation | None:
+    """Resolve a user-provided model query against loaded project models."""
+    if not name or not models:
+        return None
+    if name in models:
+        return models[name]
+    norm_query = name.lower()
+    for k, m in models.items():
+        if k.lower() == norm_query:
+            return m
+    for k, m in models.items():
+        m_name = getattr(m, "name", "")
+        if m_name.lower() == norm_query:
+            return m
+        if normalize_model_name(m_name).lower() == norm_query:
+            return m
+        if normalize_model_name(k).lower() == norm_query:
+            return m
+    for k, m in models.items():
+        m_name = getattr(m, "name", "")
+        if m_name.lower().endswith(f".{norm_query}") or k.lower().endswith(f".{norm_query}"):
+            return m
+    for m in models.values():
+        path_str = getattr(m, "path", "")
+        if path_str:
+            p = Path(path_str)
+            if p.stem.lower() == norm_query or str(p).lower().endswith(norm_query):
+                return m
+    return None
+
+
+def _render_complexity_inspection(
+    inspection: Any,
+    console: Console | None = None,
+) -> None:
+    """Render terminal inspection report for model SQL complexity and decision points."""
+    if console is None:
+        console = Console()
+
+    from rich.table import Table
+
+    width = min(console.width if console.width else 80, 78)
+    console.print(f"[bold]Model Complexity Inspection: {inspection.model_name}[/bold]")
+    console.print("─" * width, style="dim")
+    if inspection.path:
+        console.print(f"[bold]Path:[/bold]        {inspection.path}")
+    console.print(f"[bold]Dialect:[/bold]     {inspection.dialect}")
+
+    # Metrics Overview Table
+    console.print("\n[bold]Metrics Overview[/bold]")
+    table = Table(box=None, show_header=True, header_style="bold dim", padding=(0, 2, 0, 0))
+    table.add_column("Metric", style="bold")
+    table.add_column("Value", justify="right")
+    table.add_column("Warn", justify="right", style="dim")
+    table.add_column("Fail", justify="right", style="dim")
+    table.add_column("Status", justify="center")
+
+    metric_labels = [
+        ("decision_points", "Decision Points"),
+        ("cte_count", "CTEs"),
+        ("join_count", "Joins"),
+        ("line_count", "Lines"),
+    ]
+
+    for key, label in metric_labels:
+        val = int(inspection.metrics.get(key, 0))
+        if key in inspection.thresholds:
+            warn, fail = inspection.thresholds[key]
+            warn_str = str(warn)
+            fail_str = str(fail)
+            if val > fail:
+                status = "[bold red]FAIL[/bold red]"
+            elif val > warn:
+                status = "[bold yellow]WARN[/bold yellow]"
+            else:
+                status = "[bold green]PASS[/bold green]"
+        else:
+            warn_str = "—"
+            fail_str = "—"
+            status = "[bold green]PASS[/bold green]"
+        table.add_row(label, str(val), warn_str, fail_str, status)
+
+    sub_val = inspection.nested_subquery
+    sub_status = "[bold yellow]WARN[/bold yellow]" if sub_val else "[bold green]PASS[/bold green]"
+    table.add_row("Subquery in Final", "Yes" if sub_val else "No", "—", "—", sub_status)
+    console.print(table)
+
+    # Decision Points Breakdown
+    console.print(
+        f"\n[bold]Decision Points Breakdown[/bold] [dim]({len(inspection.decision_points)} total)[/dim]"
+    )
+    if not inspection.decision_points:
+        console.print("  [dim]No decision points found.[/dim]")
+    else:
+        dp_table = Table(box=None, show_header=True, header_style="bold dim", padding=(0, 2, 0, 0))
+        dp_table.add_column("Line", justify="right", style="bold")
+        dp_table.add_column("Scope / CTE", style="dim")
+        dp_table.add_column("Kind", style="cyan")
+        dp_table.add_column("Expression / Snippet")
+
+        kind_labels = {
+            "case": "CASE",
+            "when": "WHEN",
+            "if": "IF",
+            "where_and": "WHERE AND",
+            "where_or": "WHERE OR",
+        }
+
+        for dp in inspection.decision_points:
+            line_str = str(dp.line) if dp.line is not None else "·"
+            scope = dp.cte_name or "[dim]main[/dim]"
+            kind_str = kind_labels.get(dp.kind, dp.kind.upper())
+            snip = dp.snippet.strip()
+            if len(snip) > 55:
+                snip = snip[:52] + "..."
+            dp_table.add_row(line_str, scope, kind_str, snip)
+
+        console.print(dp_table)
+
+    # Recommendations
+    console.print("\n[bold]Recommendations[/bold]")
+    for rec in inspection.recommendations:
+        console.print(f"  [dim]•[/dim] {rec}")
+    console.print("─" * width, style="dim")
+
+
+def handle_model_complexity_explain(
+    model_name: str,
+    project_roots: list[Path] | None = None,
+    config_path: str | Path | None = None,
+    dialect: str | None = None,
+    manifest_path: str | Path | None = None,
+    as_json: bool = False,
+    console: Console | None = None,
+) -> int:
+    """Inspect and explain SQL complexity and decision points for a specific model."""
+    import json
+    from tff.core.rules.sql_complexity import inspect_sql_complexity
+
+    if console is None:
+        console = Console()
+
+    roots = normalize_project_roots(project_roots or [Path.cwd()])
+    fitness_config = load_fitness_config(roots[0], config_path=config_path)
+    rule_config = fitness_config.rules.sql_complexity
+    thresholds = rule_config.thresholds
+    resolved_dialect = dialect or getattr(fitness_config, "dialect", None) or "duckdb"
+
+    # 1. Direct file check
+    candidate_file = Path(model_name)
+    if not candidate_file.is_absolute():
+        candidate_file = roots[0] / candidate_file
+    if candidate_file.is_file():
+        sql_content = candidate_file.read_text(encoding="utf-8")
+        rel_path = str(
+            candidate_file.relative_to(roots[0])
+            if candidate_file.is_relative_to(roots[0])
+            else candidate_file
+        )
+        inspection = inspect_sql_complexity(
+            sql_content,
+            dialect=resolved_dialect,
+            model_name=candidate_file.stem,
+            path=rel_path,
+            thresholds=thresholds,
+        )
+        if as_json:
+            print(json.dumps(inspection.to_dict(), indent=2))
+            return 0
+        _render_complexity_inspection(inspection, console=console)
+        return 0
+
+    # 2. Project model lookup via adapter
+    try:
+        provider = detect_provider(roots, config_path=config_path)
+        adapter = get_adapter(provider)
+        models = adapter.load_models(
+            roots,
+            dialect=dialect or getattr(fitness_config, "dialect", None),
+            manifest_path=manifest_path,
+        )
+    except Exception as e:
+        if as_json:
+            print(json.dumps({"error": f"Failed to load project models: {e}"}, indent=2))
+            return 1
+        err_console = Console(stderr=True)
+        err_console.print(f"[bold red]FAIL Error:[/bold red] Failed to load project models: {e}")
+        return 1
+
+    model = _find_model_by_name(models, model_name)
+    if model is None:
+        candidate_names = set()
+        for m in models.values():
+            candidate_names.add(m.name)
+            candidate_names.add(m.name.split(".")[-1])
+            candidate_names.add(normalize_model_name(m.name))
+            if m.path:
+                candidate_names.add(Path(m.path).stem)
+        close = difflib.get_close_matches(model_name, sorted(candidate_names), n=1, cutoff=0.5)
+        suggestion = f"\n  Did you mean '{close[0]}'?" if close else ""
+        if as_json:
+            payload: dict[str, Any] = {"error": f"Model '{model_name}' not found."}
+            if close:
+                payload["suggestion"] = close[0]
+            print(json.dumps(payload, indent=2))
+            return 1
+        err_console = Console(stderr=True)
+        err_console.print(
+            f"[bold red]FAIL Error:[/bold red] Model '{model_name}' not found in project.{suggestion}"
+        )
+        return 1
+
+    sql = model.get_sql(prefer_file=True, project_root=roots[0])
+    if not sql:
+        if as_json:
+            print(
+                json.dumps(
+                    {"error": f"No SQL content available for model '{model.name}'."},
+                    indent=2,
+                )
+            )
+            return 1
+        err_console = Console(stderr=True)
+        err_console.print(
+            f"[bold red]FAIL Error:[/bold red] No SQL content available for model '{model.name}'."
+        )
+        return 1
+
+    inspection = inspect_sql_complexity(
+        sql,
+        dialect=model.dialect or resolved_dialect,
+        model_name=model.name,
+        path=model.path,
+        thresholds=thresholds,
+        parsed=model.expression or getattr(model, "_raw_ast", None),
+    )
+
+    if as_json:
+        print(json.dumps(inspection.to_dict(), indent=2))
+        return 0
+
+    _render_complexity_inspection(inspection, console=console)
+    return 0
 
 
 def handle_explain(
     rule_arg: str | None,
+    model_arg: str | None = None,
     as_json: bool = False,
     show_all: bool = False,
     console: Console | None = None,
+    project_roots: list[Path] | None = None,
+    config_path: str | Path | None = None,
+    dialect: str | None = None,
+    manifest_path: str | Path | None = None,
 ) -> int:
     """Handle explain and rules subcommands."""
     import json
 
     if console is None:
         console = Console()
+
+    # If model_arg is explicitly provided, inspect model complexity
+    if model_arg:
+        return handle_model_complexity_explain(
+            model_arg,
+            project_roots=project_roots,
+            config_path=config_path,
+            dialect=dialect,
+            manifest_path=manifest_path,
+            as_json=as_json,
+            console=console,
+        )
 
     # If no rule argument given or --all, list all checks
     if not rule_arg or show_all:
@@ -608,7 +897,46 @@ def handle_explain(
             _render_rules_table(cat_checks, title=cat_name, console=console)
             return 0
 
-    # 3. Partial substring matching
+    # 3. Check if rule_arg refers to a project model or a .sql file
+    candidate_file = Path(rule_arg)
+    roots = normalize_project_roots(project_roots or [Path.cwd()])
+    if not candidate_file.is_absolute():
+        candidate_file = roots[0] / candidate_file
+    if candidate_file.is_file():
+        return handle_model_complexity_explain(
+            rule_arg,
+            project_roots=project_roots,
+            config_path=config_path,
+            dialect=dialect,
+            manifest_path=manifest_path,
+            as_json=as_json,
+            console=console,
+        )
+
+    try:
+        provider = detect_provider(roots, config_path=config_path)
+        adapter = get_adapter(provider)
+        fit_cfg = load_fitness_config(roots[0], config_path=config_path)
+        models = adapter.load_models(
+            roots,
+            dialect=dialect or getattr(fit_cfg, "dialect", None),
+            manifest_path=manifest_path,
+        )
+        if _find_model_by_name(models, rule_arg) is not None:
+            return handle_model_complexity_explain(
+                rule_arg,
+                project_roots=project_roots,
+                config_path=config_path,
+                dialect=dialect,
+                manifest_path=manifest_path,
+                as_json=as_json,
+                console=console,
+            )
+    except Exception:
+        pass
+
+
+    # 4. Partial substring matching
     norm_query = normalize_check_name(rule_arg)
     if len(norm_query) >= 3:
         sub_matches = [
@@ -642,7 +970,7 @@ def handle_explain(
             )
             return 0
 
-    # 4. Fuzzy matching for typos
+    # 5. Fuzzy matching for typos
     all_targets: list[str] = []
     for c in registry.all_checks():
         all_targets.append(c.id)
@@ -665,7 +993,7 @@ def handle_explain(
         return 1
 
     err_console = Console(stderr=True)
-    err_console.print(f"[bold red]✖ Error:[/bold red] Unknown check or category '{rule_arg}'.{suggestion}")
+    err_console.print(f"[bold red]FAIL Error:[/bold red] Unknown check or category '{rule_arg}'.{suggestion}")
     err_console.print("  [dim]Run 'tff rules' or 'tff explain --all' to list all available checks.[/dim]")
     return 1
 
@@ -808,6 +1136,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
         help="Number of parallel worker processes for model loading and AST traversal",
     )
     lint_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="Chunk size of models per thread worker during parallel rule execution",
+    )
+    lint_parser.add_argument(
         "--no-cache",
         action="store_true",
         help="Disable disk-based AST caching",
@@ -816,6 +1150,20 @@ def _main_impl(argv: list[str] | None = None) -> int:
         "--clear-cache",
         action="store_true",
         help="Clear persistent AST disk cache before execution",
+    )
+    lint_parser.add_argument(
+        "--staged",
+        action="store_true",
+        default=False,
+        help="Only evaluate models/files currently staged in git",
+    )
+    lint_parser.add_argument(
+        "--since",
+        "--diff",
+        dest="since",
+        metavar="REF",
+        default=None,
+        help="Only evaluate models/files modified relative to git ref (e.g. origin/main, HEAD~1)",
     )
 
     health_parser = subparsers.add_parser(
@@ -892,6 +1240,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
         help="Number of parallel worker processes for model loading and AST traversal",
     )
     health_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="Chunk size of models per thread worker during parallel rule execution",
+    )
+    health_parser.add_argument(
         "--no-cache",
         action="store_true",
         help="Disable disk-based AST caching",
@@ -900,6 +1254,27 @@ def _main_impl(argv: list[str] | None = None) -> int:
         "--clear-cache",
         action="store_true",
         help="Clear persistent AST disk cache before execution",
+    )
+    health_parser.add_argument(
+        "--staged",
+        action="store_true",
+        default=False,
+        help="Only evaluate models/files currently staged in git",
+    )
+    health_parser.add_argument(
+        "--since",
+        "--diff",
+        dest="since",
+        metavar="REF",
+        default=None,
+        help="Only evaluate models/files modified relative to git ref (e.g. origin/main, HEAD~1)",
+    )
+    health_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        default=False,
+        help="Show detailed breakdown for all checks including passing and disabled checks",
     )
 
     # Info subcommand
@@ -927,6 +1302,20 @@ def _main_impl(argv: list[str] | None = None) -> int:
         "--provider",
         default="auto",
         help="Pipeline engine provider (default: auto-detected)",
+    )
+    info_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Output configuration and environment information in JSON format to stdout",
+    )
+    info_parser.add_argument(
+        "--all-adapters",
+        "--all",
+        action="store_true",
+        default=False,
+        dest="all_adapters",
+        help="Display compatibility and version info for all supported adapters",
     )
 
 
@@ -1014,6 +1403,22 @@ def _main_impl(argv: list[str] | None = None) -> int:
         default=None,
         help="Number of parallel worker processes for model loading and AST traversal",
     )
+    docs_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="Chunk size of models per thread worker during parallel rule execution",
+    )
+    docs_parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable disk-based AST caching",
+    )
+    docs_parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Clear persistent AST disk cache before execution",
+    )
 
     # Init subcommand
     init_parser = subparsers.add_parser(
@@ -1024,6 +1429,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     )
     init_parser.add_argument(
         "--project",
+        "-p",
         type=Path,
         default=Path.cwd(),
         help="Project root directory (default: current directory)",
@@ -1044,9 +1450,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
     )
     action_parser.add_argument(
         "--project",
+        "-p",
+        action="append",
+        dest="projects",
         type=Path,
-        default=Path.cwd(),
-        help="Project root directory (default: current directory)",
+        default=None,
+        help="Project root directory (can be specified multiple times; default: current directory)",
     )
     action_parser.add_argument(
         "--provider",
@@ -1144,6 +1553,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
         help="Path to precompiled Dataform compilation_result.json or manifest",
     )
     action_parser.add_argument(
+        "--base-manifest",
+        type=Path,
+        default=None,
+        help="Path to precompiled baseline manifest for base branch comparison (e.g. dbt Cloud production manifest)",
+    )
+    action_parser.add_argument(
         "--json",
         action="store_true",
         help="Output results in JSON format to stdout",
@@ -1153,6 +1568,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="Number of parallel worker processes for model loading and AST traversal",
+    )
+    action_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="Chunk size of models per thread worker during parallel rule execution",
     )
 
     explain_parser = subparsers.add_parser(
@@ -1165,7 +1586,39 @@ def _main_impl(argv: list[str] | None = None) -> int:
         "rule",
         nargs="?",
         default=None,
-        help="Name or alias of the check or category to explain (e.g. duplicate_ctes, ban_select_star, CoA, CoV)",
+        help="Name or alias of the check or category to explain (e.g. duplicate_ctes, ban_select_star, CoA, CoV, sqlcomplexity)",
+    )
+    explain_parser.add_argument(
+        "model",
+        nargs="?",
+        default=None,
+        help="Optional model name or file path to inspect (e.g. 'tff explain sqlcomplexity customers')",
+    )
+    explain_parser.add_argument(
+        "--model",
+        "-m",
+        dest="model_opt",
+        default=None,
+        help="Model name or file path to inspect (e.g. 'tff explain sqlcomplexity --model customers')",
+    )
+    explain_parser.add_argument(
+        "--project",
+        "-p",
+        action="append",
+        dest="projects",
+        type=Path,
+        default=None,
+        help="Project root directory (default: current directory)",
+    )
+    explain_parser.add_argument(
+        "--config",
+        default="fitness_functions.yaml",
+        help="Path to fitness_functions.yaml (relative to project root)",
+    )
+    explain_parser.add_argument(
+        "--dialect",
+        default=None,
+        help="SQL dialect of models (default: auto-inferred or duckdb)",
     )
     explain_parser.add_argument(
         "--all",
@@ -1204,6 +1657,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
         help="Specific command to get help for",
     )
 
+    if len(args_list) >= 2 and args_list[0] in ("lint", "check") and args_list[1] == "explain":
+        remaining = [a for a in args_list[2:] if a != "for"]
+        args_list = ["explain", *remaining]
+    elif len(args_list) >= 1 and args_list[0] == "explain":
+        args_list = ["explain", *[a for a in args_list[1:] if a != "for"]]
+
     args = parser.parse_args(args_list)
 
     is_debug = is_debug_enabled(args)
@@ -1240,12 +1699,24 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
     if args.command in ("explain", "rules"):
         rule_arg = getattr(args, "rule", None)
-        show_all = getattr(args, "all", False) or (args.command == "rules" and not rule_arg)
+        model_arg = getattr(args, "model_opt", None) or getattr(args, "model", None)
+        show_all = getattr(args, "all", False) or (
+            args.command == "rules" and not rule_arg and not model_arg
+        )
         as_json = getattr(args, "json", False)
+        project_roots_raw = getattr(args, "projects", None) or getattr(args, "project", None)
+        config_path = getattr(args, "config", "fitness_functions.yaml")
         return handle_explain(
             rule_arg=rule_arg,
+            model_arg=model_arg,
             as_json=as_json,
             show_all=show_all,
+            project_roots=[Path(p).resolve() for p in project_roots_raw]
+            if project_roots_raw
+            else None,
+            config_path=config_path,
+            dialect=getattr(args, "dialect", None),
+            manifest_path=getattr(args, "manifest", None),
         )
 
     # Normalize project roots
@@ -1267,34 +1738,34 @@ def _main_impl(argv: list[str] | None = None) -> int:
     project_root = project_roots[0]
 
     # Register target projects' virtualenv site-packages if present
-    import site
-    for root in project_roots:
-        for venv_name in (".venv", "venv", "env"):
-            venv_dir = root / venv_name
-            if venv_dir.is_dir():
-                # Unix
-                libs_dir = venv_dir / "lib"
-                if libs_dir.is_dir():
-                    for p in libs_dir.glob("python*/site-packages"):
-                        if p.is_dir():
-                            site.addsitedir(str(p))
-                # Windows
-                win_lib = venv_dir / "Lib" / "site-packages"
-                if win_lib.is_dir():
-                    site.addsitedir(str(win_lib))
+    target_site_packages = _inject_target_venv(project_roots)
 
     if args.command == "info":
         # Run info command: show diagnostics
         from rich.table import Table
-        import importlib.metadata as metadata
+        import json
+        import re
 
+        as_json = getattr(args, "json", False)
         console = Console()
         provider = args.provider
         if provider == "auto":
             try:
-                provider = _detect_provider(project_roots)
+                cfg_path = args.config if args.config != "fitness_functions.yaml" else None
+                provider = (
+                    _detect_provider(project_roots, config_path=cfg_path)
+                    if cfg_path
+                    else _detect_provider(project_roots)
+                )
             except Exception as e:
-                console.print(f"[red]Error detecting provider: {e}[/red]")
+                err = (
+                    e
+                    if isinstance(e, TffError)
+                    else _convert_to_provider_error(e, project_roots=project_roots)
+                )
+                render_cli_error(err)
+                if not as_json:
+                    console.print(f"[red]Error detecting provider: {e}[/red]")
                 return 1
         config_path = args.config
         resolved_config = (
@@ -1303,23 +1774,24 @@ def _main_impl(argv: list[str] | None = None) -> int:
             else Path(config_path)
         )
         config_exists = resolved_config.is_file()
-        logo = (
-            " [cyan]            [/cyan][green]▄███▄   ▄███▄   [/green]\n"
-            " [cyan]    ██      [/cyan][green]██  ▀   ██  ▀   [/green]\n"
-            " [cyan]█████████[/cyan][green]█████████████████[/green]\n"
-            " [cyan]    ██      [/cyan][green]██      ██      [/green]\n"
-            " [cyan]    ██      [/cyan][green]██      ██      [/green]\n"
-            " [cyan]    ██▄▄▄   [/cyan][green]██      ██      [/green]"
-        )
-        console.print(logo)
-        console.print()
-        console.print("[bold cyan]● tff Info[/bold cyan]")
+        config_loaded = False
+        width = min(console.width if console.width else 80, 78)
+        if not as_json:
+            console.print("[bold]tff Info[/bold]  [dim]·  TRANSFORMATION FITNESS FUNCTIONS[/dim]")
+            console.print("─" * width, style="dim")
         table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
         table.add_column()
         table.add_column()
 
+        raw_ver = _get_package_version("tff-core", target_site_packages)
+        tff_ver = raw_ver if raw_ver != "not installed" else __version__
+
         table.add_row("  [bold]Project root:[/bold]", str(project_root))
-        table.add_row("  [bold]Provider:[/bold]", provider)
+        table.add_row("  [bold]tff version:[/bold]", f"[bold blue]{tff_ver}[/bold blue]")
+        table.add_row(
+            "  [bold]Provider:[/bold]",
+            _format_provider_status_display(provider, target_site_packages),
+        )
         config_status = (
             "[green]found[/green]" if config_exists else "[red]missing[/red]"
         )
@@ -1327,6 +1799,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if config_exists:
             try:
                 cfg = load_fitness_config(project_root, config_path)
+                config_loaded = True
                 contract_path = resolve_project_path(cfg, cfg.contract_groups_path)
                 exclusions_path = resolve_project_path(cfg, cfg.exclusions_path)
                 contract_status = (
@@ -1351,87 +1824,114 @@ def _main_impl(argv: list[str] | None = None) -> int:
                     for p in cfg.plugins:
                         table.add_row("  [bold]Plugin:[/bold]", str(p))
             except Exception as e:
-
-                console.print(f"[yellow]Failed to load config: {e}[/yellow]")
-        console.print(table)
-
-
-        console.print("\n[bold cyan]● Adapter Versions[/bold cyan]")
-        target_site_packages = []
-        for venv_name in (".venv", "venv", "env"):
-            venv_dir = project_root / venv_name
-            if venv_dir.is_dir():
-                # Unix
-                libs_dir = venv_dir / "lib"
-                if libs_dir.is_dir():
-                    for p in libs_dir.glob("python*/site-packages"):
-                        if p.is_dir():
-                            target_site_packages.append(str(p))
-                # Windows
-                win_lib = venv_dir / "Lib" / "site-packages"
-                if win_lib.is_dir():
-                    target_site_packages.append(str(win_lib))
-
-        def get_version(pkg: str) -> str:
-            try:
-                if target_site_packages:
-                    dists = metadata.distributions(path=target_site_packages)
-                    for dist in dists:
-                        name = dist.metadata.get("Name")
-                        if name and (
-                            name == pkg
-                            or name.replace("_", "-") == pkg.replace("_", "-")
-                        ):
-                            return dist.version
-                    return "not installed"
-                return metadata.version(pkg)
-            except Exception:
-                return "not installed"
-
-        ver_table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
-        ver_table.add_column()
-        ver_table.add_column()
-
-        def format_ver(pkg: str) -> str:
-            ver = get_version(pkg)
-            if ver == "not installed":
-                return "[dim red]not installed[/dim red]"
-            return f"[cyan]{ver}[/cyan]"
-
-        tff_ver = format_ver("tff-core")
-        ver_table.add_row("  [bold]tff-core[/bold]", tff_ver)
-
-        import importlib.util
-
-        has_sqlmesh = importlib.util.find_spec("sqlmesh") is not None
-
-        sqlmesh_status = (
-            f"{tff_ver} [dim](sqlmesh extra enabled)[/dim]"
-            if has_sqlmesh
-            else "[dim red]not enabled[/dim red] [dim](install using 'tff-core[sqlmesh]')[/dim]"
-        )
-        ver_table.add_row("  [bold]sqlmesh integration[/bold]", sqlmesh_status)
-        ver_table.add_row(
-            "  [bold]dbt integration[/bold]", f"{tff_ver} [dim](core)[/dim]"
-        )
-        ver_table.add_row(
-            "  [bold]dataform integration[/bold]", f"{tff_ver} [dim](core)[/dim]"
-        )
-        from tff.core.adapter import get_available_providers
-
-        for prov in get_available_providers():
-            if prov not in ("dbt", "sqlmesh", "dataform"):
-                ver_table.add_row(
-                    f"  [bold]{prov} integration[/bold]", "[cyan]plugin[/cyan]"
+                norm_err = (
+                    normalize_validation_error(e, config_path=resolved_config)
+                    if isinstance(e, ValidationError)
+                    else e
                 )
-        console.print(ver_table)
+                if isinstance(norm_err, TffError):
+                    render_cli_error(norm_err, debug=is_debug)
+                if not as_json:
+                    console.print(f"[yellow]Failed to load config: {norm_err}[/yellow]")
+        if not as_json:
+            console.print(table)
 
+        show_all_adapters = getattr(args, "all_adapters", False)
+        if not as_json and show_all_adapters:
+            console.print("\n[bold]Adapter Versions[/bold]")
+            console.print("─" * width, style="dim")
+
+            ver_table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+            ver_table.add_column()
+            ver_table.add_column()
+
+            tff_ver_display = f"[bold blue]{tff_ver}[/bold blue]"
+            ver_table.add_row("  [bold]tff-core[/bold]", tff_ver_display)
+
+            has_sqlmesh, sqlmesh_ver = _get_sqlmesh_info(target_site_packages)
+            if has_sqlmesh:
+                if sqlmesh_ver:
+                    sqlmesh_status = (
+                        f"[bold blue]{sqlmesh_ver}[/bold blue] [dim](sqlmesh extra enabled)[/dim]"
+                    )
+                else:
+                    sqlmesh_status = f"{tff_ver_display} [dim](sqlmesh extra enabled)[/dim]"
+            else:
+                sqlmesh_status = (
+                    "[dim red]not enabled[/dim red] [dim](install using 'tff-core[sqlmesh]')[/dim]"
+                )
+            ver_table.add_row("  [bold]sqlmesh integration[/bold]", sqlmesh_status)
+            ver_table.add_row(
+                "  [bold]dbt integration[/bold]", f"{tff_ver_display} [dim](core)[/dim]"
+            )
+            ver_table.add_row(
+                "  [bold]dataform integration[/bold]", f"{tff_ver_display} [dim](core)[/dim]"
+            )
+            from tff.core.adapter import get_available_providers
+
+            for prov in get_available_providers():
+                if prov not in ("dbt", "sqlmesh", "dataform"):
+                    ver_table.add_row(
+                        f"  [bold]{prov} integration[/bold]", "[bold blue]plugin[/bold blue]"
+                    )
+            console.print(ver_table)
 
         try:
             adapter = _get_adapter(provider)
-        except (ImportError, ValueError) as e:
-            console.print(f"[red]Error loading adapter: {e}[/red]")
+        except (TffError, ImportError, ValueError) as e:
+            render_cli_error(e)
+            if not as_json:
+                console.print(f"[red]Error loading adapter: {e}[/red]")
             return 1
+
+        diag_files = adapter.get_diagnostic_files(project_roots)
+        if as_json:
+            models_loaded = 0
+            external_sources = 0
+            try:
+                loaded_models = adapter.load_models(project_roots)
+                for m in loaded_models.values():
+                    if getattr(m, "is_external", False):
+                        external_sources += 1
+                    elif not getattr(m, "is_symbolic", False):
+                        models_loaded += 1
+            except Exception:
+                pass
+            info_payload: dict[str, Any] = {
+                "version": tff_ver,
+                "provider": provider,
+                "project_root": str(project_root),
+                "projects": [str(p) for p in project_roots],
+                "config_path": str(resolved_config),
+                "config_loaded": config_loaded,
+                "files": {
+                    label: re.sub(r"\[/?[^\]]+\]", "", val)
+                    for label, val in diag_files
+                },
+                "models_loaded": models_loaded,
+                "external_sources": external_sources,
+            }
+            if show_all_adapters:
+                has_sqlmesh, sqlmesh_ver = _get_sqlmesh_info(target_site_packages)
+                from tff.core.adapter import get_available_providers
+
+                info_payload["adapters"] = {
+                    "tff-core": tff_ver,
+                    "dbt": "core",
+                    "dataform": "core",
+                    "sqlmesh": (
+                        sqlmesh_ver
+                        if sqlmesh_ver
+                        else ("enabled" if has_sqlmesh else "not enabled")
+                    ),
+                    **{
+                        p: "plugin"
+                        for p in get_available_providers()
+                        if p not in ("dbt", "sqlmesh", "dataform")
+                    },
+                }
+            print(json.dumps(info_payload, indent=2))
+            return 0
 
         prov_table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
         prov_table.add_column()
@@ -1439,10 +1939,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
         from rich.markup import escape
 
-        for label, val in adapter.get_diagnostic_files(project_roots):
+        for label, val in diag_files:
             prov_table.add_row(f"  [bold]{escape(label)}[/bold]", val)
         if prov_table.row_count > 0:
-            console.print("\n[bold cyan]● Provider Files[/bold cyan]")
+            console.print("\n[bold]Provider Files[/bold]")
+            console.print("─" * width, style="dim")
             console.print(prov_table)
         return 0
 
@@ -1484,7 +1985,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
         # 1. Health Score Trend
         console = Console()
-        console.print("[bold cyan]● tff Project Health Score Trend[/bold cyan]")
+        width = min(console.width if console.width else 80, 78)
+        console.print("[bold]tff Project Health Score Trend[/bold]")
+        console.print("─" * width, style="dim")
         has_health_data = any(h is not None for h in health_scores)
         if has_health_data:
             chart = render_ascii_chart(
@@ -1496,9 +1999,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         console.print()
 
         # 2. Lint Violations Trend
-        console.print(
-            "[bold cyan]● tff Lint Violations Trend (Errors & Warnings)[/bold cyan]"
-        )
+        console.print("[bold]tff Lint Violations Trend (Errors & Warnings)[/bold]")
+        console.print("─" * width, style="dim")
         has_lint_data = any(
             e is not None or w is not None for e, w in zip(errors, warnings)
         )
@@ -1519,12 +2021,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
         # 3. Summary Table
         from rich.table import Table
-        from rich import box
 
         table = Table(
-            box=box.SIMPLE,
+            box=None,
             show_header=True,
-            header_style="bold cyan",
+            header_style="bold dim",
             padding=(0, 2, 0, 0),
         )
         table.add_column("Date", style="bold", no_wrap=True)
@@ -1566,7 +2067,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
             table.add_row(d_formatted, h_val, e_val, w_val)
 
-        console.print("[bold cyan]● Summary History[/bold cyan]")
+        console.print("[bold]Summary History[/bold]")
+        console.print("─" * width, style="dim")
         console.print(table)
         return 0
 
@@ -1574,10 +2076,15 @@ def _main_impl(argv: list[str] | None = None) -> int:
         provider = args.provider
         if provider == "auto":
             try:
-                provider = _detect_provider(project_roots)
+                cfg_path = getattr(args, "config", None)
+                if cfg_path and cfg_path != "fitness_functions.yaml":
+                    provider = _detect_provider(project_roots, config_path=cfg_path)
+                else:
+                    provider = _detect_provider(project_roots)
+            except TffError:
+                raise
             except ValueError as e:
-                print(f"Error: {e}", file=sys.stderr)
-                return 1
+                raise _convert_to_provider_error(e, project_roots=project_roots) from e
 
         from tff.core.docs import generate_docs_dashboard
 
@@ -1598,10 +2105,23 @@ def _main_impl(argv: list[str] | None = None) -> int:
             docs_kwargs["manifest_path"] = args.manifest
         if getattr(args, "workers", None) is not None:
             docs_kwargs["workers"] = args.workers
+        if getattr(args, "chunk_size", None) is not None:
+            docs_kwargs["chunk_size"] = args.chunk_size
+        if getattr(args, "no_cache", False):
+            os.environ["TFF_NO_CACHE"] = "1"
+            logger.debug("AST caching disabled via --no-cache")
+        if getattr(args, "clear_cache", False):
+            from tff.core.ast_cache import clear_ast_cache
+
+            cleared = clear_ast_cache(project_root=project_root)
+            logger.debug("Cleared %d AST cache files", cleared)
+            print(f"Cleared {cleared} AST cache file(s).")
         try:
             output_file = generate_docs_dashboard(**docs_kwargs)
             print(f"Successfully generated HTML dashboard at: {output_file}")
             return 0
+        except ValidationError as e:
+            raise normalize_validation_error(e, config_path=args.config) from e
         except TffError:
             raise
         except Exception as e:
@@ -1638,12 +2158,18 @@ def _main_impl(argv: list[str] | None = None) -> int:
         provider = args.provider
         if provider == "auto":
             try:
-                provider = _detect_provider(project_roots)
+                cfg_path = args.config if args.config != "fitness_functions.yaml" else None
+                provider = (
+                    _detect_provider(project_roots, config_path=cfg_path)
+                    if cfg_path
+                    else _detect_provider(project_roots)
+                )
                 logger.debug("Auto-detected provider: %s", provider)
+            except TffError:
+                raise
             except ValueError as e:
                 logger.debug("Provider auto-detection error: %s", e)
-                print(f"Error: {e}", file=sys.stderr)
-                return 1
+                raise _convert_to_provider_error(e, project_roots=project_roots) from e
         else:
             logger.debug("Using specified provider: %s", provider)
 
@@ -1651,10 +2177,18 @@ def _main_impl(argv: list[str] | None = None) -> int:
         try:
             adapter = _get_adapter(provider)
             logger.debug("Loaded pipeline adapter: %s", adapter.provider_name)
-        except (ImportError, ValueError) as e:
+        except TffError:
+            raise
+        except ImportError as e:
             logger.debug("Failed to load adapter: %s", e)
-            print(f"Error: {e}", file=sys.stderr)
-            return 1
+            raise _convert_to_dependency_error(
+                e, provider=provider, project_roots=project_roots
+            ) from e
+        except ValueError as e:
+            logger.debug("Failed to load adapter: %s", e)
+            raise _convert_to_provider_error(
+                e, provider=provider, project_roots=project_roots
+            ) from e
 
         # 3. Load config
         try:
@@ -1664,6 +2198,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 config_path=args.config,
             )
             logger.debug("Loaded config: %s", config)
+        except ValidationError as e:
+            raise normalize_validation_error(e, config_path=args.config) from e
         except TffError:
             raise
         except Exception as e:
@@ -1677,6 +2213,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if getattr(args, "workers", None) is not None:
             config.workers = args.workers
             logger.debug("Set config.workers to %d from CLI flag", args.workers)
+        if getattr(args, "chunk_size", None) is not None:
+            config.chunk_size = args.chunk_size
+            logger.debug("Set config.chunk_size to %d from CLI flag", args.chunk_size)
         if getattr(args, "no_cache", False):
             config.cache_ast = False
             os.environ["TFF_NO_CACHE"] = "1"
@@ -1716,6 +2255,88 @@ def _main_impl(argv: list[str] | None = None) -> int:
             manifest_path,
         )
 
+        # Git-scoping evaluation (--staged / --since / --diff)
+        is_staged = getattr(args, "staged", False) is True
+        since_raw = getattr(args, "since", None)
+        since_ref = since_raw if isinstance(since_raw, str) and since_raw.strip() else None
+        is_git_scoped = is_staged or (since_ref is not None)
+
+        scoped_models: set[str] | None = None
+        models: dict[str, ModelRepresentation] | None = None
+
+        if is_git_scoped:
+            from tff.core.git import (
+                get_git_root,
+                get_staged_files,
+                get_changed_files_since,
+                map_files_to_model_names,
+            )
+            from tff.core.exceptions import TffGitError
+
+            repo_root = get_git_root(project_root)
+            if repo_root is None:
+                raise TffGitError(
+                    "Git repository not found for git-scoped execution (--staged / --since / --diff).",
+                    hint="Ensure you are running inside a git repository or remove git scoping flags.",
+                )
+
+            changed_files: set[str] = set()
+            if is_staged:
+                changed_files.update(get_staged_files(repo_root))
+            if since_ref:
+                changed_files.update(get_changed_files_since(repo_root, since_ref))
+
+            logger.debug("Git-scoped files detected: %s", changed_files)
+
+            model_candidate_files = {
+                f
+                for f in changed_files
+                if Path(f).suffix.lower() in (".sql", ".sqlx", ".py", ".yaml", ".yml")
+            }
+
+            if not model_candidate_files:
+                scoped_models = set()
+                models = {}
+            else:
+                models = adapter.load_models(
+                    project_root=project_roots,
+                    dialect=args.dialect,
+                    manifest_path=manifest_path,
+                )
+
+                scoped_models = map_files_to_model_names(
+                    models,
+                    model_candidate_files,
+                    project_root=project_root,
+                    repo_root=repo_root,
+                )
+                logger.debug("Mapped git-scoped files to models: %s", scoped_models)
+
+        def _run_adapter(
+            models_arg: dict[str, ModelRepresentation] | None = None,
+        ) -> tuple[list[LintFinding], int, list[str]]:
+            call_kwargs: dict[str, Any] = {
+                "project_root": project_roots,
+                "config": config,
+                "checks": checks,
+                "dialect": args.dialect,
+                "manifest_path": manifest_path,
+            }
+            if models_arg is not None:
+                call_kwargs["models"] = models_arg
+            if scoped_models is not None:
+                call_kwargs["scoped_models"] = scoped_models
+            chunk_size = getattr(args, "chunk_size", None)
+            if chunk_size is not None:
+                import inspect
+
+                sig = inspect.signature(adapter.run_checks)
+                if "chunk_size" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    call_kwargs["chunk_size"] = chunk_size
+            return adapter.run_checks(**call_kwargs)
+
         is_interactive = (
             sys.stderr.isatty()
             and not getattr(args, "json", False)
@@ -1727,92 +2348,75 @@ def _main_impl(argv: list[str] | None = None) -> int:
         import time
 
         start_time = time.perf_counter()
-        try:
-            if is_interactive:
-                from rich.status import Status
+        if is_git_scoped and len(scoped_models) == 0:  # type: ignore[arg-type]
+            findings = []
+            models_checked = 0
+            executed_checks = checks or []
+            execution_duration = 0.0
+        else:
+            try:
+                if is_interactive:
+                    from tff.core.spinner import get_status
 
-                with Status(
-                    f"Evaluating fitness functions with {adapter.provider_name}...",
-                    console=Console(stderr=True),
-                ):
-                    findings, models_checked, executed_checks = adapter.run_checks(
-                        project_root=project_roots,
-                        config=config,
-                        checks=checks,
-                        dialect=args.dialect,
-                        manifest_path=manifest_path,
-                    )
-            else:
-                findings, models_checked, executed_checks = adapter.run_checks(
-                    project_root=project_roots,
-                    config=config,
-                    checks=checks,
-                    dialect=args.dialect,
-                    manifest_path=manifest_path,
+                    with get_status(
+                        f"Evaluating fitness functions with {adapter.provider_name}...",
+                        console=Console(stderr=True),
+                    ):
+                        findings, models_checked, executed_checks = _run_adapter(models)
+                else:
+                    findings, models_checked, executed_checks = _run_adapter(models)
+                execution_duration = time.perf_counter() - start_time
+                logger.debug(
+                    "Check execution completed in %.2fs: evaluated %d model(s), executed %s, found %d violation(s)",
+                    execution_duration,
+                    models_checked,
+                    executed_checks,
+                    len(findings),
                 )
-            execution_duration = time.perf_counter() - start_time
-            logger.debug(
-                "Check execution completed in %.2fs: evaluated %d model(s), executed %s, found %d violation(s)",
-                execution_duration,
-                models_checked,
-                executed_checks,
-                len(findings),
-            )
-        except TffError:
-            raise
-        except Exception as e:
-            logger.debug("Error executing checks: %s", e)
-            print(f"Error executing checks: {e}", file=sys.stderr)
-            return 1
+            except TffError:
+                raise
+            except Exception as e:
+                logger.debug("Error executing checks: %s", e)
+                print(f"Error executing checks: {e}", file=sys.stderr)
+                return 1
 
         # Apply auto-fixes if --fix is set
         if args.command in ("lint", "check") and getattr(args, "fix", False) and findings:
-            try:
-                models = adapter.load_models(
-                    project_root=project_roots,
-                    dialect=args.dialect,
-                    manifest_path=manifest_path,
-                )
-            except Exception as e:
-                models = {}
-                print(
-                    f"Warning: Could not load models for autofix: {e}", file=sys.stderr
-                )
+            if models is None:
+                try:
+                    models = adapter.load_models(
+                        project_root=project_roots,
+                        dialect=args.dialect,
+                        manifest_path=manifest_path,
+                    )
+                except Exception as e:
+                    models = {}
+                    print(
+                        f"Warning: Could not load models for autofix: {e}", file=sys.stderr
+                    )
 
             if models:
                 from tff.core.autofix import apply_autofixes
 
-                fix_logs = apply_autofixes(project_roots, adapter, findings, models)
+                fix_logs = apply_autofixes(project_roots, adapter, findings, models, config=config)
                 if fix_logs:
                     if not args.json:
                         console = Console(stderr=True)
                         for log in fix_logs:
-                            console.print(f"[green]✓[/green] {log}")
-                    # Re-run checks to get the final state of the files
+                            console.print(f"[green]PASS[/green] {log}", highlight=False)
+                    # Re-run checks to get the final state of the files (pass models_arg=None so adapter reloads from disk)
                     try:
                         rerun_start = time.perf_counter()
                         if is_interactive:
-                            from rich.status import Status
+                            from tff.core.spinner import get_status
 
-                            with Status(
+                            with get_status(
                                 f"Re-evaluating fitness functions with {adapter.provider_name}...",
                                 console=Console(stderr=True),
                             ):
-                                findings, models_checked, executed_checks = adapter.run_checks(
-                                    project_root=project_roots,
-                                    config=config,
-                                    checks=checks,
-                                    dialect=args.dialect,
-                                    manifest_path=manifest_path,
-                                )
+                                findings, models_checked, executed_checks = _run_adapter(None)
                         else:
-                            findings, models_checked, executed_checks = adapter.run_checks(
-                                project_root=project_roots,
-                                config=config,
-                                checks=checks,
-                                dialect=args.dialect,
-                                manifest_path=manifest_path,
-                            )
+                            findings, models_checked, executed_checks = _run_adapter(None)
                         execution_duration = time.perf_counter() - rerun_start
                     except TffError:
                         raise
@@ -1923,6 +2527,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
                                 scoped_files.add(p.resolve())
                 if scoped_files:
                     scoped_models_count = len(scoped_files)
+            elif is_git_scoped:
+                scoped_models_count = models_checked
 
             scores = calculate_health_scores(
                 findings,
@@ -1959,6 +2565,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
                     provider,
                     group_by=group_by,
                     duration=execution_duration,
+                    fail_under=args.fail_under,
+                    verbose=getattr(args, "verbose", False),
+                    project_root=project_root,
                 )
 
             overall_score = scores["overall_score"]
@@ -1973,6 +2582,15 @@ def _main_impl(argv: list[str] | None = None) -> int:
             return 0
 
     return 1
+
+
+def _deprecated_provider_cli(fn: Any, args: Any) -> int:
+    """Execute a deprecated provider CLI handler with standardized TffError rendering."""
+    try:
+        return fn(args)
+    except TffError as err:
+        render_cli_error(err)
+        return 1
 
 
 def _is_debug_requested(argv: list[str] | None = None) -> bool:
@@ -1990,8 +2608,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         try:
             return _main_impl(argv)
+        except ValidationError as exc:
+            render_cli_error(normalize_validation_error(exc), console=console, debug=debug)
+            return 1
         except TffError as err:
-            render_cli_error(err, console=console)
+            render_cli_error(err, console=console, debug=debug)
             return 1
         except KeyboardInterrupt:
             console.print("Aborted by user.")
@@ -2000,9 +2621,9 @@ def main(argv: list[str] | None = None) -> int:
             if debug:
                 console.print_exception()
             else:
-                console.print(f"[bold red]✖ Unexpected Error:[/bold red] {escape(str(exc))}")
-                console.print("  [dim]•[/dim] Please report this issue at: https://github.com/tjirab/tff/issues")
-                console.print("  [dim]•[/dim] [bold cyan]Hint:[/bold cyan] Re-run with [bold]--debug[/bold] or set [bold]TFF_DEBUG=1[/bold] to display the full traceback.")
+                console.print(f"[bold red]FAIL Unexpected Error:[/bold red] {escape(str(exc))}")
+                console.print("  [dim]●[/dim] Please report this issue at: https://github.com/tjirab/tff/issues")
+                console.print("  [dim]●[/dim] [bold blue]Hint:[/bold blue] Re-run with [bold]--debug[/bold] or set [bold]TFF_DEBUG=1[/bold] to display the full traceback.")
             return 1
     finally:
         if orig_tff_no_cache is None:

@@ -6,13 +6,17 @@ import json
 import logging
 import os
 import time
+from bisect import bisect_right
 from datetime import date, datetime, timedelta
+from operator import itemgetter
 from pathlib import Path
 from typing import Any, Sequence
 
 from tff.core.report import LintFinding
 
 logger = logging.getLogger(__name__)
+
+_GET_DATE = itemgetter("date")
 
 
 def serialize_finding(f: LintFinding) -> dict[str, Any]:
@@ -93,6 +97,21 @@ def get_health_json_data(
     }
     if "check_weights" in scores:
         data["check_weights"] = scores["check_weights"]
+    by_domain = scores.get("by_domain")
+    if isinstance(by_domain, dict):
+        data["by_domain"] = {
+            domain_key: {
+                "label": d["label"],
+                "score": d["score"],
+                "models_checked": d["models_checked"],
+                "issues": d["issues"],
+                "errors": d["errors"],
+                "warnings": d["warnings"],
+                "breakdown": d["breakdown"],
+                "check_scores": d["check_scores"],
+            }
+            for domain_key, d in by_domain.items()
+        }
     if duration is not None:
         data["duration_seconds"] = round(duration, 3)
     return data
@@ -236,26 +255,16 @@ def collect_stats(
         # Find latest health log on or before date d for each root
         latest_healths = []
         for root, h_logs in health_logs_by_root.items():
-            latest = None
-            for log in h_logs:
-                if log["date"] <= d:
-                    latest = log
-                else:
-                    break
-            if latest is not None:
-                latest_healths.append(latest)
+            idx = bisect_right(h_logs, d, key=_GET_DATE)
+            if idx > 0:
+                latest_healths.append(h_logs[idx - 1])
 
         # Find latest lint log on or before date d for each root
         latest_lints = []
         for root, l_logs in lint_logs_by_root.items():
-            latest = None
-            for log in l_logs:
-                if log["date"] <= d:
-                    latest = log
-                else:
-                    break
-            if latest is not None:
-                latest_lints.append(latest)
+            idx = bisect_right(l_logs, d, key=_GET_DATE)
+            if idx > 0:
+                latest_lints.append(l_logs[idx - 1])
 
         health_score = None
         if latest_healths:

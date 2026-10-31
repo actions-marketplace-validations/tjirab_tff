@@ -12,6 +12,7 @@ from tff.core.utils.paths import get_layer_from_path
 class BanSelectStar(Rule):
     """Ban SELECT * expressions in configured layers."""
     name = "banselectstar"
+    is_fixable = False
 
     def check_model(self, model: ModelRepresentation) -> RuleViolation | None:
         rule_config = self.config.rules.ban_select_star
@@ -29,14 +30,10 @@ class BanSelectStar(Rule):
         if parsed is None:
             return None
 
-        violations = []
         for star in parsed.find_all(exp.Star):
             if isinstance(star.parent, (exp.Count, exp.Distinct)) and star.find_ancestor(exp.Count) is not None:
                 continue
-            violations.append(
-                "SELECT * is prohibited. Explicitly name your columns to reduce coupling."
+            return self.violation(
+                ["SELECT * is prohibited. Explicitly name your columns to reduce coupling."]
             )
-
-        if violations:
-            return self.violation(violations)
         return None

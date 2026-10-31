@@ -1,10 +1,14 @@
 """Unit tests for tff.core.ast_cache persistent disk-based caching."""
+from conftest import _make_model
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 import pytest
+import sqlglot
 import sqlglot.expressions as exp
 
+from tff.core import ast_cache
 from tff.core.ast_cache import (
     clear_ast_cache,
     compute_ast_cache_key,
@@ -15,6 +19,112 @@ from tff.core.ast_cache import (
     set_cached_ast,
 )
 from tff.core.config import FitnessFunctionsConfig
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mem_cache():
+    ast_cache._MEM_CACHE.clear()
+    yield
+    ast_cache._MEM_CACHE.clear()
+
+
+def test_mem_cache_hit_skips_disk(tmp_path: Path):
+    expr = exp.Literal.number(1)
+    set_cached_ast("ab" + "0" * 62, expr, cache_dir=tmp_path)
+    with patch("pathlib.Path.exists", side_effect=AssertionError("disk touched")):
+        loaded = get_cached_ast("ab" + "0" * 62, cache_dir=tmp_path)
+        assert loaded == expr
+        assert loaded is not expr
+
+
+@pytest.mark.parametrize(
+    "mutation_stage",
+    [
+        "after_set_input",
+        "after_mem_hit",
+        "after_disk_load",
+        "after_parse_sql_with_cache",
+    ],
+)
+def test_ast_cache_defensive_copy_prevents_mutation_leakage(
+    tmp_path: Path, mutation_stage: str
+):
+    sql = "SELECT a, b FROM users"
+    dialect = "duckdb"
+    key = compute_ast_cache_key(sql, dialect)
+
+    if mutation_stage == "after_set_input":
+        original = sqlglot.parse_one(sql, read=dialect)
+        set_cached_ast(key, original, cache_dir=tmp_path)
+        original.set("expressions", [exp.Literal.number(999)])
+    elif mutation_stage == "after_mem_hit":
+        set_cached_ast(key, sqlglot.parse_one(sql, read=dialect), cache_dir=tmp_path)
+        hit = get_cached_ast(key, cache_dir=tmp_path)
+        assert hit is not None
+        hit.set("expressions", [exp.Literal.number(999)])
+    elif mutation_stage == "after_disk_load":
+        set_cached_ast(key, sqlglot.parse_one(sql, read=dialect), cache_dir=tmp_path)
+        ast_cache._MEM_CACHE.clear()
+        disk_hit = get_cached_ast(key, cache_dir=tmp_path)
+        assert disk_hit is not None
+        disk_hit.set("expressions", [exp.Literal.number(999)])
+    elif mutation_stage == "after_parse_sql_with_cache":
+        parsed = parse_sql_with_cache(sql, dialect=dialect, cache_dir=tmp_path)
+        assert parsed is not None
+        parsed.set("expressions", [exp.Literal.number(999)])
+
+    subsequent = parse_sql_with_cache(sql, dialect=dialect, cache_dir=tmp_path)
+    assert subsequent is not None
+    assert subsequent.sql(dialect=dialect) == "SELECT a, b FROM users"
+
+
+@pytest.mark.parametrize("max_cache_size", [4, 16])
+def test_ast_cache_thread_safe_concurrent_operations(
+    tmp_path: Path, max_cache_size: int
+):
+    keys = [f"{i:02x}" + "0" * 62 for i in range(32)]
+
+    def worker(idx: int) -> None:
+        key = keys[idx % len(keys)]
+        expr = exp.Literal.number(idx)
+        set_cached_ast(key, expr, cache_dir=tmp_path)
+        loaded = get_cached_ast(key, cache_dir=tmp_path)
+        if loaded is not None:
+            loaded.set("this", "mutated")
+        if idx % 10 == 0:
+            clear_ast_cache(custom_dir=tmp_path)
+
+    with patch.object(ast_cache, "_MAX_MEM_CACHE_SIZE", max_cache_size):
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(worker, i) for i in range(64)]
+            for future in futures:
+                future.result()
+
+    assert len(ast_cache._MEM_CACHE) <= max_cache_size
+
+
+def test_mem_cache_evicts_oldest_on_set(tmp_path: Path):
+    with patch.object(ast_cache, "_MAX_MEM_CACHE_SIZE", 2):
+        for i in range(3):
+            set_cached_ast(f"{i:02d}" + "0" * 62, exp.Literal.number(i), cache_dir=tmp_path)
+        assert list(ast_cache._MEM_CACHE) == ["01" + "0" * 62, "02" + "0" * 62]
+
+
+def test_mem_cache_evicts_oldest_on_disk_load(tmp_path: Path):
+    key = "cd" + "0" * 62
+    set_cached_ast(key, exp.Literal.number(7), cache_dir=tmp_path)
+    ast_cache._MEM_CACHE.clear()
+    ast_cache._MEM_CACHE["stale"] = exp.Literal.number(0)
+    with patch.object(ast_cache, "_MAX_MEM_CACHE_SIZE", 1):
+        loaded = get_cached_ast(key, cache_dir=tmp_path)
+    assert loaded == exp.Literal.number(7)
+    assert list(ast_cache._MEM_CACHE) == [key]
+
+
+def test_clear_ast_cache_clears_memory(tmp_path: Path):
+    set_cached_ast("ef" + "0" * 62, exp.Literal.number(1), cache_dir=tmp_path)
+    clear_ast_cache(custom_dir=tmp_path)
+    assert ast_cache._MEM_CACHE == {}
 
 
 def test_compute_ast_cache_key():
@@ -186,11 +296,10 @@ def test_parse_sql_with_cache_respects_no_cache_env(tmp_path: Path, monkeypatch:
 
 
 def test_model_representation_ast_respects_no_cache_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from tff.core.model import ModelRepresentation
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TFF_NO_CACHE", "1")
-    m = ModelRepresentation(name="test", path="test.sql", dialect="duckdb", query="SELECT 42")
+    m = _make_model(name="test", path="test.sql", dialect="duckdb", query="SELECT 42")
     ast = m.ast
     assert ast is not None
     assert not (tmp_path / ".tff_cache").exists()

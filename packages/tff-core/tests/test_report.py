@@ -1,72 +1,82 @@
-"""Tests for lint report check filtering."""
+from __future__ import annotations
 
-from tff.core.report import _summary_check_names
-
-
-def test_summary_shows_only_executed_architectural_check() -> None:
-    names = _summary_check_names(["layer_integrity"], {})
-    assert names == ["layer_integrity"]
-
-
-def test_summary_expands_sqlmesh_when_no_findings() -> None:
-    names = _summary_check_names(["sqlmesh"], {})
-    assert set(names) == {"classificationmacros", "sqlcomplexity"}
-
-
-def test_summary_uses_sqlmesh_finding_rule_names() -> None:
-    by_check = {"nomissinggrain": {"error": 2, "warning": 0}}
-    names = _summary_check_names(["sqlmesh"], by_check)
-    assert names == ["nomissinggrain"]
+from typing import Any
+import pytest
+from conftest import _make_finding
+from tff.core.report import (
+    _format_check_cell,
+    _append_check_tag,
+    _format_connascence_tag,
+    _format_file_reference,
+    _is_fixable_finding,
+    _summary_check_names,
+    DisjointSet,
+    group_findings_by_model,
+    normalize_model_name,
+    render_lint_report,
+)
 
 
-def test_summary_full_run_includes_architectural_and_sqlmesh() -> None:
-    executed = [
-        "sqlmesh",
-        "layer_integrity",
-        "custom_exclusions",
-        "schema_contracts",
-        "dependency_graph",
-    ]
-    names = _summary_check_names(executed, {})
-    assert set(names) == {
-        "layer_integrity",
-        "custom_exclusions",
-        "schema_contracts",
-        "dependency_graph",
-        "classificationmacros",
-        "sqlcomplexity",
-    }
+@pytest.mark.parametrize(
+    ("executed", "by_check", "expected"),
+    [
+        (["layer_integrity"], {}, ["layer_integrity"]),
+        (["sqlmesh"], {}, ["classificationmacros", "sqlcomplexity"]),
+        (["sqlmesh"], {"nomissinggrain": {"error": 2, "warning": 0}}, ["nomissinggrain"]),
+        (
+            [
+                "sqlmesh",
+                "layer_integrity",
+                "custom_exclusions",
+                "schema_contracts",
+                "dependency_graph",
+            ],
+            {},
+            [
+                "layer_integrity",
+                "custom_exclusions",
+                "schema_contracts",
+                "dependency_graph",
+                "classificationmacros",
+                "sqlcomplexity",
+            ],
+        ),
+    ],
+)
+def test_summary_check_names(
+    executed: list[str], by_check: dict[str, Any], expected: list[str]
+) -> None:
+    assert set(_summary_check_names(executed, by_check)) == set(expected)
 
 
-def test_render_lint_report_groups_by_connascence() -> None:
+@pytest.mark.parametrize("group_by", ["connascence", "model"])
+def test_render_lint_report_groups_by_mode(group_by: str) -> None:
     from rich.console import Console
-
-    from tff.core.report import LintFinding, render_lint_report
 
     console = Console(record=True, width=120)
     findings = [
-        LintFinding(
+        _make_finding(
             check="banselectstar",
             severity="error",
             message="SELECT * is prohibited.",
             model="marts.users",
             path="models/marts/users.sql",
         ),
-        LintFinding(
+        _make_finding(
             check="classificationmacros",
             severity="warning",
             message="Inline CASE defines product_type",
             model="core.orders",
             path="models/core/orders.sql",
         ),
-        LintFinding(
+        _make_finding(
             check="layer_integrity",
             severity="error",
             message="depends on downstream model",
             model="core.orders",
             path="models/core/orders.sql",
         ),
-        LintFinding(
+        _make_finding(
             check="schema_contracts",
             severity="error",
             message="some contract violation",
@@ -80,76 +90,29 @@ def test_render_lint_report_groups_by_connascence() -> None:
         models_checked=2,
         executed_checks=["sqlmesh", "layer_integrity"],
         console=console,
-        group_by="connascence",
+        group_by=group_by,
     )
 
     assert success is False
-
     output = console.export_text()
-    assert "Connascence of Name (CoN)" in output
-    assert "Connascence of Meaning (CoM)" in output
-    assert "Dynamic Coupling & DAG Structure" in output
-    assert "marts.users" in output
-    assert "core.orders" in output
-    assert "Repository-level" in output
-
-
-def test_render_lint_report_groups_by_model() -> None:
-    from rich.console import Console
-
-    from tff.core.report import LintFinding, render_lint_report
-
-    console = Console(record=True, width=120)
-    findings = [
-        LintFinding(
-            check="banselectstar",
-            severity="error",
-            message="SELECT * is prohibited.",
-            model="marts.users",
-            path="models/marts/users.sql",
-        ),
-        LintFinding(
-            check="classificationmacros",
-            severity="warning",
-            message="Inline CASE defines product_type",
-            model="core.orders",
-            path="models/core/orders.sql",
-        ),
-        LintFinding(
-            check="schema_contracts",
-            severity="error",
-            message="some contract violation",
-            model=None,
-            path=None,
-        ),
-    ]
-
-    success = render_lint_report(
-        findings,
-        models_checked=2,
-        executed_checks=["sqlmesh", "layer_integrity"],
-        console=console,
-        group_by="model",
-    )
-
-    assert success is False
-
-    output = console.export_text()
-    assert "Issues by Model" in output
-    assert "Repository-level issues" in output
-    assert "marts.users" in output
-    assert "core.orders" in output
-    assert "Connascence of Name (CoN)" not in output
+    assert "TFF ARCHITECTURE AUDIT" in output
+    assert "models/marts/users.sql" in output
+    assert "models/core/orders.sql" in output
+    if group_by == "connascence":
+        assert "banselectstar" in output
+        assert "classificationmacros" in output
+        assert "layer_integrity" in output
+        assert "schema_contracts" in output
+    else:
+        assert "Connascence of Name (CoN)" not in output
 
 
 def test_render_lint_report_groups_by_connascence_cop() -> None:
     from rich.console import Console
 
-    from tff.core.report import LintFinding, render_lint_report
-
     console = Console(record=True, width=120)
     findings = [
-        LintFinding(
+        _make_finding(
             check="nopositionalgroupbyororderby",
             severity="error",
             message="Positional GROUP BY '1' found.",
@@ -167,27 +130,26 @@ def test_render_lint_report_groups_by_connascence_cop() -> None:
     )
 
     assert success is False
-
     output = console.export_text()
-    assert "Connascence of Position (CoP)" in output
-    assert "marts.users" in output
+    assert "nopositionalgroupbyororderby" in output
+    assert "position" in output
+    assert "models/marts/users.sql" in output
 
 
-def test_render_lint_report_warnings_and_multiline() -> None:
+@pytest.mark.parametrize("group_by", ["connascence", "model"])
+def test_render_lint_report_warnings_and_multiline(group_by: str) -> None:
     from rich.console import Console
-
-    from tff.core.report import LintFinding, render_lint_report
 
     console = Console(record=True, width=120)
     findings = [
-        LintFinding(
+        _make_finding(
             check="banselectstar",
             severity="warning",
             message="SELECT *\nis prohibited.",
             model="marts.users",
             path="models/marts/users.sql",
         ),
-        LintFinding(
+        _make_finding(
             check="schema_contracts",
             severity="warning",
             message="some contract\nviolation",
@@ -201,102 +163,88 @@ def test_render_lint_report_warnings_and_multiline() -> None:
         models_checked=2,
         executed_checks=["sqlmesh"],
         console=console,
-        group_by="connascence",
+        group_by=group_by,
     )
     assert success is True
 
     output = console.export_text()
-    assert "LINT WARNINGS" in output
     assert "SELECT *" in output
     assert "is prohibited." in output
-    assert "Repository-level" in output
-
-    console_model = Console(record=True, width=120)
-    success_model = render_lint_report(
-        findings,
-        models_checked=2,
-        executed_checks=["sqlmesh"],
-        console=console_model,
-        group_by="model",
-    )
-    assert success_model is True
-    output_model = console_model.export_text()
-    assert "Issues by Model" in output_model
-    assert "SELECT *" in output_model
-    assert "is prohibited." in output_model
+    if group_by == "connascence":
+        assert "WARN —" in output
+        assert "models/marts/users.sql" in output
+    else:
+        assert "TFF ARCHITECTURE AUDIT" in output
 
 
-def test_format_check_cell_with_known_check() -> None:
+@pytest.mark.parametrize(
+    "check,expected_plain,has_link,expected_style",
+    [
+        ("banselectstar", "No SELECT *", True, None),
+        ("custom_unknown_check", "custom_unknown_check", False, "bold"),
+    ],
+)
+def test_format_check_cell(
+    check: str, expected_plain: str, has_link: bool, expected_style: str | None
+) -> None:
     from tff.core.registry import registry
-    from tff.core.report import _format_check_cell
 
-    cell = _format_check_cell("banselectstar")
-    assert cell.plain == "No SELECT *"
-    docs_url = registry.get_docs_url("banselectstar")
-    assert docs_url is not None
-    assert f"link {docs_url}" in str(cell.style)
-
-
-def test_format_check_cell_with_unknown_check() -> None:
-    from tff.core.report import _format_check_cell
-
-    cell = _format_check_cell("custom_unknown_check")
-    assert cell.plain == "custom_unknown_check"
-    assert cell.style == "bold"
+    cell = _format_check_cell(check)
+    assert cell.plain == expected_plain
+    if has_link:
+        docs_url = registry.get_docs_url(check)
+        assert docs_url is not None
+        assert f"link {docs_url}" in str(cell.style)
+    if expected_style:
+        assert cell.style == expected_style
 
 
-def test_append_check_tag_with_known_check() -> None:
+@pytest.mark.parametrize(
+    "check,expected_plain,has_link,expected_style",
+    [
+        ("banselectstar", "Issue message (banselectstar)", True, None),
+        ("custom_unknown_check", "Issue message (custom_unknown_check)", False, "dim"),
+    ],
+)
+def test_append_check_tag(
+    check: str, expected_plain: str, has_link: bool, expected_style: str | None
+) -> None:
     from rich.text import Text
-
     from tff.core.registry import registry
-    from tff.core.report import _append_check_tag
 
     text = Text("Issue message ")
-    _append_check_tag(text, "banselectstar")
-    assert text.plain == "Issue message (banselectstar)"
+    _append_check_tag(text, check)
+    assert text.plain == expected_plain
     span = text.spans[0]
-    assert span.start == len("Issue message ")
-    assert span.end == len("Issue message (banselectstar)")
-    docs_url = registry.get_docs_url("banselectstar")
-    assert docs_url is not None
-    assert f"link {docs_url}" in str(span.style)
-
-
-def test_append_check_tag_with_unknown_check() -> None:
-    from rich.text import Text
-
-    from tff.core.report import _append_check_tag
-
-    text = Text("Issue message ")
-    _append_check_tag(text, "custom_unknown_check")
-    assert text.plain == "Issue message (custom_unknown_check)"
-    span = text.spans[0]
-    assert span.style == "dim"
+    if has_link:
+        docs_url = registry.get_docs_url(check)
+        assert docs_url is not None
+        assert f"link {docs_url}" in str(span.style)
+    if expected_style:
+        assert span.style == expected_style
 
 
 def test_render_lint_report_hyperlinks_in_terminal_output() -> None:
     from rich.console import Console
-
     from tff.core.registry import registry
-    from tff.core.report import LintFinding, render_lint_report
 
     console = Console(record=True, width=120)
     findings = [
-        LintFinding(
+        _make_finding(
             check="banselectstar",
             severity="error",
             message="SELECT * is prohibited.",
             model="marts.users",
             path="models/marts/users.sql",
         ),
-        LintFinding(
+        _make_finding(
             check="layer_integrity",
             severity="error",
             message="Repo level architecture failure.",
             model=None,
             path=None,
         ),
-        LintFinding(
+        _make_finding(
             check="unknown_rule",
             severity="warning",
             message="Unknown warning.",
@@ -317,27 +265,22 @@ def test_render_lint_report_hyperlinks_in_terminal_output() -> None:
     assert docs_url is not None
     arch_docs_url = registry.get_docs_url("layer_integrity")
     assert arch_docs_url is not None
-    # Rich export_html renders OSC-8 hyperlinks as HTML <a> anchors
     html_output = console.export_html(clear=False)
     assert f'href="{docs_url}"' in html_output
-    assert f'href="{arch_docs_url}"' in html_output
-    # Plain text export should not leak URL markup
     text_output = console.export_text()
     assert "https://tff.readthedocs.io" not in text_output
-    assert "(banselectstar)" in text_output
-    assert "(layer_integrity)" in text_output
-    assert "(unknown_rule)" in text_output
+    assert "banselectstar" in text_output
+    assert "layer_integrity" in text_output
+    assert "unknown_rule" in text_output
 
 
 def test_render_lint_report_connascence_grouping_hyperlinks() -> None:
     from rich.console import Console
-
     from tff.core.registry import registry
-    from tff.core.report import LintFinding, render_lint_report
 
     console = Console(record=True, width=120)
     findings = [
-        LintFinding(
+        _make_finding(
             check="banselectstar",
             severity="error",
             message="SELECT * is prohibited.",
@@ -360,44 +303,44 @@ def test_render_lint_report_connascence_grouping_hyperlinks() -> None:
     assert f'href="{docs_url}"' in html_output
     text_output = console.export_text()
     assert "https://tff.readthedocs.io" not in text_output
-    assert "(banselectstar)" in text_output
+    assert "banselectstar" in text_output
 
 
-def test_normalize_model_name() -> None:
-    from tff.core.report import normalize_model_name
+@pytest.mark.parametrize(
+    "raw_name,expected_norm",
+    [
+        ("model.my_project.dim_users", "dim_users"),
+        ("source.my_project.raw_users", "raw_users"),
+        ("seed.my_project.country_codes", "country_codes"),
+        ("snapshot.my_project.orders_snapshot", "orders_snapshot"),
+        ('"model"."my_project"."dim_users"', "dim_users"),
+        ("sqlmesh_example.dim_users", "sqlmesh_example.dim_users"),
+        ("catalog.sqlmesh_example.dim_users", "sqlmesh_example.dim_users"),
+        ("dim_users", "dim_users"),
+    ],
+)
+def test_normalize_model_name(raw_name: str, expected_norm: str) -> None:
+    assert normalize_model_name(raw_name) == expected_norm
 
-    assert normalize_model_name("model.my_project.dim_users") == "dim_users"
-    assert normalize_model_name("source.my_project.raw_users") == "raw_users"
-    assert normalize_model_name("seed.my_project.country_codes") == "country_codes"
-    assert normalize_model_name("snapshot.my_project.orders_snapshot") == "orders_snapshot"
-    assert normalize_model_name('"model"."my_project"."dim_users"') == "dim_users"
-    assert normalize_model_name("sqlmesh_example.dim_users") == "sqlmesh_example.dim_users"
-    assert normalize_model_name("catalog.sqlmesh_example.dim_users") == "sqlmesh_example.dim_users"
-    assert normalize_model_name("dim_users") == "dim_users"
 
-
-def test_render_lint_report_unifies_model_headings_across_checks() -> None:
-    from rich.console import Console
-
-    from tff.core.report import LintFinding, render_lint_report
-
-    console = Console(record=True, width=120)
+def test_group_findings_by_model_unifies_model_headings_across_checks() -> None:
+    """Findings across different checks with matching model identifiers unify into one group."""
     findings = [
-        LintFinding(
+        _make_finding(
             check="dependency_graph",
             severity="error",
             message="fan_out=5 (fail>2) — high blast-radius hub model",
             model="dbt_example.dim_users",
             path="models/core/dim_users.sql",
         ),
-        LintFinding(
+        _make_finding(
             check="banselectstar",
             severity="error",
             message="SELECT * is prohibited.",
             model="dim_users",
             path="models/core/dim_users.sql",
         ),
-        LintFinding(
+        _make_finding(
             check="materialization_depth",
             severity="warning",
             message="View nesting depth is 3",
@@ -406,130 +349,85 @@ def test_render_lint_report_unifies_model_headings_across_checks() -> None:
         ),
     ]
 
-    success = render_lint_report(
-        findings,
-        models_checked=1,
-        executed_checks=["sqlmesh", "dependency_graph"],
-        console=console,
-        group_by="model",
-    )
-
-    assert success is False
-    output = console.export_text()
-
-    # The canonical heading ● dim_users should appear exactly once
-    assert output.count("● dim_users") == 1
-    # Qualified model prefix should not appear as a separate heading
-    assert "● dbt_example.dim_users" not in output
-    assert "● model.dbt_example.dim_users" not in output
-    # All 3 findings should be present under the single heading
-    assert "fan_out=5" in output
-    assert "SELECT * is prohibited" in output
-    assert "View nesting depth is 3" in output
+    groups, repo = group_findings_by_model(findings)
+    assert len(groups) == 1
+    assert groups[0]["name"] == "dim_users"
+    assert groups[0]["path"] == "models/core/dim_users.sql"
+    assert len(groups[0]["findings"]) == 3
+    assert len(repo) == 0
 
 
-def test_render_lint_report_model_grouping_edge_cases() -> None:
-    from rich.console import Console
-
-    from tff.core.report import LintFinding, render_lint_report
-
-    console = Console(record=True, width=120)
+def test_group_findings_by_model_edge_cases() -> None:
+    """Group findings properly handles path-only, model-only, and stem matching."""
     findings = [
-        # 1. Finding with path only (no model name)
-        LintFinding(
+        _make_finding(
             check="banselectstar",
-            severity="error",
-            message="No select star",
             model=None,
             path="models/staging/stg_only_path.sql",
         ),
-        # 2. Finding with model name only first (no path)
-        LintFinding(
+        _make_finding(
             check="sqlcomplexity",
             severity="warning",
-            message="High complexity",
             model="orders",
             path=None,
         ),
-        # 3. Subsequent finding with path that matches the previous model name by stem
-        LintFinding(
+        _make_finding(
             check="banselectstar",
-            severity="error",
-            message="No select star in orders",
             model="orders",
             path="models/marts/orders.sql",
         ),
-        # 4. Finding with path first
-        LintFinding(
+        _make_finding(
             check="banselectstar",
-            severity="error",
-            message="No select star in customers",
             model="customers",
             path="models/marts/customers.sql",
         ),
-        # 5. Subsequent finding with model name only that matches by norm_name
-        LintFinding(
+        _make_finding(
             check="sqlcomplexity",
             severity="warning",
-            message="High complexity in customers",
             model="customers",
             path=None,
         ),
-        # 6. Model name only first
-        LintFinding(
+        _make_finding(
             check="nomissingowner",
-            severity="error",
-            message="Missing owner",
             model="reports",
             path=None,
         ),
-        # 7. Subsequent finding with no model name, but path stem matches previous model
-        LintFinding(
+        _make_finding(
             check="banselectstar",
-            severity="error",
-            message="No select star in reports",
             model=None,
             path="models/marts/reports.sql",
         ),
     ]
 
-    success = render_lint_report(
-        findings,
-        models_checked=4,
-        executed_checks=["sqlmesh"],
-        console=console,
-        group_by="model",
-    )
-
-    assert success is False
-    output = console.export_text()
-    assert "● stg_only_path" in output
-    assert "● orders" in output
-    assert "● customers" in output
-    assert "● reports" in output
-    assert output.count("● orders") == 1
-    assert output.count("● customers") == 1
-    assert output.count("● reports") == 1
-    assert "models/marts/orders.sql" in output
-    assert "models/marts/customers.sql" in output
-    assert "models/marts/reports.sql" in output
+    groups, repo = group_findings_by_model(findings)
+    assert len(repo) == 0
+    group_names = {g["name"] for g in groups}
+    assert group_names == {"stg_only_path", "orders", "customers", "reports"}
+    group_paths = {g["path"] for g in groups}
+    assert "models/marts/orders.sql" in group_paths
+    assert "models/marts/customers.sql" in group_paths
+    assert "models/marts/reports.sql" in group_paths
 
 
-def test_render_lint_report_multiline_finding_formatting() -> None:
+@pytest.mark.parametrize("group_by", ["model", "connascence"])
+def test_render_lint_report_multiline_finding_formatting(group_by: str) -> None:
     """Multi-line findings format cleanly with rule tag on line 1 and sub-bullets indented below."""
     from rich.console import Console
-    from tff.core.report import LintFinding, render_lint_report
 
-    multiline_msg = "another_user_model.sql does not match dim_users.sql:\n  - missing columns: api_request, bad_id\n  + extra columns: email_flag"
+    multiline_msg = (
+        "another_user_model.sql does not match dim_users.sql:\n"
+        "  - missing columns: api_request, bad_id\n"
+        "  + extra columns: email_flag"
+    )
     findings = [
-        LintFinding(
+        _make_finding(
             check="schema_contracts",
             severity="error",
             message=multiline_msg,
             model=None,
             path=None,
         ),
-        LintFinding(
+        _make_finding(
             check="schema_contracts",
             severity="error",
             message=multiline_msg,
@@ -538,26 +436,23 @@ def test_render_lint_report_multiline_finding_formatting() -> None:
         ),
     ]
 
-    console_model = Console(record=True, width=120)
-    render_lint_report(findings, models_checked=2, executed_checks=["schema_contracts"], console=console_model, group_by="model")
-    out_model = console_model.export_text()
-
-    assert "another_user_model.sql does not match dim_users.sql: (schema_contracts)" in out_model
-    assert "  - missing columns: api_request, bad_id" in out_model
-    assert "  + extra columns: email_flag" in out_model
-
-    console_cat = Console(record=True, width=120)
-    render_lint_report(findings, models_checked=2, executed_checks=["schema_contracts"], console=console_cat, group_by="connascence")
-    out_cat = console_cat.export_text()
-
-    assert "another_user_model.sql does not match dim_users.sql: (schema_contracts)" in out_cat
-    assert "  - missing columns: api_request, bad_id" in out_cat
-    assert "  + extra columns: email_flag" in out_cat
+    console = Console(record=True, width=120)
+    render_lint_report(
+        findings,
+        models_checked=2,
+        executed_checks=["schema_contracts"],
+        console=console,
+        group_by=group_by,
+    )
+    out = console.export_text()
+    assert "another_user_model.sql does not match dim_users.sql:" in out
+    assert "schema_contracts" in out
+    assert "  - missing columns: api_request, bad_id" in out
+    assert "  + extra columns: email_flag" in out
 
 
 def test_render_lint_report_with_duration() -> None:
     from rich.console import Console
-    from tff.core.report import render_lint_report
 
     console = Console(record=True, width=120)
     render_lint_report(
@@ -568,50 +463,71 @@ def test_render_lint_report_with_duration() -> None:
         duration=0.42,
     )
     output = console.export_text()
-    assert "15 models checked" in output
+    assert "15 models" in output
     assert "0.42s" in output
 
 
-def test_format_file_reference_without_line() -> None:
-    from tff.core.report import _format_file_reference
+@pytest.mark.parametrize(
+    "kwargs,expected_plain,expected_link_substr,has_link",
+    [
+        ({"path": "models/core/dim_users.sql"}, "models/core/dim_users.sql", "/models/core/dim_users.sql", True),
+        ({"path": "models/core/dim_users.sql", "line": 42}, "models/core/dim_users.sql:42", "/models/core/dim_users.sql", True),
+        ({"path": "models/sub dir/dim users.sql"}, "models/sub dir/dim users.sql", "/models/sub%20dir/dim%20users.sql", True),
+        ({"path": "models/core/dim_users.sql", "display_text": "custom:123"}, "custom:123", "/models/core/dim_users.sql", True),
+        ({"path": ""}, "", None, False),
+    ],
+)
+def test_format_file_reference(
+    kwargs: dict[str, Any],
+    expected_plain: str,
+    expected_link_substr: str | None,
+    has_link: bool,
+) -> None:
+    ref = _format_file_reference(**kwargs)
+    assert ref.plain == expected_plain
+    if has_link:
+        assert ref.style is not None
+        assert str(ref.style.link).startswith("file://")
+        assert expected_link_substr is not None and expected_link_substr in str(ref.style.link)
+    else:
+        assert ref.style is None
 
-    ref = _format_file_reference("models/core/dim_users.sql")
-    assert ref.plain == "models/core/dim_users.sql"
-    assert "link file://" in str(ref.style)
-    assert "dim" in str(ref.style)
+
+def test_format_file_reference_windows_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pathlib import PureWindowsPath
+
+    mock_resolved = PureWindowsPath(r"C:\Users\Jane Doe\project\models\model.sql")
+    monkeypatch.setattr(
+        "tff.core.report.Path.resolve",
+        lambda self: mock_resolved,
+    )
+    ref = _format_file_reference(r"models\model.sql")
+    assert ref.plain == r"models\model.sql"
+    assert ref.style is not None
+    assert ref.style.link == "file:///C:/Users/Jane%20Doe/project/models/model.sql"
 
 
-def test_format_file_reference_with_line() -> None:
-    from tff.core.report import _format_file_reference
-
-    ref = _format_file_reference("models/core/dim_users.sql", line=42)
-    assert ref.plain == "models/core/dim_users.sql:42"
-    assert "link file://" in str(ref.style)
-
-
-def test_render_lint_report_model_view_shows_line_coordinates() -> None:
-    """Findings with line info show 'path:line' prefix in model-grouped view."""
+@pytest.mark.parametrize(
+    "group_by,path,line,expected_substr",
+    [
+        ("model", "models/core/dim_users.sql", 42, "42:1"),
+        ("connascence", "models/marts/users.sql", 10, "models/marts/users.sql:10"),
+    ],
+)
+def test_render_lint_report_shows_line_coordinates(
+    group_by: str, path: str, line: int, expected_substr: str
+) -> None:
     from rich.console import Console
-
-    from tff.core.report import LintFinding, render_lint_report
 
     console = Console(record=True, width=120)
     findings = [
-        LintFinding(
+        _make_finding(
             check="banselectstar",
             severity="error",
             message="SELECT * is prohibited.",
             model="dim_users",
-            path="models/core/dim_users.sql",
-            line=42,
-        ),
-        LintFinding(
-            check="sqlcomplexity",
-            severity="warning",
-            message="High complexity score.",
-            model="dim_users",
-            path="models/core/dim_users.sql",
-            line=None,
+            path=path,
+            line=line,
         ),
     ]
 
@@ -620,63 +536,21 @@ def test_render_lint_report_model_view_shows_line_coordinates() -> None:
         models_checked=1,
         executed_checks=["sqlmesh"],
         console=console,
-        group_by="model",
+        group_by=group_by,
     )
 
     output = console.export_text(clear=False)
-    # Finding with line=42 should show path:line prefix
-    assert "models/core/dim_users.sql:42" in output
-    # Finding without line should NOT show a path prefix in the finding row
-    assert output.count("models/core/dim_users.sql:") == 1
-
-    # Header path should be a clickable file:// hyperlink (verify via HTML export)
-    html_output = console.export_html(clear=False)
-    assert "file://" in html_output
-
-
-def test_render_lint_report_connascence_view_shows_line_coordinates() -> None:
-    """Findings with line info show 'path:line' prefix in connascence-grouped view."""
-    from rich.console import Console
-
-    from tff.core.report import LintFinding, render_lint_report
-
-    console = Console(record=True, width=120)
-    findings = [
-        LintFinding(
-            check="banselectstar",
-            severity="error",
-            message="SELECT * is prohibited.",
-            model="marts.users",
-            path="models/marts/users.sql",
-            line=10,
-        ),
-    ]
-
-    render_lint_report(
-        findings,
-        models_checked=1,
-        executed_checks=["sqlmesh"],
-        console=console,
-        group_by="connascence",
-    )
-
-    output = console.export_text(clear=False)
-    assert "models/marts/users.sql:10" in output
-
-    # Path in model part should be a clickable link
-    html_output = console.export_html(clear=False)
-    assert "file://" in html_output
+    assert expected_substr in output
+    assert "file://" in console.export_html(clear=False)
 
 
 def test_render_lint_report_model_header_has_clickable_file_link() -> None:
     """Model header path is wrapped in an OSC 8 file:// hyperlink."""
     from rich.console import Console
 
-    from tff.core.report import LintFinding, render_lint_report
-
     console = Console(record=True, width=120)
     findings = [
-        LintFinding(
+        _make_finding(
             check="banselectstar",
             severity="error",
             message="SELECT * is prohibited.",
@@ -693,16 +567,430 @@ def test_render_lint_report_model_header_has_clickable_file_link() -> None:
         group_by="model",
     )
 
-    # Plain text should still show the path naturally
     output = console.export_text(clear=False)
-    assert "dim_users" in output
     assert "models/core/dim_users.sql" in output
-
-    # HTML export should contain file:// hyperlinks
     html_output = console.export_html(clear=False)
     assert "file://" in html_output
 
 
+@pytest.mark.parametrize(
+    "findings,expected_name,expected_path",
+    [
+        (
+            [
+                _make_finding(path="models/core/dim_users.sql"),
+                _make_finding(model="dim_users"),
+            ],
+            "dim_users",
+            "models/core/dim_users.sql",
+        ),
+        (
+            [
+                _make_finding(model="dim_users"),
+                _make_finding(path="models/core/dim_users.sql"),
+            ],
+            "dim_users",
+            "models/core/dim_users.sql",
+        ),
+        (
+            [
+                _make_finding(path="models/core/dim_users.sql"),
+                _make_finding(model="analytics.dim_users"),
+            ],
+            "analytics.dim_users",
+            "models/core/dim_users.sql",
+        ),
+        (
+            [
+                _make_finding(model="analytics.dim_users"),
+                _make_finding(path="models/core/dim_users.sql"),
+            ],
+            "analytics.dim_users",
+            "models/core/dim_users.sql",
+        ),
+    ],
+)
+def test_group_findings_by_model_order_independent(
+    findings: list[Any], expected_name: str, expected_path: str
+) -> None:
+    groups, repo = group_findings_by_model(findings)
+    assert len(groups) == 1
+    assert groups[0]["name"] == expected_name
+    assert groups[0]["path"] == expected_path
+    assert len(groups[0]["findings"]) == len(findings)
+    assert len(repo) == 0
 
 
+def test_group_findings_by_model_bridge_merges_disjoint_and_prevents_stale_lookup() -> None:
+    """Findings that bridge disjoint groups merge them and re-point path_to_key without KeyError."""
+    findings = [
+        _make_finding(model="users", path="models/staging/users.sql", msg="Staging model"),
+        _make_finding(model=None, path="models/other/users.sql", msg="Other path"),
+        _make_finding(model="users", path="models/other/users.sql", msg="Bridge"),
+        _make_finding(model=None, path="models/staging/users.sql", msg="Subsequent staging"),
+    ]
+    groups, repo = group_findings_by_model(findings)
+    assert len(groups) == 1
+    assert len(groups[0]["findings"]) == 4
+    assert len(repo) == 0
+
+
+def test_group_findings_by_model_same_stem_different_folders_remain_isolated() -> None:
+    """Models with same stem in different folders remain distinct groups."""
+    findings = [
+        _make_finding(model="staging.users", path="models/staging/users.sql"),
+        _make_finding(model="marts.users", path="models/marts/users.sql"),
+        _make_finding(model="staging.users", path=None),
+        _make_finding(model="marts.users", path=None),
+    ]
+    groups, _ = group_findings_by_model(findings)
+    assert len(groups) == 2
+    assert {g["name"] for g in groups} == {"staging.users", "marts.users"}
+
+
+@pytest.mark.parametrize(
+    ("operations", "expected_roots", "expected_connected"),
+    [
+        (
+            [("union", "a", "b"), ("union", "b", "c")],
+            {"a": "a", "b": "a", "c": "a"},
+            [("a", "c", True), ("a", "d", False)],
+        ),
+        (
+            [("union", "a", "b"), ("union", "c", "d"), ("union", "b", "d")],
+            {"a": "a", "b": "a", "c": "a", "d": "a"},
+            [("a", "d", True), ("b", "c", True)],
+        ),
+        (
+            [("union", "a", "a")],
+            {"a": "a"},
+            [("a", "a", True)],
+        ),
+    ],
+)
+def test_disjoint_set_operations(
+    operations: list[tuple[str, str, str]],
+    expected_roots: dict[str, str],
+    expected_connected: list[tuple[str, str, bool]],
+) -> None:
+    dsu = DisjointSet()
+    for op, x, y in operations:
+        if op == "union":
+            dsu.union(x, y)
+    for elem, root in expected_roots.items():
+        assert dsu.find(elem) == dsu.find(root)
+    for x, y, connected in expected_connected:
+        assert (dsu.find(x) == dsu.find(y)) is connected
+
+
+@pytest.mark.parametrize(
+    ("findings_data", "expected_groups_count", "expected_names"),
+    [
+        (
+            [
+                {"model": "staging.users", "path": None},
+                {"model": "marts.users", "path": None},
+            ],
+            2,
+            {"staging.users", "marts.users"},
+        ),
+        (
+            [
+                {"model": "", "path": ""},
+                {"model": None, "path": None},
+            ],
+            0,
+            set(),
+        ),
+        (
+            [
+                {"model": "staging.users", "path": None},
+                {"model": None, "path": "models/staging/users.sql"},
+            ],
+            1,
+            {"staging.users"},
+        ),
+    ],
+)
+def test_group_findings_by_model_permutations(
+    findings_data: list[dict[str, Any]],
+    expected_groups_count: int,
+    expected_names: set[str],
+) -> None:
+    findings = [_make_finding(**data) for data in findings_data]
+    groups, repo = group_findings_by_model(findings)
+    assert len(groups) == expected_groups_count
+    assert {g["name"] for g in groups} == expected_names
+    if not expected_groups_count:
+        assert len(repo) == len(findings_data)
+
+
+def test_render_lint_report_model_grouping_e2e() -> None:
+    """End-to-end integration test verifying Rich console output with model header."""
+    from rich.console import Console
+
+    console = Console(record=True, width=120)
+    findings = [
+        _make_finding(path="models/core/dim_users.sql", msg="Column type mismatch."),
+        _make_finding(model="dim_users", msg="SELECT * prohibited."),
+    ]
+    render_lint_report(
+        findings,
+        models_checked=1,
+        executed_checks=["sqlmesh"],
+        console=console,
+        group_by="model",
+    )
+    output = console.export_text()
+    assert "models/core/dim_users.sql" in output
+    assert "Column type mismatch." in output
+    assert "SELECT * prohibited." in output
+
+
+def test_render_lint_report_tree_branches_and_footer() -> None:
+    """Verify tree formatting with branch symbols and fixable footer."""
+    from rich.console import Console
+
+    console = Console(record=True, width=120)
+    findings = [
+        _make_finding(
+            check="filenameequalsmodelname",
+            severity="error",
+            message="Model name does not match file stem.",
+            model="dim_users",
+            path="models/core/dim_users.sql",
+            line=42,
+            col=1,
+        ),
+        _make_finding(
+            check="nopositionalgroupbyororderby",
+            severity="warning",
+            message="Positional reference found.",
+            model="dim_users",
+            path="models/core/dim_users.sql",
+            line=50,
+        ),
+    ]
+
+    render_lint_report(
+        findings,
+        models_checked=5,
+        executed_checks=["sqlmesh"],
+        console=console,
+        group_by="model",
+        duration=0.38,
+    )
+
+    output = console.export_text()
+    assert "TFF ARCHITECTURE AUDIT" in output
+    assert "5 models" in output
+    assert "1 error" in output
+    assert "1 warning" in output
+    assert "0.38s" in output
+    assert "models/core/dim_users.sql" in output
+    assert "42:1" in output
+    assert "50:1" in output
+    assert "filenameequalsmodelname" in output
+    assert "name" in output
+    assert "position" in output
+    assert "FAIL — 1 error block merge. Run `tff lint --fix` for auto-correctable rules." in output
+
+
+@pytest.mark.parametrize(
+    "category,expected_tag",
+    [
+        ("Connascence of Name (CoN)", "name"),
+        ("Connascence of Meaning (CoM)", "meaning"),
+        ("Connascence of Algorithm (CoA)", "algorithm"),
+        ("Connascence of Position (CoP)", "position"),
+        ("Connascence of Value (CoV)", "value"),
+        ("Connascence of Type (CoT)", "type"),
+        ("Dynamic Coupling & DAG Structure", "dynamic"),
+        ("Quality & Metadata (Non-Connascence)", "metadata"),
+        ("Unknown Category", "Unknown Category"),
+    ],
+)
+def test_format_connascence_tag_helper(category: str, expected_tag: str) -> None:
+    assert _format_connascence_tag(category) == expected_tag
+
+
+@pytest.mark.parametrize(
+    "check,message,expected_fixable",
+    [
+        ("nopositionalgroupbyororderby", "pos", False),
+        ("nomissingdescription", "desc", False),
+        ("martmodelnamingconvention", "mart", False),
+        ("mart_naming", "mart", False),
+        ("filenameequalsmodelname", "name", True),
+        ("filename_equals_modelname", "name", True),
+        ("sqlcomplexity", "nested subquery in final SELECT", False),
+        ("sqlcomplexity", "too many CTEs", False),
+        ("banselectstar", "select *", False),
+        ("ban_select_star", "select *", False),
+        ("jointypeparity", "type mismatch", False),
+    ],
+)
+def test_is_fixable_finding_helper(check: str, message: str, expected_fixable: bool) -> None:
+    f = _make_finding(check=check, message=message)
+    assert _is_fixable_finding(f) is expected_fixable
+
+
+@pytest.mark.parametrize(
+    ("is_fixable", "expected"),
+    [
+        (True, True),
+        (False, False),
+    ],
+)
+def test_is_fixable_finding_dynamic_registry(is_fixable: bool, expected: bool) -> None:
+    from tff.core.registry import CheckDefinition, registry
+
+    custom_id = f"custom_dynamic_rule_{is_fixable}"
+    registry.register(
+        CheckDefinition(
+            id=custom_id,
+            label="Custom Dynamic Rule",
+            category="Custom Rules",
+            scope="model",
+            is_fixable=is_fixable,
+        )
+    )
+    try:
+        finding = _make_finding(check=custom_id, message="Custom violation")
+        assert _is_fixable_finding(finding) is expected
+    finally:
+        registry.unregister(custom_id)
+
+
+def test_render_lint_report_connascence_model_without_path_and_custom_rule() -> None:
+    """Verify connascence rendering when model has no path and rule has no docs URL."""
+    from rich.console import Console
+
+    console = Console(record=True, width=120)
+    findings = [
+        _make_finding(
+            check="custom_rule_without_url",
+            severity="error",
+            message="Custom violation without url.",
+            model="dim_users",
+            path=None,
+        ),
+    ]
+
+    render_lint_report(
+        findings,
+        models_checked=1,
+        console=console,
+        group_by="connascence",
+    )
+
+    output = console.export_text()
+    assert "dim_users" in output
+    assert "custom_rule_without_url" in output
+
+
+@pytest.mark.parametrize(
+    ("findings", "models_checked", "fail_level", "expected_success", "expected_text"),
+    [
+        ([], 5, "error", True, "PASS — all fitness functions satisfied."),
+        (
+            [_make_finding(check="sqlcomplexity", severity="warning", message="High complexity", model="orders")],
+            1,
+            "warning",
+            False,
+            "FAIL — 1 warning block merge.",
+        ),
+    ],
+)
+def test_render_lint_report_status_footers(
+    findings: list[Any],
+    models_checked: int,
+    fail_level: str,
+    expected_success: bool,
+    expected_text: str,
+) -> None:
+    from rich.console import Console
+
+    console = Console(record=True, width=120)
+    passed = render_lint_report(
+        findings,
+        models_checked=models_checked,
+        fail_level=fail_level,
+        console=console,
+    )
+    assert passed is expected_success
+    assert expected_text in console.export_text()
+
+
+def test_render_lint_report_sqlcomplexity_tip() -> None:
+    from rich.console import Console
+
+    console = Console(record=True, width=120)
+    findings = [
+        _make_finding(
+            check="sqlcomplexity",
+            severity="error",
+            message="FAIL: decision_points=26",
+            model="raw.orders",
+        )
+    ]
+    render_lint_report(findings, models_checked=1, console=console)
+    output = console.export_text()
+    assert "● Tip: Run 'tff explain sqlcomplexity --model raw.orders'" in output
+    assert "💡" not in output
+
+
+def test_render_lint_report_zero_emoji_guarantee() -> None:
+    """Ensure zero decorative emojis appear in any generated CLI lint report."""
+    from rich.console import Console
+
+    console = Console(record=True, width=120)
+    findings = [
+        _make_finding(
+            check="sqlcomplexity",
+            severity="error",
+            message="FAIL: decision_points=26",
+            model="raw.orders",
+        ),
+        _make_finding(
+            check="banselectstar",
+            severity="warning",
+            message="WARN: SELECT * used",
+            model="raw.users",
+        ),
+    ]
+    render_lint_report(findings, models_checked=2, console=console)
+    output = console.export_text()
+
+    prohibited_emojis = ["💡", "📁", "🔧", "📈", "📉", "🚀", "🎉", "❌", "⚠️", "✅"]
+    for emoji in prohibited_emojis:
+        assert emoji not in output, f"Prohibited emoji '{emoji}' found in lint report"
+
+
+
+@pytest.mark.parametrize(
+    ("findings_severities", "fail_level", "expected_passed"),
+    [
+        ([], "error", True),
+        ([], "warning", True),
+        (["warning"], "error", True),
+        (["warning"], "warning", False),
+        (["error"], "error", False),
+        (["error"], "warning", False),
+        (["error", "warning"], "error", False),
+        (["error", "warning"], "warning", False),
+    ],
+)
+def test_render_lint_report_fail_level_permutations(
+    findings_severities: list[Any],
+    fail_level: Any,
+    expected_passed: bool,
+) -> None:
+    findings = [_make_finding(severity=sev) for sev in findings_severities]
+    passed = render_lint_report(
+        findings,
+        models_checked=1,
+        fail_level=fail_level,
+    )
+    assert passed is expected_passed
 

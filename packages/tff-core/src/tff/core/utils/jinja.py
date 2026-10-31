@@ -151,10 +151,14 @@ def _strip_sqlmesh_macros(sql: str) -> str:
     if not spans:
         return sql
 
-    res = list(sql)
-    for start, end in reversed(spans):
-        res[start:end] = list(" __sqlmesh_macro__ ")
-    return "".join(res)
+    parts: list[str] = []
+    last_idx = 0
+    for start, end in spans:
+        parts.append(sql[last_idx:start])
+        parts.append(" __sqlmesh_macro__ ")
+        last_idx = end
+    parts.append(sql[last_idx:])
+    return "".join(parts)
 
 
 def clean_jinja_for_parsing(sql: str, provider: str | None = None) -> str:
@@ -166,7 +170,11 @@ def clean_jinja_for_parsing(sql: str, provider: str | None = None) -> str:
     # 1. Remove Jinja comments
     sql = re.sub(r"\{#.*?#\}", "", sql, flags=re.DOTALL)
 
-    # 2. Map dbt ref(...) to model name
+    # 2. Strip top-level {{ config(...) }} and {{ set(...) }} blocks cleanly
+    # so they do not get converted into dummy variable identifiers in statement positions
+    sql = re.sub(r"\{\{\s*(?:config|set)\s*\(.*?\)\s*\}\}", " ", sql, flags=re.DOTALL)
+
+    # 3. Map dbt ref(...) to model name
     # e.g. {{ ref('my_model') }} -> my_model
     # e.g. {{ ref('package', 'my_model') }} -> my_model
     sql = re.sub(

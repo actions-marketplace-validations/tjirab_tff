@@ -6,14 +6,20 @@ tff runs two categories of quality guardrails: **Architectural Checks** and **Li
 
 ## 🛠️ Auto-Fixer (`--fix`)
 
-tff includes a built-in auto-fixer that can automatically resolve simple violations. By running `tff lint --fix`, tff will modify your source files to fix the following issues:
+tff includes a focused, safe auto-fixer for model declarations. By running `tff lint --fix`, tff safely synchronizes model declarations to match their file stems on disk:
 
-*   **[No Positional GROUP BY/ORDER BY](#no-positional-group-byorder-by-no_positional_group_by_or_order_by-auto-fixable)** (`nopositionalgroupbyororderby`): Rewrites integer positional references in `GROUP BY` and `ORDER BY` clauses to explicit column names or select aliases using AST modification.
-*   **[Nested Subqueries in Final SELECT](#sql-complexity-sql_complexity)** (`sqlcomplexity`): Refactors inline subqueries in `FROM (SELECT ...) alias` and `JOIN (SELECT ...) alias` clauses of the final `SELECT` statement into named Common Table Expressions (`WITH alias AS (...)`).
-*   **Metadata (`nomissingowner`, `nomissingdescription`)**:
-    *   **dbt**: Automatically appends or scaffolds `schema.yml` metadata configs with `"TODO: Add owner"` and `"TODO: Add description"` templates.
-    *   **SQLMesh**: Inline-updates the `MODEL` block in the model `.sql` file to add `owner` and `description` headers.
-    *   **Dataform**: Injects `description: "TODO: Add description"` and `bigquery: { labels: { owner: "TODO: Add owner" } }` inside `.sqlx` `config { ... }` blocks, or scaffolds a minimal `config { ... }` header if absent.
+*   **[Filename Equals Model Name](#filename-equals-model-name-filename_equals_modelname)** (`filenameequalsmodelname`, `filename_equals_modelname`):
+    *   **SQLMesh**: Updates the model name identifier in the `MODEL (name ...)` declaration block within `.sql` model files.
+    *   **Dataform**: Updates or injects the `name: "..."` property inside the `config { ... }` declaration block within `.sqlx` files.
+
+### Design Principles: Safe & Atomic Remediation
+
+To ensure zero risk to production data pipelines, `tff` adheres to strict safety boundaries for automated remediation:
+
+1.  **Atomic File Writes**: All fixes are executed using atomic temporary file creation followed by an atomic filesystem replace operation. Even in the event of an unexpected process interruption, files are never left in a partially written or corrupted state.
+2.  **No Lossy SQL AST Rewrites**: Destructive code transformations—such as expanding `SELECT *` across schemas, lifting subqueries into CTEs, or rewriting positional `GROUP BY`/`ORDER BY` clauses—are intentionally not auto-fixed. AST re-serialization can strip comments, introduce whitespace irregularities, or subtly alter query execution semantics.
+3.  **No Superficial Metadata Placeholders**: Rules requiring team domain context (such as model owners or descriptions) are not filled with dummy placeholder strings (`"TODO: Add owner"`). Violations remain visible until authors provide meaningful documentation and ownership.
+4.  **No Destructive Renames**: `tff` never renames files on disk during linting, preventing broken downstream references or version control churn.
 
 ---
 
@@ -30,14 +36,16 @@ For enterprise DAGs consisting of hundreds or thousands of transformation models
 
 ```yaml
 # Root configuration options:
+provider: dbt           # Optional: explicitly set pipeline provider (dbt, sqlmesh, dataform)
 workers: 4              # Optional: number of worker processes (default: auto, capped at CPU count)
+chunk_size: 10          # Optional: chunk size of models per thread worker (default: dynamic or TFF_CHUNK_SIZE)
 cache_ast: true         # Optional: toggle persistent AST caching (default: true)
 cache_dir: ".tff_cache" # Optional: persistent cache directory (default: ".tff_cache")
 ```
 
-You can also override these on the CLI via `--workers <N>`, `--no-cache`, and `--clear-cache`, or via the `TFF_WORKERS` environment variable.
+You can also override these on the CLI via `--workers <N>`, `--chunk-size <N>`, `--no-cache`, and `--clear-cache`, or via the `TFF_WORKERS` / `TFF_CHUNK_SIZE` environment variables.
 
-### Task Batch Tuning (`TFF_CHUNK_SIZE`)
+### Task Batch Tuning (`--chunk-size`, `TFF_CHUNK_SIZE`)
 
 When evaluating model-level rules across large repositories (>1,000 models), creating individual tasks per model can introduce thread pool scheduling and synchronization overhead. `tff` automatically groups eligible models into task batches:
 
@@ -345,6 +353,7 @@ Architectural checks evaluate the structure, dependencies, and layout of your en
   * CTEs are parsed, canonicalized using `sqlglot` to ignore whitespace/formatting differences, and hashed.
   * CTE extraction and fingerprinting run concurrently across a parallel worker pool for high-performance traversal on large DAGs.
   * Only "complex" CTEs are checked. A CTE is complex if it has a minimum AST node count and contains a structural element (`JOIN`, `WHERE`, `GROUP BY`, `HAVING`, `WINDOW`, `CASE`, or `IF`).
+  * Centrally managed CTE transformation logic generated by shared macros (dbt Jinja macros, SQLMesh macros, or Dataform functions) is automatically detected and excluded from duplication findings when `ignore_macros: true` (default).
 * **How to configure**:
   Defined under `checks.duplicate_ctes` in `fitness_functions.yaml`.
   ```yaml
@@ -353,6 +362,7 @@ Architectural checks evaluate the structure, dependencies, and layout of your en
       enabled: true
       severity: warning      # Severity of finding: 'warning' or 'error'
       min_ast_nodes: 12      # Minimum AST node count to analyze (default: 12)
+      ignore_macros: true    # Ignore duplicate CTEs originating from shared macros (default: true)
       skip_layers: [staging]
   ```
 
@@ -370,7 +380,10 @@ Architectural checks evaluate the structure, dependencies, and layout of your en
     * Positional string slicing parameters (e.g. `SUBSTRING(name, 1, 10)`, `LEFT(name, 5)`, `RIGHT(name, 5)`).
     * String concatenation operators (`||` / `DPipe`) and `CONCAT_WS` separators.
     * Mathematical divisors in arithmetic division (e.g. `amount / 100.00` cents-to-dollars divisor).
+    * Subscript/bracket key and index access on semi-structured or array fields (e.g. `payload['status']`, `row[0]`).
+    * Semi-structured property and struct extraction functions (e.g. `GET(obj, 'status')`, `STRUCT_EXTRACT(data, 'status')`).
   * Short punctuation characters (`|`, ` `, `-`, `_`, `/`, `:`) are ignored by default and configurable via `ignored_punctuation`.
+  * Tiny string literals can be excluded by setting `min_length` (e.g. `min_length: 3` to ignore `'0'`, `'-1'`, `''`, `'3'`).
   * Project-specific literal escapes can be added to `ignored_values`.
   * Grouping is case-insensitive for strings, but the original casing is preserved in the findings messages.
 * **How to configure**:
@@ -381,6 +394,7 @@ Architectural checks evaluate the structure, dependencies, and layout of your en
       enabled: true
       severity: warning               # Severity of finding: 'warning' or 'error'
       min_occurrences: 2             # Minimum number of unique models sharing a literal to trigger (default: 2)
+      min_length: 0                  # Minimum length for string literals to check (default: 0)
       ignored_values: ["0", "1", ""]  # List of literals to ignore (default: ['0', '1', ''])
       ignored_punctuation: ["|", " ", "-", "_", "/", ":"] # Punctuation strings to ignore (default: ['|', ' ', '-', '_', '/', ':'])
       skip_layers: [staging]
@@ -425,7 +439,7 @@ Architectural checks evaluate the structure, dependencies, and layout of your en
 * **What it checks**:
   * Validates data type parity for joined columns across SQL queries to eliminate **Connascence of Type (CoT)**.
   * Walks join condition expressions (`ON left.col = right.col` and `USING (col)`), extracts columns on both sides, resolves their data types from project model metadata, and flags any incompatible type mismatches.
-  * Honors explicit casts (e.g. `CAST(id AS VARCHAR) = user_id`) and recognizes dialect-equivalent type families (e.g. `VARCHAR` $\leftrightarrow$ `TEXT`, `INT` $\leftrightarrow$ `BIGINT`).
+  * Honors explicit casts (e.g. `CAST(id AS VARCHAR) = user_id`), infers return types of common scalar and wrapper functions (e.g. `LOWER`, `UPPER`, `TRIM`, `CONCAT`, `DATE_TRUNC`, `DATE`, `TIMESTAMP`, `COALESCE`, `IF`, `CASE`), and recognizes dialect-equivalent type families (e.g. `VARCHAR` $\leftrightarrow$ `TEXT`, `INT` $\leftrightarrow$ `BIGINT`).
 
 * **Why it matters (The "Why")**:
   Joining columns with mismatching data types (e.g. `VARCHAR` joined to `INTEGER`) causes dynamic type casting overhead across every processed row, disables database index and partition scans, or leads to runtime execution failures. It introduces **Connascence of Type (CoT)** where models are tightly and invisibly coupled to upstream internal type representations.
@@ -490,19 +504,35 @@ For SQLMesh projects, these rules run dynamically inside SQLMesh (e.g., `sqlmesh
 
 ---
 
-### No Positional GROUP BY/ORDER BY (`no_positional_group_by_or_order_by`) [Auto-fixable]
+### No Positional GROUP BY/ORDER BY (`no_positional_group_by_or_order_by`) <a id="no-positional-group-byorder-by-no_positional_group_by_or_order_by"></a>
 
 * **What it checks**:
   * Prevents using ordinal integers (e.g., `GROUP BY 1, 2` or `ORDER BY 1 DESC`) instead of explicit column name references.
+  * Can be configured together under `rules.no_positional_group_by_or_order_by`, or individually via `rules.no_positional_group_by` and `rules.no_positional_order_by`.
 * **How to configure**:
-  Defined under `rules.no_positional_group_by_or_order_by` in `fitness_functions.yaml`.
+  Defined under `rules.no_positional_group_by_or_order_by` or individual rule sections in `fitness_functions.yaml`.
   ```yaml
   rules:
+    # Option 1: Configure together with individual toggles
     no_positional_group_by_or_order_by:
+      enabled: true
+      group_by: true
+      order_by: true
+      skip_layers: [sources]
+
+    # Option 2: Configure separately
+    no_positional_group_by:
+      enabled: true
+      skip_layers: [sources]
+
+    no_positional_order_by:
       enabled: true
       skip_layers: [sources]
   ```
-  * **SQLMesh Rule Name**: `nopositionalgroupbyororderby`
+  * **Checks**:
+    * `no_positional_group_by` (`nopositionalgroupby`): flags positional `GROUP BY` references.
+    * `no_positional_order_by` (`nopositionalorderby`): flags positional `ORDER BY` references.
+    * `no_positional_group_by_or_order_by` (`nopositionalgroupbyororderby`): legacy umbrella check name.
   * Default `skip_layers`: `["sources"]`
 
 ---
@@ -555,7 +585,7 @@ For SQLMesh projects, these rules run dynamically inside SQLMesh (e.g., `sqlmesh
     * `join_count`: Number of `JOIN` statements.
     * `line_count`: Total lines of code (ignoring empty lines and SQLMesh `MODEL` blocks).
     * `decision_points`: Number of logical conditional statements (`CASE`, `IF` and boolean operators `AND`/`OR` in `WHERE` clauses).
-    * `nested_subquery_in_final_select`: Warns if a subquery is nested in the final SELECT statement FROM or JOIN clauses. (Auto-fixable via `tff lint --fix`)
+    * `nested_subquery_in_final_select`: Warns if a subquery is nested in the final SELECT statement FROM or JOIN clauses.
 * **How to configure**:
   Defined under `rules.sql_complexity` in `fitness_functions.yaml`.
   ```yaml
@@ -569,7 +599,7 @@ For SQLMesh projects, these rules run dynamically inside SQLMesh (e.g., `sqlmesh
         line_count: [250, 400]
   ```
   * **SQLMesh Rule Name**: `sqlcomplexity`
-  * `thresholds`: Map of metric to `[warn_threshold, fail_threshold]` integer pairs. Exceeding `warn_threshold` raises a warning; exceeding `fail_threshold` raises an error.
+  * `thresholds`: Map of metric to `[warn_threshold, fail_threshold]` integer pairs. Exceeding `warn_threshold` raises a warning; exceeding `fail_threshold` raises an error. Unconfigured metrics inherit standard default thresholds.
   * `severity` (string, optional, default: `"error"`): Overall rule severity override (`"warning"` or `"error"`). Set to `"warning"` if you want all complexity breaches to be emitted as warnings only and never fail the run.
   * *Note*: The legacy `warn_only` setting is deprecated and no longer supported; use `severity: warning` or threshold pairs instead.
 
@@ -640,12 +670,12 @@ For SQLMesh projects, these rules run dynamically inside SQLMesh (e.g., `sqlmesh
 
 ---
 
-### Metadata (`metadata`) [Partially Auto-fixable]
+### Metadata (`metadata`) <a id="metadata-metadata"></a>
 
 * **What it checks**:
   * Enforces model metadata documentation and testing:
-    * **`owner`** [Auto-fixable]: Validates that the model config has a specified owner.
-    * **`description`** [Auto-fixable]: Validates that the model description is defined and non-empty.
+    * **`owner`**: Validates that the model config has a specified owner.
+    * **`description`**: Validates that the model description is defined and non-empty.
     * **`grain`**: Validates that grains (primary key/grain definition) are specified.
     * **`not_null`**: Validates that the model has a `not_null` audit (SQLMesh) or test (dbt).
     * **`unique_values`**: Validates that the model has a `unique_values` audit (SQLMesh) or `unique` test (dbt).
@@ -670,10 +700,11 @@ For SQLMesh projects, these rules run dynamically inside SQLMesh (e.g., `sqlmesh
 
 ---
 
-### Filename Equals Model Name (`filename_equals_modelname`)
+### Filename Equals Model Name (`filename_equals_modelname`) [Auto-fixable] <a id="filename-equals-model-name-filename_equals_modelname"></a>
 
 * **What it checks**:
   * Validates that the model's catalog identifier matches the stem of its source SQL file on disk.
+* **Auto-fix**: Supported via `tff lint --fix` to safely update the model declaration (`MODEL (name ...)` in SQLMesh or `config { name: "..." }` in Dataform) to match the file stem.
 * **How to configure**:
   Defined under `rules.filename_equals_modelname` in `fitness_functions.yaml`.
   ```yaml
@@ -682,6 +713,9 @@ For SQLMesh projects, these rules run dynamically inside SQLMesh (e.g., `sqlmesh
       enabled: true
   ```
   * **SQLMesh Rule Name**: `filenameequalsmodelname`
+
+!!! note "Per-Model Error Isolation"
+    If an unexpected error (such as a syntax error or AST parsing exception) prevents a rule from evaluating a model, tff isolates the failure and emits a `rule_execution_error` diagnostic finding. See [Diagnostic Findings & Error Isolation (`rule_execution_error`)](#5-diagnostic-findings-error-isolation-rule_execution_error) for details.
 
 ---
 
@@ -712,6 +746,23 @@ health:
 
 * **Check-level weights (`weights`)**: Map check or rule names (e.g. `layer_integrity`, `ban_select_star`) to a positive float weight.
 * **Category weights (`category_weights`)**: Map categories (e.g. `connascence_of_algorithm`, `dynamic_coupling`, `metadata`) to a positive float weight. If both category and check weights are specified, check-level weights take precedence.
+
+### Weight Calibration Guidelines
+
+When introducing new lint rules or architectural checks, align their default weights and penalty bounds according to scope:
+
+| Dimension / Scope | Typical Weight Bounds | Default Error Penalty | Default Warning Penalty | Rationale |
+| :--- | :--- | :--- | :--- | :--- |
+| **Cross-Model / Architectural DAG Checks** (e.g. `layer_integrity`, `dependency_graph`, `schema_contracts`) | `2.0` – `3.0` | `100.0` (Project-level) | `50.0` (Project-level) | Structural defects span multiple pipelines or domain boundaries; failure represents system-wide architectural drift. |
+| **High-Impact Semantic Coupling** (e.g. `duplicate_ctes`, `join_type_parity`, `connascence_of_value`) | `1.5` – `2.0` | `1.0` (Model-level) | `0.5` (Model-level) | Cross-model algorithm or type mismatches that cause query bloat or type coercion degradation across downstream consumers. |
+| **Single-Model Linter Rules** (e.g. `ban_select_star`, `no_positional_group_by`, `environment_agnostic_references`) | `1.0` | `1.0` (Model-level) | `0.5` (Model-level) | Local code smells within isolated models; penalties scale with the total number of checked models ($M$). |
+| **Style & Metadata Hygiene** (e.g. `mart_naming`, `column_names`, `metadata`) | `0.5` – `1.0` | `1.0` (Model-level) | `0.5` (Model-level) | Documentation and surface naming conventions; lower impact on runtime correctness and schema stability. |
+
+#### Stability and Drift Guarantees Across Releases
+
+1. **Deterministic Bounding**: All check scores evaluate to the range $[0.0, 100.0]$. Overall scores are weighted averages bounded within $[0.0, 100.0]$.
+2. **Tolerance Bounds**: Minor releases must preserve existing check weights ($w_i = 1.0$ default) unless an explicit configuration override or migration path is provided.
+3. **Model Cardinality Invariance**: Model-level check scores use $100 \times \left(1 - \frac{\text{penalties}}{M}\right)$, ensuring that adding compliant models to a repo cannot decrease scores.
 
 ### Failure Penalties
 
@@ -877,4 +928,74 @@ You can inspect registered plugins and adapters using the `tff info` command:
 ```bash
 tff info
 ```
+
+---
+
+## 5. Diagnostic Findings & Error Isolation (`rule_execution_error`)
+
+tff provides **per-model error isolation** during rule and check evaluation. When evaluating hundreds or thousands of models across large dbt, SQLMesh, or Dataform projects, individual models may occasionally fail during evaluation due to dialect-specific SQL syntax, AST parsing failures, unhandled exceptions in custom rule plugins, or corrupted project metadata.
+
+Rather than aborting the entire evaluation run and discarding findings for all other models, tff isolates runtime failures to the specific model or check, allowing the rest of the project to complete evaluation.
+
+### Diagnostic Finding Specification
+
+| Attribute | Value |
+| :--- | :--- |
+| **Check ID** | `rule_execution_error` |
+| **Finding Label** | `Rule execution error` |
+| **Category** | `Execution Errors` |
+| **Default Severity** | `error` |
+| **Scope** | `model` (when a model rule fails) or `project` (when a DAG/project-level check fails) |
+| **Configurable via YAML?** | **No** (diagnostic finding, not a configurable quality rule) |
+
+### Quality Violations vs. Execution Errors
+
+It is important to distinguish `rule_execution_error` from standard architectural and linter violations:
+* **Fitness Function Violations** (e.g. `layer_integrity`, `ban_select_star`, `mart_naming`): The model was successfully parsed and evaluated, but its architecture or SQL style violated a configured governance rule.
+* **Execution Errors** (`rule_execution_error`): The rule could not be evaluated because an unexpected exception occurred during model inspection, AST parsing, or rule execution.
+
+Because `rule_execution_error` indicates an execution failure rather than a style preference, it **cannot be disabled** via `fitness_functions.yaml`.
+
+### Common Causes & Triggers
+
+1. **SQL Dialect Syntax Incompatibilities**:
+   * A model query uses database-specific syntax or procedural SQL constructs not yet supported by the configured SQLGlot dialect.
+2. **AST Parsing Failures**:
+   * Syntax errors or dialect mismatches when generating the abstract syntax tree for a model query.
+3. **Custom Plugin Exceptions**:
+   * An unhandled exception (e.g. `AttributeError`, `KeyError`, `IndexError`) raised within a custom rule plugin or custom adapter.
+4. **Missing or Corrupted Model Attributes**:
+   * Malformed manifest data or missing files that prevent standard model representation instantiation.
+
+### Surfacing in CLI and CI/CD Pipelines
+
+* **CLI Audit Ledger**: Surfaced in the terminal output with `ERR` status tag, `rule_execution_error` rule identifier, `[Execution Errors]` category, and the underlying error message:
+  ```text
+  STATUS  LOCATION                                 RULE                  COUPLING
+  ─────────────────────────────────────────────────────────────────────────────────────────────
+  ERR     models/marts/orders.sql                  rule_execution_error  [Execution Errors]
+          ! Rule 'ban_select_star' failed to evaluate: Syntax error near 'QUALIFY' at line 14
+  ```
+* **CI Exit Codes**: Since `rule_execution_error` is emitted with severity `error`, commands like `tff lint` and `tff check` exit with code `1` by default (`--fail-level error`), preventing broken or un-evaluated models from passing CI gates unnoticed.
+* **SARIF Reports (`--format sarif`)**: Exported as an error-level result under `ruleId: "rule_execution_error"` with file path and line location for GitHub Code Scanning and security alerts.
+* **GitHub Actions Workflow Annotations**: In CI or when `--github-annotations` is enabled, emits `::error` annotations on the exact model file in pull requests.
+* **JUnit XML (`--junit-xml`)**: Recorded as a failed test case in standard test reports for GitLab CI, Azure DevOps, and Bitbucket.
+* **Health Scoring (`tff health`)**:
+  * Grouped under the `Execution Errors` category in diagnostic breakdowns.
+  * Because `rule_execution_error` is an execution diagnostic rather than a configurable quality metric, its category score is reported as `None` and does not deduct penalty points from the overall architectural health score percentage (which measures fitness function conformance).
+
+### Troubleshooting & Remediation
+
+When encountering `rule_execution_error`:
+
+1. **Inspect Full Stack Traces with `--debug`**:
+   Run the command with the `--debug` flag or set `export TFF_DEBUG=1` to print the full Python exception traceback and diagnostic context:
+   ```bash
+   tff lint --debug
+   ```
+2. **Verify Dialect Configuration**:
+   Ensure the project or command specifies the correct SQL dialect (e.g. `--dialect snowflake` or `--dialect duckdb`).
+3. **Debug Custom Rule Plugins**:
+   If the failure occurs inside a custom plugin rule, inspect the exception trace to identify unhandled AST node types or missing model attributes.
+
 

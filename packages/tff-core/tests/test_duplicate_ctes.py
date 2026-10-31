@@ -1,15 +1,15 @@
+from conftest import _make_model
 from pathlib import Path
 
 from tff.core.checks.duplicate_ctes import collect_duplicate_cte_findings
 from tff.core.config import FitnessFunctionsConfig
-from tff.core.model import ModelRepresentation
 
 
 def test_duplicate_ctes_no_duplicates():
     config = FitnessFunctionsConfig()
     config.checks.duplicate_ctes.enabled = True
 
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
@@ -20,7 +20,7 @@ def test_duplicate_ctes_no_duplicates():
         SELECT * FROM cte1
         """,
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -63,13 +63,13 @@ def test_duplicate_ctes_with_duplicates():
     SELECT id FROM user_cte
     """
 
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query=query1,
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -97,13 +97,13 @@ def test_duplicate_ctes_simple_ignored():
     query1 = "WITH imported AS (SELECT * FROM ref('stg_users')) SELECT * FROM imported"
     query2 = "WITH import_alias AS (SELECT * FROM ref('stg_users')) SELECT id FROM import_alias"
 
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query=query1,
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -127,13 +127,13 @@ def test_duplicate_ctes_layer_filtering():
     SELECT * FROM complex_cte
     """
 
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="sources.model1",
         path="models/sources/model1.sql",
         dialect="postgres",
         query=query,
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="marts.model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -158,13 +158,13 @@ def test_duplicate_ctes_disabled():
     SELECT * FROM complex_cte
     """
 
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query=query,
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -181,7 +181,7 @@ def test_duplicate_ctes_file_fallbacks(tmp_path: Path):
     config.checks.duplicate_ctes.enabled = True
 
     # 1. Nonexistent/invalid path
-    model_nonexistent = ModelRepresentation(
+    model_nonexistent = _make_model(
         name="model1",
         path="nonexistent.txt",
         dialect="postgres",
@@ -192,7 +192,7 @@ def test_duplicate_ctes_file_fallbacks(tmp_path: Path):
     # 2. Existing path with read exception
     bad_file = tmp_path / "bad.sql"
     bad_file.write_text("dummy", encoding="utf-8")
-    model_read_err = ModelRepresentation(
+    model_read_err = _make_model(
         name="model2",
         path=str(bad_file),
         dialect="postgres",
@@ -209,7 +209,7 @@ def test_duplicate_ctes_parse_exception():
     config.checks.duplicate_ctes.enabled = True
 
     # Invalid SQL syntax that sqlglot cannot parse
-    model_invalid_sql = ModelRepresentation(
+    model_invalid_sql = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
@@ -258,7 +258,7 @@ def test_duplicate_ctes_parallel_execution():
     """
 
     models = {
-        f"model_{i}": ModelRepresentation(
+        f"model_{i}": _make_model(
             name=f"model_{i}",
             path=f"models/marts/model_{i}.sql",
             dialect="duckdb",
@@ -290,7 +290,7 @@ def test_duplicate_ctes_parallel_fallback():
     """
 
     models = {
-        f"model_{i}": ModelRepresentation(
+        f"model_{i}": _make_model(
             name=f"model_{i}",
             path=f"models/marts/model_{i}.sql",
             dialect="duckdb",
@@ -317,8 +317,8 @@ def test_duplicate_ctes_empty_and_external():
 
     # Only external / symbolic models
     models = {
-        "ext": ModelRepresentation(name="ext", path="ext.sql", dialect="duckdb", is_external=True),
-        "sym": ModelRepresentation(name="sym", path="sym.sql", dialect="duckdb", is_symbolic=True),
+        "ext": _make_model(name="ext", path="ext.sql", dialect="duckdb", is_external=True),
+        "sym": _make_model(name="sym", path="sym.sql", dialect="duckdb", is_symbolic=True),
     }
     assert collect_duplicate_cte_findings(models, config) == []
 
@@ -342,19 +342,19 @@ def test_duplicate_ctes_from_file_path(tmp_path: Path):
     f1.write_text(cte_sql, encoding="utf-8")
     f2.write_text(cte_sql, encoding="utf-8")
 
-    m1 = ModelRepresentation(
+    m1 = _make_model(
         name="m1",
         path=str(f1),
         dialect="duckdb",
         query=None,
     )
-    m2 = ModelRepresentation(
+    m2 = _make_model(
         name="m2",
         path=str(f2),
         dialect="duckdb",
         query=None,
     )
-    m3_missing = ModelRepresentation(
+    m3_missing = _make_model(
         name="m3_missing",
         path="nonexistent_model_file.sql",
         dialect="duckdb",
@@ -365,5 +365,407 @@ def test_duplicate_ctes_from_file_path(tmp_path: Path):
     findings = collect_duplicate_cte_findings(models, config, max_workers=1)
     assert len(findings) == 2
     assert {f.model for f in findings} == {"m1", "m2"}
+
+
+def test_duplicate_ctes_ignored_from_dbt_macros():
+    config = FitnessFunctionsConfig()
+    config.checks.duplicate_ctes.enabled = True
+    config.checks.duplicate_ctes.min_ast_nodes = 8
+
+    # Compiled SQL has identical complex CTE logic
+    compiled_m1 = """
+    WITH cleaning_cte AS (
+        SELECT id, name, LOWER(email) AS clean_email
+        FROM stg_users
+        WHERE active = TRUE
+        ORDER BY id
+    )
+    SELECT * FROM cleaning_cte
+    """
+    compiled_m2 = """
+    WITH user_cte AS (
+        SELECT id, name, LOWER(email) AS clean_email
+        FROM stg_users
+        WHERE active = TRUE
+        ORDER BY id
+    )
+    SELECT id FROM user_cte
+    """
+
+    # Raw source code invokes macro
+    raw_m1 = """
+    WITH cleaning_cte AS (
+        {{ clean_users() }}
+    )
+    SELECT * FROM cleaning_cte
+    """
+    raw_m2 = """
+    WITH user_cte AS (
+        {{ clean_users() }}
+    )
+    SELECT id FROM user_cte
+    """
+
+    m1 = _make_model(
+        name="model1",
+        path="models/marts/model1.sql",
+        dialect="postgres",
+        query=compiled_m1,
+        raw_code=raw_m1,
+    )
+    m2 = _make_model(
+        name="model2",
+        path="models/marts/model2.sql",
+        dialect="postgres",
+        query=compiled_m2,
+        raw_code=raw_m2,
+    )
+
+    findings = collect_duplicate_cte_findings({"model1": m1, "model2": m2}, config)
+    assert len(findings) == 0
+
+
+def test_duplicate_ctes_ignored_when_macro_generates_entire_cte():
+    config = FitnessFunctionsConfig()
+    config.checks.duplicate_ctes.enabled = True
+    config.checks.duplicate_ctes.min_ast_nodes = 8
+
+    compiled_sql = """
+    WITH generated_cte AS (
+        SELECT id, name, count(*) OVER (PARTITION BY id) AS cnt
+        FROM stg_events
+        WHERE status = 'processed'
+    )
+    SELECT * FROM generated_cte
+    """
+
+    raw_m1 = "WITH {{ generate_events_cte() }} SELECT * FROM generated_cte"
+    raw_m2 = "WITH {{ generate_events_cte() }} SELECT id FROM generated_cte"
+
+    m1 = _make_model(
+        name="m1",
+        path="models/m1.sql",
+        dialect="postgres",
+        query=compiled_sql,
+        raw_code=raw_m1,
+    )
+    m2 = _make_model(
+        name="m2",
+        path="models/m2.sql",
+        dialect="postgres",
+        query=compiled_sql,
+        raw_code=raw_m2,
+    )
+
+    findings = collect_duplicate_cte_findings({"m1": m1, "m2": m2}, config)
+    assert len(findings) == 0
+
+
+def test_duplicate_ctes_ignored_from_sqlmesh_macros():
+    config = FitnessFunctionsConfig()
+    config.checks.duplicate_ctes.enabled = True
+    config.checks.duplicate_ctes.min_ast_nodes = 8
+
+    compiled_sql = """
+    WITH cleaning_cte AS (
+        SELECT id, name, LOWER(email) AS clean_email
+        FROM stg_users
+        WHERE active = TRUE
+        ORDER BY id
+    )
+    SELECT * FROM cleaning_cte
+    """
+
+    raw_m1 = """
+    MODEL (name marts.m1);
+    WITH cleaning_cte AS (
+        @clean_users()
+    )
+    SELECT * FROM cleaning_cte;
+    """
+    raw_m2 = """
+    MODEL (name marts.m2);
+    WITH cleaning_cte AS (
+        @clean_users()
+    )
+    SELECT * FROM cleaning_cte;
+    """
+
+    m1 = _make_model(
+        name="m1",
+        path="models/m1.sql",
+        dialect="postgres",
+        query=compiled_sql,
+        raw_code=raw_m1,
+    )
+    m2 = _make_model(
+        name="m2",
+        path="models/m2.sql",
+        dialect="postgres",
+        query=compiled_sql,
+        raw_code=raw_m2,
+    )
+
+    findings = collect_duplicate_cte_findings({"m1": m1, "m2": m2}, config)
+    assert len(findings) == 0
+
+
+def test_duplicate_ctes_ignored_from_dataform_macros():
+    config = FitnessFunctionsConfig()
+    config.checks.duplicate_ctes.enabled = True
+    config.checks.duplicate_ctes.min_ast_nodes = 8
+
+    compiled_sql = """
+    WITH cleaning_cte AS (
+        SELECT id, name, LOWER(email) AS clean_email
+        FROM stg_users
+        WHERE active = TRUE
+        ORDER BY id
+    )
+    SELECT * FROM cleaning_cte
+    """
+
+    raw_m1 = """
+    WITH cleaning_cte AS (
+        ${cleanUsers()}
+    )
+    SELECT * FROM cleaning_cte
+    """
+    raw_m2 = """
+    WITH user_cte AS (
+        ${cleanUsers()}
+    )
+    SELECT * FROM user_cte
+    """
+
+    m1 = _make_model(
+        name="m1",
+        path="definitions/m1.sqlx",
+        dialect="bigquery",
+        query=compiled_sql,
+        raw_code=raw_m1,
+    )
+    m2 = _make_model(
+        name="m2",
+        path="definitions/m2.sqlx",
+        dialect="bigquery",
+        query=compiled_sql,
+        raw_code=raw_m2,
+    )
+
+    findings = collect_duplicate_cte_findings({"m1": m1, "m2": m2}, config)
+    assert len(findings) == 0
+
+
+def test_duplicate_ctes_mixed_macro_and_manual_models():
+    config = FitnessFunctionsConfig()
+    config.checks.duplicate_ctes.enabled = True
+    config.checks.duplicate_ctes.min_ast_nodes = 8
+
+    compiled_sql = """
+    WITH cleaning_cte AS (
+        SELECT id, name, LOWER(email) AS clean_email
+        FROM stg_users
+        WHERE active = TRUE
+        ORDER BY id
+    )
+    SELECT * FROM cleaning_cte
+    """
+
+    # m1 uses macro
+    m1 = _make_model(
+        name="m1",
+        path="models/m1.sql",
+        dialect="postgres",
+        query=compiled_sql,
+        raw_code="WITH cleaning_cte AS ( {{ clean_users() }} ) SELECT * FROM cleaning_cte",
+    )
+    # m2 also uses macro
+    m2 = _make_model(
+        name="m2",
+        path="models/m2.sql",
+        dialect="postgres",
+        query=compiled_sql,
+        raw_code="WITH cleaning_cte AS ( {{ clean_users() }} ) SELECT * FROM cleaning_cte",
+    )
+    # m3 copy-pasted the SQL logic manually into its source file
+    m3 = _make_model(
+        name="m3",
+        path="models/m3.sql",
+        dialect="postgres",
+        query=compiled_sql,
+        raw_code="""
+        WITH cleaning_cte AS (
+            SELECT id, name, LOWER(email) AS clean_email
+            FROM {{ ref('stg_users') }}
+            WHERE active = TRUE
+            ORDER BY id
+        )
+        SELECT * FROM cleaning_cte
+        """,
+    )
+
+    models = {"m1": m1, "m2": m2, "m3": m3}
+    findings = collect_duplicate_cte_findings(models, config)
+
+    # Only m3 should be flagged because it duplicated manually without the macro
+    assert len(findings) == 1
+    assert findings[0].model == "m3"
+    assert "model 'm1'" in findings[0].message
+    assert "model 'm2'" in findings[0].message
+
+
+def test_duplicate_ctes_config_ignore_macros_disabled():
+    config = FitnessFunctionsConfig()
+    config.checks.duplicate_ctes.enabled = True
+    config.checks.duplicate_ctes.min_ast_nodes = 8
+    config.checks.duplicate_ctes.ignore_macros = False
+
+    compiled_sql = """
+    WITH cleaning_cte AS (
+        SELECT id, name, LOWER(email) AS clean_email
+        FROM stg_users
+        WHERE active = TRUE
+        ORDER BY id
+    )
+    SELECT * FROM cleaning_cte
+    """
+
+    m1 = _make_model(
+        name="m1",
+        path="models/m1.sql",
+        dialect="postgres",
+        query=compiled_sql,
+        raw_code="WITH cleaning_cte AS ( {{ clean_users() }} ) SELECT * FROM cleaning_cte",
+    )
+    m2 = _make_model(
+        name="m2",
+        path="models/m2.sql",
+        dialect="postgres",
+        query=compiled_sql,
+        raw_code="WITH cleaning_cte AS ( {{ clean_users() }} ) SELECT * FROM cleaning_cte",
+    )
+
+    findings = collect_duplicate_cte_findings({"m1": m1, "m2": m2}, config)
+    assert len(findings) == 2
+
+
+def test_duplicate_ctes_from_disk_raw_macro(tmp_path: Path):
+    config = FitnessFunctionsConfig()
+    config.checks.duplicate_ctes.enabled = True
+    config.checks.duplicate_ctes.min_ast_nodes = 8
+
+    f1 = tmp_path / "m1.sql"
+    f2 = tmp_path / "m2.sql"
+    f1.write_text("WITH c AS ( {{ my_macro() }} ) SELECT * FROM c", encoding="utf-8")
+    f2.write_text("WITH c AS ( {{ my_macro() }} ) SELECT * FROM c", encoding="utf-8")
+
+    compiled_sql = """
+    WITH c AS (
+        SELECT a, b, SUM(x) AS total FROM tbl WHERE active = 1 GROUP BY a, b
+    )
+    SELECT * FROM c
+    """
+
+    m1 = _make_model(name="m1", path=str(f1), dialect="duckdb", query=compiled_sql)
+    m2 = _make_model(name="m2", path=str(f2), dialect="duckdb", query=compiled_sql)
+
+    findings = collect_duplicate_cte_findings({"m1": m1, "m2": m2}, config)
+    assert len(findings) == 0
+
+
+def test_duplicate_ctes_not_ignored_if_raw_code_has_full_complex_logic():
+    config = FitnessFunctionsConfig()
+    config.checks.duplicate_ctes.enabled = True
+    config.checks.duplicate_ctes.min_ast_nodes = 8
+
+    # Raw code has the full complex logic with only a table ref macro
+    raw_sql = """
+    WITH c AS (
+        SELECT a, b, SUM(x) AS total FROM {{ ref('tbl') }} WHERE active = 1 GROUP BY a, b
+    )
+    SELECT * FROM c
+    """
+    compiled_sql = """
+    WITH c AS (
+        SELECT a, b, SUM(x) AS total FROM tbl WHERE active = 1 GROUP BY a, b
+    )
+    SELECT * FROM c
+    """
+
+    m1 = _make_model(name="m1", path="models/m1.sql", dialect="duckdb", query=compiled_sql, raw_code=raw_sql)
+    m2 = _make_model(name="m2", path="models/m2.sql", dialect="duckdb", query=compiled_sql, raw_code=raw_sql)
+
+    findings = collect_duplicate_cte_findings({"m1": m1, "m2": m2}, config)
+    assert len(findings) == 2
+
+
+def test_extract_paren_content_edge_cases():
+    from tff.core.checks.duplicate_ctes import _extract_paren_content
+
+    # Unclosed paren
+    assert _extract_paren_content("WITH c AS ( SELECT 1", 10) is None
+
+    # Nested parens with comments and strings
+    sql = """WITH c AS (
+        -- Comment with ( paren and )
+        /* Block with ( and ) */
+        SELECT 'quoted ( paren )' AS val, (SELECT 1) AS sub
+    ) SELECT * FROM c"""
+    open_idx = sql.find("(")
+    content = _extract_paren_content(sql, open_idx)
+    assert content is not None
+    assert "quoted ( paren )" in content
+    assert "(SELECT 1)" in content
+
+
+def test_duplicate_ctes_macro_coverage_edge_cases():
+    import sqlglot
+    from tff.core.checks.duplicate_ctes import (
+        _extract_paren_content,
+        extract_model_cte_fingerprints,
+        is_cte_produced_by_macro,
+    )
+
+    # 1. Paren extraction with escaped quotes
+    sql_escapes = r"WITH c AS ( SELECT 'it''s', 'it\'s' ) SELECT * FROM c"
+    idx = sql_escapes.find("(")
+    assert _extract_paren_content(sql_escapes, idx) is not None
+
+    # 2. is_cte_produced_by_macro with empty raw_sql
+    parsed_query = sqlglot.parse_one("SELECT a FROM t WHERE a > 1")
+    assert not is_cte_produced_by_macro("c", parsed_query, None, "duckdb", 8)
+    assert not is_cte_produced_by_macro("c", parsed_query, "   ", "duckdb", 8)
+
+    # 3. is_cte_produced_by_macro with unclosed paren in raw CTE definition
+    unclosed_raw = "WITH c AS ( SELECT {{ my_macro() }} SELECT * FROM c"
+    assert not is_cte_produced_by_macro("c", parsed_query, unclosed_raw, "duckdb", 8)
+
+    # 4. is_cte_produced_by_macro when raw CTE body has NO macro, but model has macro elsewhere
+    raw_mixed = "WITH c AS ( SELECT a, b FROM t WHERE a > 1 ), m AS ( {{ macro() }} ) SELECT * FROM c"
+    assert not is_cte_produced_by_macro("c", parsed_query, raw_mixed, "duckdb", 8)
+
+    # 5. is_cte_produced_by_macro when raw CTE body cleaned syntax has parse error
+    raw_parse_err = "WITH c AS ( {{ m() }} SELECT FROM WHERE ) SELECT * FROM c"
+    assert is_cte_produced_by_macro("c", parsed_query, raw_parse_err, "duckdb", 8)
+
+    # 6. is_cte_produced_by_macro when raw CTE body cleans to empty/whitespace
+    raw_empty_body = "WITH c AS ( {{ m() }} ) SELECT * FROM c"
+    from unittest.mock import patch
+    with patch("tff.core.ast_cache.parse_sql_with_cache", return_value=None):
+        assert is_cte_produced_by_macro("c", parsed_query, raw_empty_body, "duckdb", 8)
+
+    # 7. extract_model_cte_fingerprints with 6-tuple and 7-tuple
+    query_sql = "WITH c AS ( SELECT a, b, SUM(x) FROM tbl WHERE a > 1 GROUP BY a, b ) SELECT * FROM c"
+    parsed_expr = sqlglot.parse_one(query_sql)
+    res_6 = extract_model_cte_fingerprints(("m", "m.sql", "duckdb", parsed_expr, 8, "WITH c AS ( {{ m() }} ) SELECT * FROM c"))
+    assert len(res_6) == 1
+    assert res_6[0][1]["from_macro"] is True
+
+    res_7 = extract_model_cte_fingerprints(("m", "m.sql", "duckdb", query_sql, 8, "WITH c AS ( {{ m() }} ) SELECT * FROM c", False))
+    assert len(res_7) == 1
+    assert res_7[0][1]["from_macro"] is False
+
+
 
 

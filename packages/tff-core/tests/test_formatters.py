@@ -1,6 +1,7 @@
 """Unit tests for CI/CD formatters (GitHub Actions annotations, SARIF v2.1.0, JUnit XML)."""
 
 from __future__ import annotations
+from conftest import _make_finding
 
 import io
 import xml.etree.ElementTree as ET
@@ -13,7 +14,6 @@ from tff.core.formatters import (
     generate_junit_xml,
     generate_sarif_report,
 )
-from tff.core.report import LintFinding
 
 
 def test_get_relative_path_project_root(tmp_path: Path):
@@ -55,8 +55,20 @@ def test_get_relative_path_inside_cwd():
     assert _get_relative_path(cwd_file) == "some_dir/model.sql"
 
 
+def test_get_relative_path_multiple_project_roots(tmp_path: Path):
+    r1 = tmp_path / "proj1"
+    r2 = tmp_path / "proj2"
+    r1.mkdir()
+    r2.mkdir()
+    f1 = r1 / "models" / "m1.sql"
+    f2 = r2 / "models" / "m2.sql"
+    assert _get_relative_path(f1, project_root=[r1, r2]) == "models/m1.sql"
+    assert _get_relative_path(f2, project_root=[r1, r2]) == "models/m2.sql"
+
+
+
 def test_format_github_annotation_error_and_warning():
-    f_err = LintFinding(
+    f_err = _make_finding(
         check="duplicate_ctes",
         severity="error",
         message="Duplicate CTE found in model.",
@@ -67,10 +79,10 @@ def test_format_github_annotation_error_and_warning():
     res_err = format_github_annotation(f_err)
     assert (
         res_err
-        == "::error file=models/marts/fct_orders.sql,line=42::Duplicate CTE found in model."
+        == "::error file=models/marts/fct_orders.sql,line=42,title=ERR · Duplicate CTEs (Connascence of Algorithm)::! Duplicate CTE found in model. See https://tff.readthedocs.io/en/latest/rules_and_checks/#duplicate-ctes-duplicate_ctes"
     )
 
-    f_warn = LintFinding(
+    f_warn = _make_finding(
         check="mart_naming",
         severity="warning",
         message="Model in marts must start with fct_ or dim_.",
@@ -81,22 +93,81 @@ def test_format_github_annotation_error_and_warning():
     # When line is not provided, it defaults to line 1
     assert (
         res_warn
-        == "::warning file=models/marts/bad_name.sql,line=1::Model in marts must start with fct_ or dim_."
+        == "::warning file=models/marts/bad_name.sql,line=1,title=WRN · Mart naming convention (Connascence of Name)::* Model in marts must start with fct_ or dim_. See https://tff.readthedocs.io/en/latest/rules_and_checks/#mart-naming-mart_naming"
     )
 
 
 def test_format_github_annotation_repo_level_no_path():
-    f_repo = LintFinding(
+    f_repo = _make_finding(
         check="layer_integrity",
         severity="error",
         message="Missing layers in config.",
     )
     res = format_github_annotation(f_repo)
-    assert res == "::error::Missing layers in config."
+    assert (
+        res
+        == "::error title=ERR · Layer integrity (Dynamic Coupling & DAG Structure)::! Missing layers in config. See https://tff.readthedocs.io/en/latest/rules_and_checks/#layer-integrity-layer_integrity"
+    )
+
+
+def test_format_github_annotation_uniform_docs_links_cov_and_con():
+    """Verify that both CoV and CoN inline annotations uniformly end with clickable 'See https://...' links."""
+    f_cov = _make_finding(
+        check="connascence_of_value",
+        severity="warning",
+        message="Literal 'active' is duplicated in models 'orders' and 'customers' (CoV). Centralize via macro, seed, or upstream model. See https://tff.readthedocs.io/en/latest/rules_and_checks/#connascence-of-value-connascence_of_value",
+        model="orders",
+        path="models/marts/orders.sql",
+        line=10,
+    )
+    res_cov = format_github_annotation(f_cov)
+    assert res_cov.endswith("See https://tff.readthedocs.io/en/latest/rules_and_checks/#connascence-of-value-connascence_of_value")
+    assert "(" not in res_cov.split("See ")[-1]
+
+    f_con = _make_finding(
+        check="ban_select_star",
+        severity="error",
+        message="SELECT * is prohibited. Explicitly name your columns to reduce coupling.",
+        model="orders",
+        path="models/marts/orders.sql",
+        line=10,
+    )
+    res_con = format_github_annotation(f_con)
+    assert res_con.endswith("See https://tff.readthedocs.io/en/latest/rules_and_checks/#ban-select-ban_select_star")
+    assert not res_con.endswith(")")
+
+
+def test_format_github_annotation_with_coordinates():
+    f = _make_finding(
+        check="duplicate_ctes",
+        severity="error",
+        message="Duplicate CTE found in model.",
+        path="models/marts/fct_orders.sql",
+        line=42,
+        col=5,
+        end_line=45,
+        end_col=20,
+    )
+    res = format_github_annotation(f)
+    assert "line=42" in res
+    assert "endLine=45" in res
+    assert "col=5" in res
+    assert "endColumn=20" in res
+    assert "title=ERR · Duplicate CTEs (Connascence of Algorithm)" in res
+
+
+def test_format_github_annotation_custom_rule_no_category():
+    f = _make_finding(
+        check="my_custom_check",
+        severity="warning",
+        message="Custom violation",
+    )
+    res = format_github_annotation(f)
+    assert res == "::warning title=WRN · my_custom_check::* Custom violation"
 
 
 def test_format_github_annotation_escaping():
-    f = LintFinding(
+    f = _make_finding(
         check="sqlcomplexity",
         severity="warning",
         message="High complexity: 100% (target < 80%)\nLine 2 details\rLine 3",
@@ -111,14 +182,14 @@ def test_format_github_annotation_escaping():
 
 def test_emit_github_annotations():
     findings = [
-        LintFinding(
+        _make_finding(
             check="c1",
             severity="error",
             message="Error 1",
             path="models/a.sql",
             line=10,
         ),
-        LintFinding(
+        _make_finding(
             check="c2",
             severity="warning",
             message="Warning 1",
@@ -130,8 +201,163 @@ def test_emit_github_annotations():
     output = stream.getvalue()
     lines = output.strip().split("\n")
     assert len(lines) == 2
-    assert lines[0] == "::error file=models/a.sql,line=10::Error 1"
-    assert lines[1] == "::warning file=models/b.sql,line=1::Warning 1"
+    assert lines[0] == "::error file=models/a.sql,line=10,title=ERR · c1::! Error 1"
+    assert lines[1] == "::warning file=models/b.sql,line=1,title=WRN · c2::* Warning 1"
+
+
+def test_emit_github_annotations_deduplication():
+    findings = [
+        _make_finding(
+            check="ban_select_star",
+            severity="error",
+            message="SELECT * is prohibited",
+            path="models/marts/orders.sql",
+            line=10,
+        ),
+        _make_finding(
+            check="ban_select_star",
+            severity="error",
+            message="SELECT * is prohibited",
+            path="models/marts/orders.sql",
+            line=25,
+        ),
+        _make_finding(
+            check="duplicate_ctes",
+            severity="error",
+            message="Duplicate CTE found",
+            path="models/marts/orders.sql",
+            line=5,
+        ),
+        _make_finding(
+            check="ban_select_star",
+            severity="error",
+            message="SELECT * is prohibited",
+            path="models/marts/customers.sql",
+            line=12,
+        ),
+        _make_finding(
+            check="layer_integrity",
+            severity="error",
+            message="Missing layers",
+            path=None,
+        ),
+        _make_finding(
+            check="layer_integrity",
+            severity="error",
+            message="Missing layers duplicate",
+            path=None,
+        ),
+    ]
+    stream = io.StringIO()
+    emit_github_annotations(findings, stream=stream)
+    output = stream.getvalue()
+    lines = output.strip().split("\n")
+    # 4 distinct (file, check) pairs:
+    # 1. (models/marts/orders.sql, ban_select_star) -> line 10
+    # 2. (models/marts/orders.sql, duplicate_ctes) -> line 5
+    # 3. (models/marts/customers.sql, ban_select_star) -> line 12
+    # 4. (None, layer_integrity)
+    assert len(lines) == 4
+    assert lines[0] == "::error file=models/marts/orders.sql,line=10,title=ERR · No SELECT * (Connascence of Name)::! SELECT * is prohibited. See https://tff.readthedocs.io/en/latest/rules_and_checks/#ban-select-ban_select_star"
+    assert lines[1] == "::error file=models/marts/orders.sql,line=5,title=ERR · Duplicate CTEs (Connascence of Algorithm)::! Duplicate CTE found. See https://tff.readthedocs.io/en/latest/rules_and_checks/#duplicate-ctes-duplicate_ctes"
+    assert lines[2] == "::error file=models/marts/customers.sql,line=12,title=ERR · No SELECT * (Connascence of Name)::! SELECT * is prohibited. See https://tff.readthedocs.io/en/latest/rules_and_checks/#ban-select-ban_select_star"
+    assert lines[3] == "::error title=ERR · Layer integrity (Dynamic Coupling & DAG Structure)::! Missing layers. See https://tff.readthedocs.io/en/latest/rules_and_checks/#layer-integrity-layer_integrity"
+
+
+def test_emit_github_annotations_prioritization_and_capping(tmp_path: Path):
+    root = tmp_path / "project"
+    root.mkdir()
+    mod_file = root / "models" / "modified.sql"
+    mod_file.parent.mkdir()
+    mod_file.touch()
+
+    # Findings:
+    # 1. Unmodified file, warning
+    # 2. Unmodified file, error
+    # 3. Modified file, warning
+    # 4. Modified file, error
+    f_unmod_warn = _make_finding(
+        check="c_unmod_warn",
+        severity="warning",
+        message="Unmodified warning",
+        path="models/other.sql",
+    )
+    f_unmod_err = _make_finding(
+        check="c_unmod_err",
+        severity="error",
+        message="Unmodified error",
+        path="models/other.sql",
+    )
+    f_mod_warn = _make_finding(
+        check="c_mod_warn",
+        severity="warning",
+        message="Modified warning",
+        path="models/modified.sql",
+    )
+    f_mod_err = _make_finding(
+        check="c_mod_err",
+        severity="error",
+        message="Modified error",
+        model="modified",
+        path="models/modified.sql",
+    )
+
+    findings = [f_unmod_warn, f_unmod_err, f_mod_warn, f_mod_err]
+    stream = io.StringIO()
+    emit_github_annotations(
+        findings,
+        project_root=root,
+        stream=stream,
+        modified_files={"models/modified.sql"},
+        max_annotations=3,
+    )
+    output = stream.getvalue().strip().split("\n")
+
+    # Should emit notice because 4 > 3 max_annotations
+    assert len(output) == 4  # 1 notice + 3 annotations
+    assert output[0].startswith("::warning::tff found 4 violations. Displaying the 3 highest-priority annotations")
+    # Priority order:
+    # 1. Modified file error (f_mod_err)
+    # 2. Modified file warning (f_mod_warn)
+    # 3. Unmodified file error (f_unmod_err)
+    assert "title=ERR · c_mod_err" in output[1]
+    assert "title=WRN · c_mod_warn" in output[2]
+    assert "title=ERR · c_unmod_err" in output[3]
+
+
+def test_is_finding_in_modified_files_branches(tmp_path: Path):
+    from tff.core.formatters import _is_finding_in_modified_files
+
+    root = tmp_path / "project"
+    root.mkdir()
+
+    # Empty modified files
+    f1 = _make_finding(check="c", severity="error", message="msg", path="models/a.sql")
+    assert _is_finding_in_modified_files(f1, set()) is False
+
+    # Finding matching via model name stem
+    f2 = _make_finding(check="c", severity="error", message="msg", model="stg_users")
+    assert _is_finding_in_modified_files(f2, {"models/staging/stg_users.sql"}) is True
+
+    # Finding matching via relative project path
+    f3 = _make_finding(
+        check="c",
+        severity="error",
+        message="msg",
+        path=str(root / "models" / "marts" / "fct.sql"),
+    )
+    assert (
+        _is_finding_in_modified_files(
+            f3,
+            {"models/marts/fct.sql"},
+            project_root=root,
+        )
+        is True
+    )
+
+    # Finding not matching
+    f4 = _make_finding(check="c", severity="error", message="msg", path="models/b.sql", model="b")
+    assert _is_finding_in_modified_files(f4, {"models/c.sql"}) is False
 
 
 def test_generate_sarif_report_structure(tmp_path: Path):
@@ -142,7 +368,7 @@ def test_generate_sarif_report_structure(tmp_path: Path):
     sql_file.touch()
 
     findings = [
-        LintFinding(
+        _make_finding(
             check="duplicate_ctes",
             severity="error",
             message="Duplicate CTE found.",
@@ -150,7 +376,7 @@ def test_generate_sarif_report_structure(tmp_path: Path):
             path=str(sql_file),
             line=15,
         ),
-        LintFinding(
+        _make_finding(
             check="custom_rule",
             severity="warning",
             message="Custom warning message.",
@@ -202,9 +428,10 @@ def test_generate_sarif_report_structure(tmp_path: Path):
 
 
 def test_generate_sarif_report_empty():
-    report = generate_sarif_report([], tool_version="0.7.0")
+    report = generate_sarif_report([])
     assert report["version"] == "2.1.0"
     run = report["runs"][0]
+    assert run["tool"]["driver"]["version"] == "0.25.0"
     assert run["results"] == []
 
 
@@ -236,7 +463,7 @@ def test_generate_junit_xml_with_findings(tmp_path: Path):
     sql_file.touch()
 
     findings = [
-        LintFinding(
+        _make_finding(
             check="banselectstar",
             severity="error",
             message="SELECT * is prohibited.",
@@ -244,7 +471,7 @@ def test_generate_junit_xml_with_findings(tmp_path: Path):
             path=str(sql_file),
             line=5,
         ),
-        LintFinding(
+        _make_finding(
             check="layer_integrity",
             severity="warning",
             message="Cross-layer dependency warning.",

@@ -91,6 +91,7 @@ def precompute_model_asts(
     project_root: Path | None = None,
     config: FitnessFunctionsConfig | None = None,
     max_workers: int | None = None,
+    pool_threshold: int | None = None,
 ) -> None:
     """Parse and populate AST expressions for models in parallel using disk cache."""
     cache_enabled = is_cache_enabled(config)
@@ -138,7 +139,15 @@ def precompute_model_asts(
         return
 
     workers = get_max_workers(config=config, override=max_workers)
-    if workers <= 1 or len(tasks) <= 2:
+    threshold = 32 if pool_threshold is None else pool_threshold
+    env_thresh = os.environ.get("TFF_PROCESS_POOL_THRESHOLD")
+    if env_thresh and pool_threshold is None:
+        try:
+            threshold = max(1, int(env_thresh.strip()))
+        except ValueError:
+            pass
+
+    if workers <= 1 or len(tasks) < threshold:
         for task in tasks:
             m_name, expr = _worker_parse_model_sql(task)
             if expr is not None and m_name in models:
@@ -187,17 +196,20 @@ def _extract_model_findings(
         or rule_cls.__name__ == "SqlComplexity"
     )
 
+    v_line = getattr(violation, "line", None)
+    v_col = getattr(violation, "col", None)
+    v_end_line = getattr(violation, "end_line", None)
+    v_end_col = getattr(violation, "end_col", None)
+
     for msg in msgs:
         model_label = f"{model.name}: "
         clean_msg = msg.removeprefix(model_label)
         if is_sql_complexity:
-            parts = [p.strip() for p in clean_msg.split(";") if p.strip()]
-            for part in parts:
-                part_severity = severity
-                if part.startswith("WARN:"):
-                    part_severity = "warning"
-                elif part.startswith("FAIL:"):
-                    part_severity = "error" if severity == "error" else severity
+            from tff.core.rules.sql_complexity import split_complexity_message
+
+            for part, part_severity in split_complexity_message(
+                clean_msg, base_severity=severity, model_name=model.name
+            ):
                 findings.append(
                     LintFinding(
                         check=finding_check,
@@ -205,6 +217,10 @@ def _extract_model_findings(
                         model=model.name,
                         path=model_path_relative(model),
                         message=part,
+                        line=v_line,
+                        col=v_col,
+                        end_line=v_end_line,
+                        end_col=v_end_col,
                     )
                 )
         else:
@@ -215,6 +231,10 @@ def _extract_model_findings(
                     model=model.name,
                     path=model_path_relative(model),
                     message=clean_msg,
+                    line=v_line,
+                    col=v_col,
+                    end_line=v_end_line,
+                    end_col=v_end_col,
                 )
             )
     return findings
@@ -353,12 +373,19 @@ def run_parallel_model_rule(
     # Parallelize model rule execution using thread pool
     pool_size = min(workers, len(eligible_models))
     if chunk_size is None or chunk_size <= 0:
-        env_chunk = os.environ.get("TFF_CHUNK_SIZE")
-        if env_chunk:
+        cfg_chunk = getattr(config, "chunk_size", None) if config is not None else None
+        if cfg_chunk is not None:
             try:
-                chunk_size = max(1, int(env_chunk.strip()))
-            except ValueError:
+                chunk_size = max(1, int(cfg_chunk))
+            except (ValueError, TypeError):
                 chunk_size = None
+        else:
+            env_chunk = os.environ.get("TFF_CHUNK_SIZE")
+            if env_chunk:
+                try:
+                    chunk_size = max(1, int(env_chunk.strip()))
+                except ValueError:
+                    chunk_size = None
 
     if chunk_size is None or chunk_size <= 0:
         chunk_size = max(1, min(100, len(eligible_models) // (pool_size * 4)))

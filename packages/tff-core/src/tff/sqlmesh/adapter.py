@@ -21,12 +21,11 @@ class SQLMeshAdapter(PipelineAdapter):
         return "sqlmesh"
 
     def is_applicable(self, project_root: Path) -> bool:
-        return (
-            (project_root / ".sqlmesh").exists()
-            or (project_root / "config.py").exists()
-            or (project_root / "config.yaml").exists()
-            or (project_root / "config.yml").exists()
-        )
+        from tff.core.adapter import _detect_provider_from_models, is_sqlmesh_project
+
+        if is_sqlmesh_project(project_root):
+            return True
+        return _detect_provider_from_models(project_root) == "sqlmesh"
 
     def load_models(
         self,
@@ -53,31 +52,23 @@ class SQLMeshAdapter(PipelineAdapter):
         dialect: str | None = None,
         manifest_path: str | Path | None = None,
         models: dict[str, ModelRepresentation] | None = None,
+        scoped_models: set[str] | None = None,
+        chunk_size: int | None = None,
     ) -> tuple[list[LintFinding], int, list[str]]:
+        from typing import Any
         from tff.sqlmesh.runner import run_all_checks
 
-        return run_all_checks(
-            project_root=project_root,
-            config=config,
-            checks=checks,
-            models=models,
-        )
-
-    def apply_metadata_fix(
-        self,
-        project_root: Path,
-        abs_path: Path,
-        model_name: str,
-        missing_owner: bool,
-        missing_description: bool,
-    ) -> str | None:
-        from tff.core.autofix import fix_sqlmesh_metadata
-
-        return fix_sqlmesh_metadata(
-            abs_path=abs_path,
-            missing_owner=missing_owner,
-            missing_description=missing_description,
-        )
+        kwargs: dict[str, Any] = {
+            "project_root": project_root,
+            "config": config,
+            "checks": checks,
+            "models": models,
+        }
+        if scoped_models is not None:
+            kwargs["scoped_models"] = scoped_models
+        if chunk_size is not None:
+            kwargs["chunk_size"] = chunk_size
+        return run_all_checks(**kwargs)
 
     def get_diagnostic_files(
         self, project_root: Path | Sequence[Path]

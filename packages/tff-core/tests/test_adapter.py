@@ -9,7 +9,7 @@ from tff.core.adapter import (
     detect_provider,
     get_adapter,
 )
-from tff.core.cli import _MockRunnerAdapter, _get_adapter, main
+from tff.core.cli import _get_adapter, main
 from tff.core.config import FitnessFunctionsConfig
 from tff.dataform.adapter import DataformAdapter
 from tff.dbt.adapter import DBTAdapter
@@ -50,10 +50,6 @@ def test_pipeline_adapter_base_defaults():
     assert adapter.is_applicable(Path.cwd()) is True
     assert adapter.load_models(Path.cwd()) == {}
     assert adapter.run_checks(Path.cwd(), MagicMock()) == ([], 0, [])
-    assert (
-        adapter.apply_metadata_fix(Path.cwd(), Path("foo.sql"), "foo", True, True)
-        is None
-    )
     assert adapter.get_diagnostic_files(Path.cwd()) == []
 
 
@@ -103,7 +99,9 @@ def test_detect_provider(tmp_path: Path):
     assert detect_provider(tmp_path) == "dbt"
 
     # dbt + sqlmesh (ambiguous)
-    (tmp_path / "config.py").touch()
+    (tmp_path / "config.py").write_text(
+        "import sqlmesh\nfrom sqlmesh.core.config import Config\nconfig = Config()"
+    )
     with pytest.raises(ValueError, match="Both dbt and SQLMesh"):
         detect_provider(tmp_path)
 
@@ -115,9 +113,19 @@ def test_detect_provider(tmp_path: Path):
     (tmp_path / "config.py").unlink()
 
     # sqlmesh alternatives
-    for sig in (".sqlmesh", "config.yaml", "config.yml"):
+    (tmp_path / ".sqlmesh").mkdir()
+    assert detect_provider(tmp_path) == "sqlmesh"
+    (tmp_path / ".sqlmesh").rmdir()
+
+    for sig in ("sqlmesh.yaml", "sqlmesh.yml"):
         p = tmp_path / sig
         p.touch()
+        assert detect_provider(tmp_path) == "sqlmesh"
+        p.unlink()
+
+    for sig in ("config.yaml", "config.yml"):
+        p = tmp_path / sig
+        p.write_text("gateways:\n  local:\n    connection:\n      type: duckdb")
         assert detect_provider(tmp_path) == "sqlmesh"
         p.unlink()
 
@@ -130,7 +138,7 @@ def test_detect_provider(tmp_path: Path):
     assert detect_provider(tmp_path) == "dataform"
 
     # multiple detected (e.g. dataform and sqlmesh)
-    (tmp_path / "config.yaml").touch()
+    (tmp_path / "config.yaml").write_text("gateways:\n  local:\n    connection:\n      type: duckdb")
     with pytest.raises(ValueError, match="Multiple pipeline configuration files"):
         detect_provider(tmp_path)
 
@@ -150,6 +158,10 @@ def test_dbt_adapter(tmp_path: Path):
         assert "m" in models
         mock_load.assert_called_once_with(tmp_path, dialect="duckdb")
 
+        # Test passing manifest_path
+        adapter.load_models(tmp_path, dialect="duckdb", manifest_path="target/custom.json")
+        mock_load.assert_called_with(tmp_path, dialect="duckdb", manifest_path="target/custom.json")
+
     cfg = FitnessFunctionsConfig()
     with patch(
         "tff.dbt.runner.run_all_checks", return_value=([], 1, ["rules"])
@@ -166,13 +178,6 @@ def test_dbt_adapter(tmp_path: Path):
             models=models,
         )
 
-    with patch("tff.core.autofix.fix_dbt_metadata", return_value="fixed") as mock_fix:
-        res = adapter.apply_metadata_fix(
-            tmp_path, tmp_path / "models/m.sql", "m", True, False
-        )
-        assert res == "fixed"
-        mock_fix.assert_called_once()
-
     diag = adapter.get_diagnostic_files(tmp_path)
     assert len(diag) == 2
     assert diag[0][0] == "dbt_project.yml"
@@ -186,7 +191,9 @@ def test_sqlmesh_adapter(tmp_path: Path):
     assert adapter.provider_name == "sqlmesh"
 
     assert not adapter.is_applicable(tmp_path)
-    (tmp_path / "config.py").touch()
+    (tmp_path / "config.py").write_text(
+        "from sqlmesh.core.config import Config\nconfig = Config()"
+    )
     assert adapter.is_applicable(tmp_path)
 
     with (
@@ -212,15 +219,15 @@ def test_sqlmesh_adapter(tmp_path: Path):
             checks=["sqlmesh"],
             models=models,
         )
-
-    with patch(
-        "tff.core.autofix.fix_sqlmesh_metadata", return_value="fixed"
-    ) as mock_fix:
-        res = adapter.apply_metadata_fix(
-            tmp_path, tmp_path / "models/m.sql", "m", True, False
+        # Test with scoped_models
+        adapter.run_checks(tmp_path, cfg, checks=["sqlmesh"], models=models, scoped_models={"m"})
+        mock_run.assert_called_with(
+            project_root=tmp_path,
+            config=cfg,
+            checks=["sqlmesh"],
+            models=models,
+            scoped_models={"m"},
         )
-        assert res == "fixed"
-        mock_fix.assert_called_once()
 
     diag = adapter.get_diagnostic_files(tmp_path)
     assert len(diag) == 2
@@ -272,13 +279,25 @@ def test_dataform_adapter(tmp_path: Path):
             manifest_path="manifest.json",
             models=models,
         )
-
-    assert (
-        adapter.apply_metadata_fix(
-            tmp_path, tmp_path / "definitions/m.sqlx", "m", True, False
+        # Test with scoped_models
+        adapter.run_checks(
+            tmp_path,
+            cfg,
+            checks=["rules"],
+            dialect="bigquery",
+            manifest_path="manifest.json",
+            models=models,
+            scoped_models={"m"},
         )
-        is None
-    )
+        mock_run.assert_called_with(
+            project_root=tmp_path,
+            config=cfg,
+            checks=["rules"],
+            dialect="bigquery",
+            manifest_path="manifest.json",
+            models=models,
+            scoped_models={"m"},
+        )
 
     diag = adapter.get_diagnostic_files(tmp_path)
     assert len(diag) == 2
@@ -298,79 +317,6 @@ def test_dataform_adapter(tmp_path: Path):
     diag3 = adapter.get_diagnostic_files(tmp_path)
     assert diag3[0][0] == "workflow_settings.yaml"
     assert "missing" in diag3[0][1]
-
-
-def test_mock_runner_adapter_all_methods(tmp_path: Path):
-    mock_runner = MagicMock()
-    mock_runner.run_all_checks.return_value = ([], 3, ["rules"])
-
-    # dbt
-    dbt_adapter = _MockRunnerAdapter("dbt", mock_runner)
-    assert dbt_adapter.provider_name == "dbt"
-    assert dbt_adapter.is_applicable(tmp_path) is True
-    with patch("tff.dbt.manifest.load_dbt_models", return_value={"m1": MagicMock()}):
-        assert "m1" in dbt_adapter.load_models(tmp_path, dialect="duckdb")
-    cfg = FitnessFunctionsConfig()
-    assert dbt_adapter.run_checks(
-        tmp_path, cfg, dialect="duckdb", models={"m1": MagicMock()}
-    ) == ([], 3, ["rules"])
-    with patch("tff.core.autofix.fix_dbt_metadata", return_value="fixed"):
-        assert (
-            dbt_adapter.apply_metadata_fix(
-                tmp_path, tmp_path / "models/m.sql", "m", True, True
-            )
-            == "fixed"
-        )
-    assert len(dbt_adapter.get_diagnostic_files(tmp_path)) == 2
-
-    # sqlmesh
-    sqlmesh_adapter = _MockRunnerAdapter("sqlmesh", mock_runner)
-    assert sqlmesh_adapter.provider_name == "sqlmesh"
-    with (
-        patch("sqlmesh.core.context.Context"),
-        patch(
-            "tff.sqlmesh.runner.map_sqlmesh_context_models",
-            return_value={"m2": MagicMock()},
-        ),
-    ):
-        assert "m2" in sqlmesh_adapter.load_models(tmp_path)
-    assert sqlmesh_adapter.run_checks(tmp_path, cfg, models={"m2": MagicMock()}) == (
-        [],
-        3,
-        ["rules"],
-    )
-    with patch("tff.core.autofix.fix_sqlmesh_metadata", return_value="fixed_sm"):
-        assert (
-            sqlmesh_adapter.apply_metadata_fix(
-                tmp_path, tmp_path / "models/m.sql", "m", True, True
-            )
-            == "fixed_sm"
-        )
-    assert len(sqlmesh_adapter.get_diagnostic_files(tmp_path)) == 2
-
-    # dataform
-    df_adapter = _MockRunnerAdapter("dataform", mock_runner)
-    assert df_adapter.provider_name == "dataform"
-    with patch(
-        "tff.dataform.manifest.load_dataform_models", return_value={"m3": MagicMock()}
-    ):
-        assert "m3" in df_adapter.load_models(tmp_path)
-    assert df_adapter.run_checks(
-        tmp_path,
-        cfg,
-        dialect="bigquery",
-        manifest_path="m.json",
-        models={"m3": MagicMock()},
-    ) == ([], 3, ["rules"])
-
-    # other/unknown provider
-    other_adapter = _MockRunnerAdapter("other", mock_runner)
-    assert other_adapter.load_models(tmp_path) == {}
-    assert (
-        other_adapter.apply_metadata_fix(tmp_path, tmp_path / "x", "m", True, True)
-        is None
-    )
-    assert other_adapter.get_diagnostic_files(tmp_path) == []
 
 
 def test_cli_info_adapter_error(tmp_path: Path):
@@ -561,8 +507,12 @@ def test_detect_provider_multiple_roots(tmp_path: Path):
     r2.mkdir()
 
     # Both SQLMesh
-    (r1 / "config.py").touch()
-    (r2 / "config.yaml").touch()
+    (r1 / "config.py").write_text(
+        "from sqlmesh.core.config import Config\nconfig = Config()"
+    )
+    (r2 / "config.yaml").write_text(
+        "gateways:\n  local:\n    connection:\n      type: duckdb"
+    )
     assert detect_provider([r1, r2]) == "sqlmesh"
 
     # Conflicting: r1 is SQLMesh, r2 has dbt_project.yml
@@ -574,7 +524,7 @@ def test_detect_provider_multiple_roots(tmp_path: Path):
     # Empty roots fallback to cwd
     with patch("tff.core.adapter._detect_provider_single", return_value="sqlmesh") as mock_single:
         assert detect_provider([]) == "sqlmesh"
-        mock_single.assert_called_once_with(Path.cwd())
+        mock_single.assert_called_once_with(Path.cwd(), config_path=None)
 
 
 def test_sqlmesh_adapter_multiple_roots(tmp_path: Path):
@@ -648,5 +598,69 @@ def test_sqlmesh_runner_run_all_checks_multiple_roots(tmp_path: Path):
         run_all_checks(project_root=[r1, r2], config=cfg, checks=["sqlmesh"])
         _, kwargs = mock_context_cls.call_args
         assert kwargs["paths"] == [str(r1.resolve()), str(r2.resolve())]
+
+
+def test_dbt_adapter_multiple_roots(tmp_path: Path):
+    from tff.dbt.adapter import DBTAdapter
+
+    adapter = DBTAdapter()
+    r1 = tmp_path / "repo1"
+    r2 = tmp_path / "repo2"
+    r1.mkdir()
+    r2.mkdir()
+    (r1 / "dbt_project.yml").touch()
+    (r2 / "dbt_project.yml").touch()
+
+    # 1. Diagnostics with multiple roots
+    diag = adapter.get_diagnostic_files([r1, r2])
+    labels = [label for label, _ in diag]
+    assert "[repo1] dbt_project.yml" in labels
+    assert "[repo1] manifest.json" in labels
+    assert "[repo2] dbt_project.yml" in labels
+    assert "[repo2] manifest.json" in labels
+
+    # 2. load_models passes multiple roots to load_dbt_models
+    with patch("tff.dbt.manifest.load_dbt_models", return_value={"m": MagicMock()}) as mock_load:
+        models = adapter.load_models([r1, r2], dialect="duckdb")
+        assert "m" in models
+        mock_load.assert_called_once_with([r1.resolve(), r2.resolve()], dialect="duckdb")
+
+    # 3. run_checks forwards multiple roots to run_all_checks
+    cfg = MagicMock()
+    with patch("tff.dbt.runner.run_all_checks", return_value=([], 2, ["rules"])) as mock_run:
+        findings, count, sel = adapter.run_checks([r1, r2], cfg)
+        assert count == 2
+        mock_run.assert_called_once_with(
+            project_root=[r1.resolve(), r2.resolve()],
+            config=cfg,
+            checks=None,
+            dialect=None,
+            models=None,
+        )
+
+
+def test_dbt_runner_run_all_checks_multiple_roots(tmp_path: Path):
+    from tff.dbt.runner import run_all_checks
+
+    r1 = tmp_path / "repo1"
+    r2 = tmp_path / "repo2"
+    r1.mkdir()
+    r2.mkdir()
+
+    cfg = MagicMock()
+    cfg.workers = 1
+
+    with (
+        patch("tff.dbt.runner.load_dbt_models", return_value={}) as mock_load,
+        patch("tff.core.registry.registry.run_checks", return_value=([], ["rules"])),
+    ):
+        findings, count, sel = run_all_checks(project_root=[r1, r2], config=cfg)
+        assert count == 0
+        mock_load.assert_called_once_with(
+            [r1.resolve(), r2.resolve()],
+            dialect=None,
+            max_workers=1,
+            config=cfg,
+        )
 
 

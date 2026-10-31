@@ -1,10 +1,12 @@
 import json
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tff.core.cli import _detect_provider, _get_runner, main
+from conftest import _make_model
+from tff.core.cli import _detect_provider, _get_adapter, main
 from tff.core.health import _domain_key
 from tff.core.utils.jinja import clean_dataform_for_parsing
 from tff.core.utils.paths import (
@@ -404,24 +406,25 @@ def test_load_dataform_models_direct_sqlx(tmp_path: Path):
 
 
 def test_cli_compile_fallback(tmp_path: Path):
-    with patch("shutil.which") as mock_which, patch("subprocess.run") as mock_run:
-        mock_which.side_effect = lambda cmd: "/usr/local/bin/dataform" if cmd == "dataform" else None
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stdout = json.dumps({
-            "tables": [
-                {
-                    "target": {"schema": "s", "name": "t"},
-                    "type": "table",
-                    "query": "SELECT 1",
-                }
-            ]
-        })
-        mock_run.return_value = mock_proc
+    with patch.dict(os.environ, {"TFF_DISABLE_DATAFORM_CLI_COMPILATION": "0"}):
+        with patch("shutil.which") as mock_which, patch("subprocess.run") as mock_run:
+            mock_which.side_effect = lambda cmd: "/usr/local/bin/dataform" if cmd == "dataform" else None
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.stdout = json.dumps({
+                "tables": [
+                    {
+                        "target": {"schema": "s", "name": "t"},
+                        "type": "table",
+                        "query": "SELECT 1",
+                    }
+                ]
+            })
+            mock_run.return_value = mock_proc
 
-        res = _compile_via_cli(tmp_path)
-        assert res is not None
-        assert "tables" in res
+            res = _compile_via_cli(tmp_path)
+            assert res is not None
+            assert "tables" in res
 
 
 def test_dataform_runner_run_all_checks(tmp_path: Path):
@@ -495,7 +498,7 @@ def test_cli_integration_with_dataform(tmp_path: Path):
 def test_get_runner_dataform_import_error():
     with patch("importlib.import_module", side_effect=ImportError("mocked import error")):
         with pytest.raises(ImportError, match="Dataform project detected, but tff is not installed with dataform support"):
-            _get_runner("dataform")
+            _get_adapter("dataform")
 
 
 def test_info_command_with_dataform_json_and_missing(tmp_path: Path):
@@ -540,30 +543,39 @@ def test_docs_generation_with_dataform(tmp_path: Path):
     assert main(["docs", "--project", str(tmp_path), "--provider", "dataform", "--manifest", str(manifest_file)]) == 0
 
 
-def test_cli_autofix_with_dataform(tmp_path: Path):
+def test_cli_autofix_filename_equals_modelname_with_dataform(tmp_path: Path):
+    (tmp_path / "workflow_settings.yaml").write_text("defaultProject: p\n", encoding="utf-8")
     definitions_dir = tmp_path / "definitions"
     definitions_dir.mkdir(parents=True, exist_ok=True)
-    sqlx = """
-    config {
-      type: 'view',
-      description: 'Positional test',
-      bigquery: { labels: { owner: 'team' } },
-      assertions: { uniqueKey: ['id'], nonNull: ['id'] }
-    }
-    SELECT id, count(*) FROM raw_orders GROUP BY 1
-    """
+    sqlx = """config {
+  type: 'view',
+  name: "mismatched_model_name",
+  description: 'Test view'
+}
+SELECT 1 AS id
+"""
     file_path = definitions_dir / "stg_orders.sqlx"
     file_path.write_text(sqlx, encoding="utf-8")
 
-    # Run lint with --fix
-    exit_code = main(["lint", "--project", str(tmp_path), "--provider", "dataform", "--fix"])
-    assert exit_code in (0, 1)
-    # The file should now have GROUP BY id
+    # Run lint with --fix scoped to filename_equals_modelname
+    exit_code = main([
+        "lint",
+        "--project",
+        str(tmp_path),
+        "--provider",
+        "dataform",
+        "--checks",
+        "filename_equals_modelname",
+        "--fix",
+    ])
+    assert exit_code == 0
+    # The name in config should now be synchronized to file stem 'stg_orders'
     fixed_content = file_path.read_text(encoding="utf-8")
-    assert "GROUP BY id" in fixed_content or "GROUP BY 1" in fixed_content
+    assert 'name: "stg_orders"' in fixed_content
+    assert "mismatched_model_name" not in fixed_content
 
 
-def test_cli_autofix_metadata_with_dataform(tmp_path: Path):
+def test_cli_autofix_does_not_mutate_positional_or_metadata(tmp_path: Path):
     (tmp_path / "workflow_settings.yaml").write_text("defaultProject: p\n", encoding="utf-8")
     definitions_dir = tmp_path / "definitions"
     definitions_dir.mkdir(parents=True, exist_ok=True)
@@ -571,55 +583,20 @@ def test_cli_autofix_metadata_with_dataform(tmp_path: Path):
   type: 'view',
   assertions: { uniqueKey: ['id'], nonNull: ['id'] }
 }
-SELECT 1 AS id
+SELECT id, count(*) FROM raw_orders GROUP BY 1
 """
     file_path = definitions_dir / "stg_orders.sqlx"
     file_path.write_text(sqlx, encoding="utf-8")
 
     # Run lint with --fix
     exit_code = main(["lint", "--project", str(tmp_path), "--provider", "dataform", "--fix"])
-    assert exit_code == 0
+    assert exit_code == 1
 
-    # Verify metadata added
-    fixed_content = file_path.read_text(encoding="utf-8")
-    assert 'description: "TODO: Add description"' in fixed_content
-    assert 'owner: "TODO: Add owner"' in fixed_content
-
-    # Re-running lint reports 0 findings
-    exit_code_after = main(["lint", "--project", str(tmp_path), "--provider", "dataform"])
-    assert exit_code_after == 0
-
-
-def test_cli_autofix_metadata_no_config_with_dataform(tmp_path: Path):
-    (tmp_path / "workflow_settings.yaml").write_text("defaultProject: p\n", encoding="utf-8")
-    (tmp_path / "fitness_functions.yaml").write_text("""
-rules:
-  metadata:
-    owner: true
-    description: true
-    grain: false
-    not_null: false
-    unique_values: false
-""", encoding="utf-8")
-    definitions_dir = tmp_path / "definitions"
-    definitions_dir.mkdir(parents=True, exist_ok=True)
-    sqlx = "SELECT 1 AS id\n"
-    file_path = definitions_dir / "stg_raw.sqlx"
-    file_path.write_text(sqlx, encoding="utf-8")
-
-    # Run lint with --fix
-    exit_code = main(["lint", "--project", str(tmp_path), "--provider", "dataform", "--fix"])
-    assert exit_code == 0
-
-    # Verify config block scaffolded
-    fixed_content = file_path.read_text(encoding="utf-8")
-    assert 'description: "TODO: Add description"' in fixed_content
-    assert 'owner: "TODO: Add owner"' in fixed_content
-    assert "SELECT 1 AS id" in fixed_content
-
-    # Re-running lint reports 0 findings
-    exit_code_after = main(["lint", "--project", str(tmp_path), "--provider", "dataform"])
-    assert exit_code_after == 0
+    # Verify query and metadata are NOT corrupted or injected with dummy TODOs
+    content = file_path.read_text(encoding="utf-8")
+    assert "GROUP BY 1" in content
+    assert "TODO: Add description" not in content
+    assert "TODO: Add owner" not in content
 
 
 def test_clean_dataform_edge_cases():
@@ -634,12 +611,11 @@ def test_clean_dataform_edge_cases():
 
 
 def test_collect_dataform_rules_findings_external_and_symbolic():
-    from tff.core.model import ModelRepresentation
     from tff.dataform.runner import collect_dataform_rules_findings
 
     models = {
-        "ext": ModelRepresentation(name="ext", path="definitions/ext.sqlx", dialect="bigquery", is_external=True),
-        "sym": ModelRepresentation(name="sym", path="definitions/sym.sqlx", dialect="bigquery", is_symbolic=True),
+        "ext": _make_model(name="ext", path="definitions/ext.sqlx", dialect="bigquery", is_external=True),
+        "sym": _make_model(name="sym", path="definitions/sym.sqlx", dialect="bigquery", is_symbolic=True),
     }
     findings = collect_dataform_rules_findings(models)
     assert len(findings) == 0
@@ -657,22 +633,23 @@ def test_load_settings_exceptions(tmp_path: Path):
 
 
 def test_compile_via_cli_npx_and_exceptions(tmp_path: Path):
-    # Test npx fallback
-    with patch("shutil.which") as mock_which, patch("subprocess.run") as mock_run:
-        mock_which.side_effect = lambda cmd: "/usr/local/bin/npx" if cmd == "npx" else None
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stdout = json.dumps({"tables": []})
-        mock_run.return_value = mock_proc
+    with patch.dict(os.environ, {"TFF_DISABLE_DATAFORM_CLI_COMPILATION": "0"}):
+        # Test npx fallback
+        with patch("shutil.which") as mock_which, patch("subprocess.run") as mock_run:
+            mock_which.side_effect = lambda cmd: "/usr/local/bin/npx" if cmd == "npx" else None
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.stdout = json.dumps({"tables": []})
+            mock_run.return_value = mock_proc
 
-        res = _compile_via_cli(tmp_path)
-        assert res == {"tables": []}
-        assert mock_run.call_args[0][0][:2] == ["npx", "--no-install"]
+            res = _compile_via_cli(tmp_path)
+            assert res == {"tables": []}
+            assert mock_run.call_args[0][0][:2] == ["npx", "--no-install"]
 
-    # Test exception handling
-    with patch("shutil.which", return_value="/usr/local/bin/dataform"):
-        with patch("subprocess.run", side_effect=RuntimeError("exec error")):
-            assert _compile_via_cli(tmp_path) is None
+        # Test exception handling
+        with patch("shutil.which", return_value="/usr/local/bin/dataform"):
+            with patch("subprocess.run", side_effect=RuntimeError("exec error")):
+                assert _compile_via_cli(tmp_path) is None
 
 
 def test_load_dataform_models_manifest_parse_error(tmp_path: Path):
@@ -790,8 +767,9 @@ def test_dataform_cli_no_subcommand():
 
 
 def test_compile_via_cli_no_binary(tmp_path: Path):
-    with patch("shutil.which", return_value=None):
-        assert _compile_via_cli(tmp_path) is None
+    with patch.dict(os.environ, {"TFF_DISABLE_DATAFORM_CLI_COMPILATION": "0"}):
+        with patch("shutil.which", return_value=None):
+            assert _compile_via_cli(tmp_path) is None
 
 
 def test_parse_sqlx_config_edge_cases():
@@ -916,6 +894,108 @@ def test_dataform_run_all_checks_with_no_cache(tmp_path: Path):
     findings, checked, _ = run_all_checks(project_root=tmp_path, config=config)
     assert checked == 1
     assert not (tmp_path / ".tff_cache").exists()
+
+
+def test_dataform_runner_and_adapter_propagate_chunk_size() -> None:
+    from unittest.mock import patch
+    from tff.core.config import FitnessFunctionsConfig
+    from tff.dataform.runner import collect_dataform_rules_findings, run_all_checks
+    from tff.dataform.adapter import DataformAdapter
+
+    models = {
+        "m1": _make_model(name="m1", path="definitions/m1.sqlx", dialect="bigquery"),
+    }
+    cfg = FitnessFunctionsConfig()
+
+    # 1. collect_dataform_rules_findings
+    with patch("tff.core.registry.CheckDefinition.run", return_value=[]) as mock_run:
+        res = collect_dataform_rules_findings(models, config=cfg, chunk_size=8)
+        assert res == []
+        if mock_run.called:
+            assert mock_run.call_args.kwargs.get("chunk_size") == 8
+
+    # 2. run_all_checks
+    with patch("tff.core.registry.CheckRegistry.run_checks", return_value=([], ["rules"])) as mock_registry_run:
+        findings, count, sel = run_all_checks(
+            models=models,
+            config=cfg,
+            chunk_size=14,
+        )
+        assert findings == []
+        assert sel == ["rules"]
+        mock_registry_run.assert_called_once_with(
+            models=models,
+            config=cfg,
+            checks=None,
+            provider="dataform",
+            max_workers=None,
+            scoped_models=None,
+            chunk_size=14,
+        )
+
+    # 3. DataformAdapter.run_checks
+    adapter = DataformAdapter()
+    with patch("tff.dataform.runner.run_all_checks", return_value=([], 1, ["rules"])) as mock_runner_all:
+        findings, count, sel = adapter.run_checks(
+            project_root=Path.cwd(),
+            config=cfg,
+            models=models,
+            chunk_size=16,
+        )
+        assert findings == []
+        assert count == 1
+        assert sel == ["rules"]
+        assert mock_runner_all.call_args.kwargs.get("chunk_size") == 16
+
+
+@pytest.mark.parametrize("cache_enabled", [True, False])
+def test_dataform_ast_cache_precomputation(tmp_path: Path, cache_enabled: bool) -> None:
+    from tff.core.config import FitnessFunctionsConfig
+
+    definitions_dir = tmp_path / "definitions"
+    definitions_dir.mkdir(parents=True, exist_ok=True)
+    (definitions_dir / "m_cache.sqlx").write_text(
+        "config { type: 'view', schema: 'staging' }\nSELECT 1 AS id, 'abc' AS label",
+        encoding="utf-8",
+    )
+
+    cfg = FitnessFunctionsConfig(cache_ast=cache_enabled)
+    models = load_dataform_models(tmp_path, config=cfg)
+    assert "staging.m_cache" in models
+    assert models["staging.m_cache"].expression is not None
+    assert (tmp_path / ".tff_cache").exists() is cache_enabled
+
+
+@pytest.mark.parametrize("root_count", [1, 2])
+def test_dataform_multi_project_roots(tmp_path: Path, root_count: int) -> None:
+    from tff.dataform.adapter import DataformAdapter
+
+    roots: list[Path] = []
+    for idx in range(root_count):
+        proj = tmp_path / f"proj_{idx}"
+        defs = proj / "definitions" / "staging"
+        defs.mkdir(parents=True, exist_ok=True)
+        (proj / "workflow_settings.yaml").write_text("defaultProject: p\n", encoding="utf-8")
+        dep_clause = "FROM ${ref('staging', 'stg_m0')}" if idx > 0 else ""
+        (defs / f"stg_m{idx}.sqlx").write_text(
+            f"config {{ type: 'view', schema: 'staging', description: 'd', "
+            f"bigquery: {{ labels: {{ owner: 'team' }} }}, "
+            f"assertions: {{ uniqueKey: ['id'], nonNull: ['id'] }} }}\n"
+            f"SELECT 1 AS id {dep_clause}",
+            encoding="utf-8",
+        )
+        roots.append(proj)
+
+    adapter = DataformAdapter()
+    loaded = adapter.load_models(roots)
+    assert len(loaded) == root_count
+    if root_count == 2:
+        assert "staging.stg_m0" in loaded["staging.stg_m1"].depends_on
+
+    _, checked, _ = run_all_checks(project_root=roots, config=None)
+    assert checked == root_count
+
+
 
 
 

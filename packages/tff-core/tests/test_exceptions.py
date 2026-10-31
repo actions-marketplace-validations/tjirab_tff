@@ -1,4 +1,5 @@
 """Tests for tff-core structured exception hierarchy and OS error translation."""
+from conftest import _make_model
 
 import errno
 from pathlib import Path
@@ -8,16 +9,19 @@ import pytest
 from tff.core.config import FitnessFunctionsConfig, load_fitness_config, resolve_project_path
 from tff.core.exceptions import (
     TffConfigError,
+    TffDependencyError,
     TffError,
     TffFileError,
     TffManifestError,
     TffManifestNotFoundError,
     TffModelError,
+    TffProviderError,
     handle_os_errors,
     normalize_os_error,
+    normalize_validation_error,
     translate_os_error,
 )
-from tff.core.model import ModelRepresentation, read_file_safe, read_model_sql
+from tff.core.model import read_file_safe, read_model_sql
 from tff.dataform.manifest import _find_manifest_file, load_dataform_models
 from tff.dbt.manifest import load_dbt_models
 
@@ -113,6 +117,64 @@ def test_tff_manifest_not_found_error():
     assert isinstance(err, FileNotFoundError)
     assert isinstance(err, OSError)
     assert isinstance(err, TffError)
+
+
+def test_tff_provider_error():
+    root = Path("/path/to/project")
+    err = TffProviderError(
+        "Could not detect project type",
+        hint="Specify --provider explicitly",
+        provider="dbt",
+        project_root=root,
+        details={"extra": "val"},
+    )
+    assert isinstance(err, TffError)
+    assert isinstance(err, ValueError)
+    assert err.message == "Could not detect project type"
+    assert err.provider == "dbt"
+    assert err.project_root == root
+    assert err.details["provider"] == "dbt"
+    assert err.details["project_root"] == str(root)
+    assert err.details["extra"] == "val"
+    assert "Hint: Specify --provider explicitly" in str(err)
+
+    # Test multi-root sequence
+    multi_err = TffProviderError(
+        "Conflict across roots",
+        project_root=[Path("/p1"), Path("/p2")],
+    )
+    assert multi_err.details["project_root"] == "/p1, /p2"
+
+
+def test_tff_dependency_error():
+    root = Path("/path/to/dbt_project")
+    # Default hint generation
+    err = TffDependencyError(
+        "dbt project detected, but tff is not installed with dbt support.",
+        provider="dbt",
+        project_root=root,
+    )
+    assert isinstance(err, TffError)
+    assert isinstance(err, ImportError)
+    assert err.provider == "dbt"
+    assert err.project_root == root
+    assert err.package_hint is None
+    assert 'pip install "tff-core[dbt]"' in err.hint
+    assert err.details["provider"] == "dbt"
+    assert err.details["project_root"] == str(root)
+
+    # Explicit hint and custom package_hint
+    custom_err = TffDependencyError(
+        "Missing custom engine adapter",
+        hint="Install my-adapter",
+        provider="custom",
+        package_hint="my-adapter-pkg",
+        project_root=[Path("/p1")],
+    )
+    assert custom_err.hint == "Install my-adapter"
+    assert custom_err.package_hint == "my-adapter-pkg"
+    assert custom_err.details["package_hint"] == "my-adapter-pkg"
+    assert custom_err.details["project_root"] == "/p1"
 
 
 def test_normalize_os_error_eisdir():
@@ -283,13 +345,13 @@ def test_read_file_safe_with_raise_on_error(tmp_path: Path):
 
 def test_read_model_sql_with_raise_on_error(tmp_path: Path):
     # Model with query attribute
-    m_query = ModelRepresentation(name="m1", path="", dialect="postgres", query="SELECT 1")
+    m_query = _make_model(name="m1", path="", dialect="postgres", query="SELECT 1")
     assert read_model_sql(m_query, raise_on_error=True) == "SELECT 1"
 
     # Model with unreadable file and no query
     d = tmp_path / "model_dir"
     d.mkdir()
-    m_dir = ModelRepresentation(name="m_dir", path=str(d), dialect="postgres")
+    m_dir = _make_model(name="m_dir", path=str(d), dialect="postgres")
     with pytest.raises(TffModelError) as exc_info:
         read_model_sql(m_dir, raise_on_error=True)
     assert exc_info.value.model_name == "m_dir"
@@ -302,7 +364,7 @@ def test_read_model_sql_with_raise_on_error(tmp_path: Path):
         m_dir.read_sql(raise_on_error=True)
 
     # prefer_file=True fallback with raise_on_error
-    m_pref = ModelRepresentation(name="m_pref", path=str(tmp_path / "missing.sql"), dialect="postgres")
+    m_pref = _make_model(name="m_pref", path=str(tmp_path / "missing.sql"), dialect="postgres")
     with pytest.raises(TffModelError):
         m_pref.get_sql(prefer_file=True, raise_on_error=True)
 
@@ -413,3 +475,102 @@ def test_config_loader_exceptions(tmp_path: Path):
         resolve_project_path(cfg, "../../outside.json")
     assert isinstance(exc_info.value, ValueError)
     assert "resolves outside project root" in exc_info.value.message
+
+
+def test_config_validation_exceptions():
+    from pydantic import ValidationError
+    from tff.core.config import MetadataRuleConfig, SqlComplexityRuleConfig
+
+    # Workers validation
+    with pytest.raises(ValidationError) as exc_info:
+        FitnessFunctionsConfig(workers=0)
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert err.hint == "Set workers to an integer >= 1 in fitness_functions.yaml or CLI flag."
+    assert err.details == {"field": "workers", "workers": 0, "min_workers": 1}
+
+    # Threshold boundaries validation
+    with pytest.raises(ValidationError) as exc_info:
+        SqlComplexityRuleConfig.model_validate({"thresholds": {"cte_count": [15, 10]}})
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "Warn threshold (15) cannot be greater than fail threshold (10)" in err.message
+    assert err.details == {"rule": "sql_complexity", "metric": "cte_count", "warn": 15, "fail": 10}
+
+    # Model grain validation
+    with pytest.raises(ValidationError) as exc_info:
+        MetadataRuleConfig(grain=123)  # type: ignore[arg-type]
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "Invalid configuration for 'rules.metadata.grain': expected boolean" in err.message
+    assert err.details == {"rule": "metadata", "field": "grain", "value": 123, "provided_type": "int"}
+
+
+@pytest.mark.parametrize(
+    "config_payload,expected_msg,expected_hint,expected_detail_subset",
+    [
+        (
+            {"workers": 0},
+            "workers must be at least 1, got 0",
+            "Set workers to an integer >= 1 in fitness_functions.yaml or CLI flag.",
+            {"field": "workers", "workers": 0, "min_workers": 1},
+        ),
+        (
+            {"rules": {"metadata": {"grain": 123}}},
+            "Invalid configuration for 'rules.metadata.grain': expected boolean",
+            "Set 'grain: true' or 'grain: false' under 'rules.metadata'.",
+            {"rule": "metadata", "field": "grain", "value": 123, "provided_type": "int"},
+        ),
+        (
+            {"unknown_top_level_key": True},
+            "Invalid configuration: 'unknown_top_level_key': Extra inputs are not permitted",
+            "Check fitness_functions.yaml against 'tff rules' or 'tff explain <rule>' for valid configuration keys and types.",
+            {"errors": 1},
+        ),
+        (
+            {"checks": {"dependency_graph": {"fan_out_warn": "not_an_int"}}},
+            "Invalid configuration: 'checks.dependency_graph.fan_out_warn': Input should be a valid integer",
+            "Check fitness_functions.yaml against 'tff rules' or 'tff explain <rule>' for valid configuration keys and types.",
+            {"errors": 1},
+        ),
+    ],
+)
+def test_normalize_validation_error_parametrized(
+    config_payload: dict,
+    expected_msg: str,
+    expected_hint: str,
+    expected_detail_subset: dict,
+) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as exc_info:
+        FitnessFunctionsConfig.model_validate(config_payload)
+
+    norm = normalize_validation_error(exc_info.value, config_path="custom_fitness.yaml")
+    assert isinstance(norm, TffConfigError)
+    assert expected_msg in norm.message
+    assert norm.hint == expected_hint
+    assert norm.path == Path("custom_fitness.yaml")
+    assert norm.details["path"] == "custom_fitness.yaml"
+    assert norm.original_error is exc_info.value
+    for k, v in expected_detail_subset.items():
+        assert norm.details[k] == v
+
+
+def test_normalize_validation_error_edge_cases() -> None:
+    # 1. Already a TffConfigError without path
+    existing = TffConfigError("Already normalized", hint="Fix it")
+    res1 = normalize_validation_error(existing, config_path="my_config.yaml")
+    assert res1 is existing
+    assert res1.path == Path("my_config.yaml")
+    assert res1.details["path"] == "my_config.yaml"
+
+    # 2. Plain Exception without .errors()
+    plain = ValueError("Raw value failure")
+    res2 = normalize_validation_error(plain)
+    assert isinstance(res2, TffConfigError)
+    assert res2.message == "Raw value failure"
+    assert res2.details == {"errors": 0}
+    assert "tff rules" in (res2.hint or "")
+
+

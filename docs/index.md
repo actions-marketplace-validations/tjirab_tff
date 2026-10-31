@@ -7,6 +7,7 @@
 **Enforce clean boundaries, layer integrity, and logic deduplication for dbt, SQLMesh, and Dataform.**
 
 [![PyPI version](https://img.shields.io/pypi/v/tff-core.svg?logo=pypi)](https://pypi.org/project/tff-core/)
+[![Downloads](https://img.shields.io/pypi/dm/tff-core.svg)](https://pypi.org/project/tff-core/)
 [![Python versions](https://img.shields.io/pypi/pyversions/tff-core.svg?logo=python)](https://pypi.org/project/tff-core/)
 [![Documentation Status](https://readthedocs.org/projects/tff/badge/?version=latest)](https://tff.readthedocs.io/en/latest/?badge=latest)
 
@@ -19,31 +20,38 @@ SQL linters check syntax and indentation in individual files, but they are blind
 ```text
 $ tff check
 
-╭──────────────────────────────── LINT FAILED ─────────────────────────────────╮
-│  5 models checked  ·  3 errors  ·  4 warnings                                │
-╰──────────────────────────────────────────────────────────────────────────────╯
+TFF ARCHITECTURE AUDIT
+6 models · 4 errors · 4 warnings · 0.05s
 
-Issues by Model
-● marts/marketing/marketing_all_users.sql
-  ✘ marts/marketing depends on sqlmesh_example.finance_stats (marts/finance)
-    → Illegal cross-layer dependency! (layer_integrity)
-  ⚠ CTE 'marketing_cleaned_users' duplicates transformation logic with 3 other models.
-    → Connascence of Algorithm: extract into a shared upstream model. (duplicate_ctes)
+STATUS  LOCATION                              RULE               COUPLING
+──────────────────────────────────────────────────────────────────────────────
+WRN     models/core/layer_violation.sql       duplicate_ctes     algorithm
+        * CTE 'cleaned_users' duplicates transformation logic with 3 other models.
 
-● marts/finance/finance_stats.sql
-  ⚠ CTE 'cleaned_users' duplicates transformation logic with 3 other models.
-    → Connascence of Algorithm. (duplicate_ctes)
+ERR     models/core/users.sql                 banselectstar      name
+        ! SELECT * is prohibited. Explicitly name your columns to reduce coupling.
 
-● core/users.sql
-  ✘ SELECT * is prohibited. Explicitly name your columns to reduce coupling. (ban_select_star)
-  ✘ Model owner should always be specified. (nomissingowner)
+ERR     models/core/users.sql                 nomissingowner     metadata
+        ! Model owner should always be specified.
 
-Lint failed — fix errors above before merging.
+WRN     models/marts/finance/finance_stats.sql  duplicate_ctes   algorithm
+        * CTE 'cleaned_users' duplicates transformation logic with 3 other models.
+
+ERR     models/marts/marketing/marketing_all_users.sql  layer_integrity  dynamic
+        ! marts/marketing depends on sqlmesh_example.finance_stats (marts/finance)
+
+WRN     models/marts/marketing/marketing_all_users.sql  duplicate_ctes   algorithm
+        * CTE 'marketing_cleaned_users' has duplicate transformation logic.
+
+ERR     models/marts/marketing/marketing_type_violation.sql  join_type_parity  type
+        ! Join condition 'o.user_id = u.user_id' compares integer with text (CoT).
+──────────────────────────────────────────────────────────────────────────────
+FAIL — 4 errors block merge. Run `tff --fix` for auto-correctable rules.
 ```
 
 ---
 
-## ⚡ 30-Second Evaluation (Zero Config)
+## Evaluation (Zero Configuration)
 
 Run `tff` inside any existing transformation repository without creating any configuration file. `tff` immediately infers default architectural conventions (`staging` → `intermediate` → `core` → `marts`):
 
@@ -131,14 +139,15 @@ For full CLI options and flags, see the [CLI Reference](cli.md).
 
 ## Documentation Navigation
 
-* 📐 [SQLMesh Integration Guide](sqlmesh.md)
-* ⚡ [dbt Integration Guide](dbt.md)
-* ☁️ [Dataform Integration Guide](dataform.md)
-* 💻 [CLI Reference Guide](cli.md)
-* 🔍 [Rules & Checks Reference](rules_and_checks.md)
-* 🤖 [CI/CD & GitHub Actions Guide](ci_cd.md)
-* 🧩 [Extending tff Guide (Custom Rules, Checks & Adapters)](extending_tff.md)
-* 📊 [Case Study: GitLab dbt Audit (2,200+ models)](case_study_gitlab.md)
-* 🔌 [API Reference - Adapters](api/adapters.md)
-* 📜 [API Reference - Rules & Checks](api/rules.md)
-* 🏗️ [Architecture & Contributor Guide](contributing.md)
+- [SQLMesh Integration Guide](sqlmesh.md)
+- [dbt Integration Guide](dbt.md)
+- [Dataform Integration Guide](dataform.md)
+- [CLI Reference Guide](cli.md)
+- [Rules & Checks Reference](rules_and_checks.md)
+- [Style Guide & Design System](style_guide.md)
+- [CI/CD & GitHub Actions Guide](ci_cd.md)
+- [Extending tff Guide (Custom Rules, Checks & Adapters)](extending_tff.md)
+- [Case Study: GitLab dbt Audit (2,200+ models)](case_study_gitlab.md)
+- [API Reference - Adapters](api/adapters.md)
+- [API Reference - Rules & Checks](api/rules.md)
+- [Architecture & Contributor Guide](contributing.md)

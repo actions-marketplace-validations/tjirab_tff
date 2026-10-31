@@ -1,54 +1,51 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tff-white.svg">
-    <img alt="tff logo" src="docs/assets/tff.svg" width="160">
-  </picture>
-</p>
-
 # tff
 
 ### Fast, zero-warehouse-cost architectural linter & health dashboard for dbt, SQLMesh & Dataform.
 **Catch illegal upstream joins, layer violations, and duplicate transformation logic in CI.**
 
 [![PyPI version](https://img.shields.io/pypi/v/tff-core.svg?logo=pypi)](https://pypi.org/project/tff-core/)
+[![Downloads](https://img.shields.io/pypi/dm/tff-core.svg)](https://pypi.org/project/tff-core/)
 [![Python versions](https://img.shields.io/pypi/pyversions/tff-core.svg?logo=python)](https://pypi.org/project/tff-core/)
 [![Documentation Status](https://readthedocs.org/projects/tff/badge/?version=latest)](https://tff.readthedocs.io/en/latest/?badge=latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-SQL linters check syntax and formatting in individual files, but they don't know your DAG. **tff** evaluates your transformation models holistically—enforcing layer boundaries, domain contracts, and logic deduplication across your entire data warehouse.
-
-<p align="center">
-  <img width="850" alt="tff catching layer violations and duplicate CTEs" src="docs/assets/demo-sqlmesh.gif" />
-</p>
+SQL linters check syntax and formatting in individual files, but they do not analyze the transformation graph. **tff** evaluates transformation models holistically—enforcing layer boundaries, domain contracts, and logic deduplication across the entire data warehouse DAG.
 
 ```text
 $ tff check
 
-╭──────────────────────────────── LINT FAILED ─────────────────────────────────╮
-│  5 models checked  ·  3 errors  ·  4 warnings                                │
-╰──────────────────────────────────────────────────────────────────────────────╯
+TFF ARCHITECTURE AUDIT
+6 models · 4 errors · 4 warnings · 0.05s
 
-Issues by Model
-● marts/marketing/marketing_all_users.sql
-  ✘ marts/marketing depends on sqlmesh_example.finance_stats (marts/finance)
-    → Illegal cross-layer dependency! (layer_integrity)
-  ⚠ CTE 'marketing_cleaned_users' duplicates transformation logic with 3 other models.
-    → Connascence of Algorithm: extract into a shared upstream model. (duplicate_ctes)
+STATUS  LOCATION                              RULE               COUPLING
+──────────────────────────────────────────────────────────────────────────────
+WRN     models/core/layer_violation.sql       duplicate_ctes     algorithm
+        * CTE 'cleaned_users' duplicates transformation logic with 3 other models.
 
-● marts/finance/finance_stats.sql
-  ⚠ CTE 'cleaned_users' duplicates transformation logic with 3 other models.
-    → Connascence of Algorithm. (duplicate_ctes)
+ERR     models/core/users.sql                 banselectstar      name
+        ! SELECT * is prohibited. Explicitly name your columns to reduce coupling.
 
-● core/users.sql
-  ✘ SELECT * is prohibited. Explicitly name your columns to reduce coupling. (ban_select_star)
-  ✘ Model owner should always be specified. (nomissingowner)
+ERR     models/core/users.sql                 nomissingowner     metadata
+        ! Model owner should always be specified.
 
-Lint failed — fix errors above before merging.
+WRN     models/marts/finance/finance_stats.sql  duplicate_ctes   algorithm
+        * CTE 'cleaned_users' duplicates transformation logic with 3 other models.
+
+ERR     models/marts/marketing/marketing_all_users.sql  layer_integrity  dynamic
+        ! marts/marketing depends on sqlmesh_example.finance_stats (marts/finance)
+
+WRN     models/marts/marketing/marketing_all_users.sql  duplicate_ctes   algorithm
+        * CTE 'marketing_cleaned_users' duplicates transformation logic.
+
+ERR     models/marts/marketing/marketing_type_violation.sql  join_type_parity  type
+        ! Join condition 'o.user_id = u.user_id' compares integer with text (CoT).
+──────────────────────────────────────────────────────────────────────────────
+FAIL — 4 errors block merge. Run `tff --fix` for auto-correctable rules.
 ```
 
 ---
 
-## ⚡ 30-Second Quickstart (Zero Config)
+## Quickstart (Zero Configuration)
 
 Run `tff` inside any existing dbt, SQLMesh, or Dataform repository. **No configuration file required**—`tff` automatically infers standard layer conventions (`staging` → `intermediate` → `core` → `marts`) and immediately audits your DAG:
 
@@ -72,27 +69,38 @@ tff health
 
 ---
 
-## Why tff?
+## Demo
 
-* 🛡️ **Layer Boundary Integrity**: Prevent dependency anti-patterns (e.g., marts querying raw staging directly or unauthorized cross-mart coupling).
-* 🔍 **Duplicate CTE Detector**: Automatically detect duplicate complex CTEs across models (Connascence of Algorithm) and flag them for refactoring into upstream shared models.
-* 📊 **Model Health Score**: Calculate objective repository health metrics (0–100) and enforce CI quality gates with `tff health --fail-under 80`.
-* 🚦 **dbt, SQLMesh & Dataform CI Linter**: Built-in GitHub Action (`tjirab/tff@v1`) diffs PR changes against base branches, gates merges on health scores, and emits inline PR annotations.
-* 🛠️ **Automated Fixers**: Auto-fix positional `GROUP BY`/`ORDER BY` clauses and scaffold missing metadata with `tff lint --fix`.
-* 📐 **Multi-Engine Support**: First-class support for **dbt**, **SQLMesh**, and **Google Cloud Dataform**.
+- [Terminal audit demo recording (GIF)](docs/assets/demo-sqlmesh.gif) — live capture of layer integrity enforcement and duplicate CTE detection.
+- [Terminal demo recording suite](demos/README.md) — automated VHS session scripts across dbt, SQLMesh, and health index reporting.
 
 ---
 
-## 📖 Documentation
+## Architecture & Capabilities
 
-Full documentation, configuration guides, and cookbooks are available at [**tff.readthedocs.io**](https://tff.readthedocs.io/):
+| Capability | Specification & Function |
+| :--- | :--- |
+| **Layer Boundary Integrity** | Enforces directional DAG constraints (`staging` → `intermediate` → `core` → `marts`) and blocks unauthorized cross-mart coupling. |
+| **Duplicate CTE Detection** | Identifies identical transformation sub-queries across independent models (Connascence of Algorithm) to drive upstream consolidation. |
+| **Model Health Scoring** | Computes an objective repository health metric (0–100) and gates CI builds via `tff health --fail-under 80`. |
+| **CI/CD Pipeline Governance** | Official GitHub Action (`tjirab/tff@v1`) diffs PR changes against base branches, gates merges, and generates inline annotations. |
+| **Automated Remediation** | Safely synchronizes model name declarations to file stems via `tff lint --fix`. |
+| **Multi-Engine Support** | Native semantic analysis across dbt, SQLMesh, and Google Cloud Dataform projects without warehouse connection overhead. |
 
-* 🚀 [**Getting Started & Integrations**](https://tff.readthedocs.io/) — Guides for [dbt](https://tff.readthedocs.io/en/latest/dbt/), [SQLMesh](https://tff.readthedocs.io/en/latest/sqlmesh/), and [Dataform](https://tff.readthedocs.io/en/latest/dataform/)
-* 🔍 [**Rules & Checks Reference**](https://tff.readthedocs.io/en/latest/rules_and_checks/) — Complete catalog of architectural checks and linter rules
-* 💻 [**CLI Reference Guide**](https://tff.readthedocs.io/en/latest/cli/) — Full list of CLI commands, options, and output formats (SARIF, JSON, HTML)
-* 🤖 [**CI/CD & GitHub Actions**](https://tff.readthedocs.io/en/latest/ci_cd/) — Setting up automated PR governance with `tjirab/tff@v1` and pre-commit
-* 🧩 [**Extending tff**](https://tff.readthedocs.io/en/latest/extending_tff/) — Writing custom rules, checks, and plugins
-* 📊 [**GitLab Case Study**](https://tff.readthedocs.io/en/latest/case_study_gitlab/) — Auditing 2,200+ models in GitLab's open-source enterprise dbt repository
+---
+
+## Documentation
+
+Complete specifications, configuration guides, and architectural documentation are available at [**tff.readthedocs.io**](https://tff.readthedocs.io/):
+
+- [**Getting Started & Integrations**](https://tff.readthedocs.io/) — Guides for [dbt](https://tff.readthedocs.io/en/latest/dbt/), [SQLMesh](https://tff.readthedocs.io/en/latest/sqlmesh/), and [Dataform](https://tff.readthedocs.io/en/latest/dataform/).
+- [**Rules & Checks Reference**](https://tff.readthedocs.io/en/latest/rules_and_checks/) — Catalog of architectural checks and linter rules.
+- [**CLI Reference Guide**](https://tff.readthedocs.io/en/latest/cli/) — Command-line interface reference, options, and output formats (SARIF, JSON, HTML).
+- [**CI/CD & GitHub Actions**](https://tff.readthedocs.io/en/latest/ci_cd/) — Automated PR governance with `tjirab/tff@v1` and pre-commit hooks.
+- [**Extending tff**](https://tff.readthedocs.io/en/latest/extending_tff/) — Authoring custom rules, checks, and plugins.
+- [**Architecture Decision Records (ADRs)**](docs/adr/README.md) — Technical decision log and architecture decision records.
+- [**GitLab Case Study**](https://tff.readthedocs.io/en/latest/case_study_gitlab/) — Architectural audit of 2,200+ models in enterprise dbt pipelines.
+- [**Style Guide & Design System**](docs/style_guide.md) — Functional design principles, typography, and documentation standards.
 
 ---
 

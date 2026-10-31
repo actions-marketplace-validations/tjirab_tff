@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 import yaml
 from pydantic import (
@@ -14,7 +14,11 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from tff.core.exceptions import TffConfigError
 
+
+
+Severity = Literal["error", "warning"]
 
 DEFAULT_LAYER_ORDER: list[str] = ["staging", "intermediate", "core", "marts"]
 
@@ -27,6 +31,9 @@ STARTER_CONFIG_YAML: str = """# ================================================
 # Transformation Fitness Functions (tff) Configuration
 # Documentation: https://github.com/tjirab/tff
 # =============================================================================
+
+# Pipeline engine provider (optional: auto, dbt, sqlmesh, dataform)
+# provider: dbt
 
 # Parallelism and caching options (optional)
 # workers: 4          # Number of worker processes (default: auto, capped at CPU count)
@@ -72,6 +79,7 @@ checks:
     enabled: true
     severity: warning
     min_occurrences: 2
+    min_length: 0
     ignored_values: ["0", "1", ""]
     ignored_punctuation: ["|", " ", "-", "_", "/", ":"]
 
@@ -80,10 +88,32 @@ checks:
     enabled: true
     severity: error
 
+  # Enforce custom layer/domain dependency exclusions and allowed exceptions
+  custom_exclusions:
+    enabled: true
+    exclusions: []
+    allowed_exceptions: []
+
+  # Enforce column parity and dimension parity contracts across model groups
+  schema_contracts:
+    enabled: true
+    column_parity_groups: []
+    dimension_parity_groups: []
+
 # Model-level SQL rules
 rules:
   # Prohibit 'SELECT *' to avoid silent breakage from upstream schema drift
   ban_select_star:
+    enabled: true
+    skip_layers: [sources]
+
+  # Require explicit column names instead of positional references in GROUP BY
+  no_positional_group_by:
+    enabled: true
+    skip_layers: [sources]
+
+  # Require explicit column names instead of positional references in ORDER BY
+  no_positional_order_by:
     enabled: true
     skip_layers: [sources]
 
@@ -125,6 +155,21 @@ rules:
     layer_name: marts
     rule: prefix_with_subdirectory
 
+  # Enforce standardized column naming conventions and replacements
+  column_names:
+    enabled: true
+    replacements: {}
+
+  # Enforce expected data types for columns matching specific naming patterns
+  column_types:
+    enabled: true
+    rules: []
+
+  # Require standardized classification macros for specific columns
+  classification_macros:
+    enabled: true
+    skip_layers: [sources]
+
 # External plugins and custom rules (paths to Python files or installed packages)
 # plugins:
 #   - "rules/custom_company_rules.py"
@@ -145,18 +190,36 @@ rules:
 
 
 class LayersConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     order: list[str] = Field(default_factory=lambda: list(DEFAULT_LAYER_ORDER))
 
 
 class CheckEnabled(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     enabled: bool = True
+    severity: Severity | None = None
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _validate_severity(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return v.lower()
+        return v
 
 
 class LayerFilterConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     enabled: bool = True
-    severity: str | None = None
+    severity: Severity | None = None
     skip_layers: list[str] = Field(default_factory=list)
     only_layers: list[str] | None = None
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _validate_severity(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return v.lower()
+        return v
 
     def should_run(self, layer: str | None) -> bool:
         if not self.enabled:
@@ -180,21 +243,30 @@ class MaterializationDepthCheckConfig(LayerFilterConfig):
 
 
 class DuplicateCtesCheckConfig(LayerFilterConfig):
-    severity: str = "warning"
+    severity: Severity = "warning"
     min_ast_nodes: int = 12
+    ignore_macros: bool = True
 
 
 class ConnascenceOfValueCheckConfig(LayerFilterConfig):
-    severity: str = "warning"
+    severity: Severity = "warning"
     min_occurrences: int = 2
+    min_length: int = Field(default=0, ge=0)
+    min_string_length: int | None = Field(default=None, ge=0)
     ignored_values: list[str] = Field(default_factory=lambda: ["0", "1", ""])
     ignored_punctuation: list[str] = Field(
         default_factory=lambda: ["|", " ", "-", "_", "/", ":"]
     )
 
+    @model_validator(mode="after")
+    def resolve_min_length(self) -> ConnascenceOfValueCheckConfig:
+        if self.min_string_length is not None and self.min_length == 0:
+            self.min_length = self.min_string_length
+        return self
+
 
 class JoinTypeParityCheckConfig(LayerFilterConfig):
-    severity: str = "error"
+    severity: Severity = "error"
     equivalent_types: dict[str, list[str]] = Field(
         default_factory=lambda: {
             "text": ["text", "varchar", "string", "char", "nvarchar", "bpchar", "nchar"],
@@ -241,6 +313,7 @@ class JoinTypeParityCheckConfig(LayerFilterConfig):
 
 
 class CustomExclusionRule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     source_layer: str | None = None
     source_domain: str | None = None
     source_tag: str | None = None
@@ -254,6 +327,7 @@ class CustomExclusionRule(BaseModel):
 
 
 class AllowedExceptionRule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     model: str
     dependency: str
 
@@ -264,6 +338,7 @@ class CustomExclusionsCheckConfig(LayerFilterConfig):
 
 
 class ColumnParityMember(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     file: str
     substitutions: dict[str, str] = Field(default_factory=dict)
 
@@ -274,6 +349,7 @@ class ColumnParityMember(BaseModel):
 
 
 class ColumnParityGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     models_dir: str = ""
     reference: str
     members: list[ColumnParityMember] = Field(default_factory=list)
@@ -295,11 +371,13 @@ class ColumnParityGroup(BaseModel):
 
 
 class DimensionParityTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     file: str
     exclude_columns: list[str] = Field(default_factory=list)
 
 
 class DimensionParityGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     models_dir: str = ""
     left: DimensionParityTarget
     right: DimensionParityTarget
@@ -313,6 +391,7 @@ class DimensionParityGroup(BaseModel):
 
 
 class ContractGroupsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     column_parity_groups: list[ColumnParityGroup] = Field(default_factory=list)
     dimension_parity_groups: list[DimensionParityGroup] = Field(default_factory=list)
 
@@ -348,6 +427,31 @@ class ChecksConfig(BaseModel):
         default_factory=JoinTypeParityCheckConfig
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_check_entries(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            known = set(cls.model_fields.keys())
+            for k, v in data.items():
+                if k not in known:
+                    if not isinstance(v, (dict, bool)):
+                        raise TffConfigError(
+                            f"Invalid configuration for check '{k}': expected a dictionary of options or boolean, got {type(v).__name__}",
+                            hint=f"Configure check '{k}' with a dictionary of options or a boolean.",
+                            details={"check": k, "provided_type": type(v).__name__},
+                        )
+                    if isinstance(v, dict) and "severity" in v and v["severity"] is not None:
+                        sev = v["severity"]
+                        sev_norm = sev.lower() if isinstance(sev, str) else sev
+                        if sev_norm not in ("error", "warning"):
+                            raise TffConfigError(
+                                f"Invalid severity '{sev}' for check '{k}': expected 'error' or 'warning'",
+                                hint=f"Set 'severity' for check '{k}' to either 'error' or 'warning'.",
+                                details={"check": k, "severity": sev},
+                            )
+                        v["severity"] = sev_norm
+        return data
+
 
 class ClassificationMacrosRuleConfig(LayerFilterConfig):
     skip_layers: list[str] = Field(default_factory=lambda: ["sources"])
@@ -360,24 +464,66 @@ class ClassificationMacrosRuleConfig(LayerFilterConfig):
     )
 
 
+DEFAULT_SQL_COMPLEXITY_THRESHOLDS: dict[str, list[int]] = {
+    "decision_points": [15, 25],
+    "cte_count": [8, 12],
+    "join_count": [8, 12],
+    "line_count": [250, 400],
+}
+
+
 class SqlComplexityRuleConfig(LayerFilterConfig):
     thresholds: dict[str, list[int]] = Field(
-        default_factory=lambda: {
-            "decision_points": [15, 25],
-            "cte_count": [8, 12],
-            "join_count": [8, 12],
-            "line_count": [250, 400],
-        }
+        default_factory=lambda: dict(DEFAULT_SQL_COMPLEXITY_THRESHOLDS)
     )
+
+    @field_validator("thresholds", mode="before")
+    @classmethod
+    def validate_thresholds(cls, v: Any) -> Any:
+        if not isinstance(v, dict):
+            raise TffConfigError(
+                f"Expected dictionary for thresholds in 'rules.sql_complexity', got {type(v).__name__}",
+                hint="Configure thresholds as a dictionary mapping metrics (e.g. 'decision_points', 'line_count') to [warn, fail] pairs.",
+                details={"rule": "sql_complexity", "field": "thresholds", "provided_type": type(v).__name__},
+            )
+        for metric, val in v.items():
+            if not isinstance(val, (list, tuple)) or len(val) != 2:
+                raise TffConfigError(
+                    f"Threshold for metric '{metric}' in 'rules.sql_complexity' must be a pair [warn, fail], got {val}",
+                    hint="Provide a list of two non-negative integers [warn, fail] where warn <= fail.",
+                    details={"rule": "sql_complexity", "metric": metric, "threshold": val},
+                )
+            warn, fail = val
+            if isinstance(warn, bool) or isinstance(fail, bool) or not isinstance(warn, int) or not isinstance(fail, int):
+                raise TffConfigError(
+                    f"Threshold values for metric '{metric}' in 'rules.sql_complexity' must be integers, got {val}",
+                    hint="Provide integer values for warn and fail thresholds.",
+                    details={"rule": "sql_complexity", "metric": metric, "threshold": val},
+                )
+            if warn < 0 or fail < 0:
+                raise TffConfigError(
+                    f"Threshold values for metric '{metric}' in 'rules.sql_complexity' must be non-negative, got {val}",
+                    hint="Provide non-negative integer values for warn and fail thresholds.",
+                    details={"rule": "sql_complexity", "metric": metric, "threshold": val},
+                )
+            if warn > fail:
+                raise TffConfigError(
+                    f"Warn threshold ({warn}) cannot be greater than fail threshold ({fail}) for metric '{metric}' in 'rules.sql_complexity'",
+                    hint="Ensure the warning threshold is less than or equal to the fail threshold: [warn, fail].",
+                    details={"rule": "sql_complexity", "metric": metric, "warn": warn, "fail": fail},
+                )
+        return {**DEFAULT_SQL_COMPLEXITY_THRESHOLDS, **v}
 
     @model_validator(mode="before")
     @classmethod
     def reject_warn_only(cls, data: Any) -> Any:
         if isinstance(data, dict) and "warn_only" in data:
-            raise ValueError(
+            raise TffConfigError(
                 "'rules.sql_complexity.warn_only' is deprecated and no longer supported. "
                 "To emit warnings only, configure 'severity: warning' under 'rules.sql_complexity'. "
-                "To configure strict thresholds, define [warn, fail] values in 'thresholds'."
+                "To configure strict thresholds, define [warn, fail] values in 'thresholds'.",
+                hint="Configure 'severity: warning' under 'rules.sql_complexity' or define [warn, fail] values in 'thresholds'.",
+                details={"rule": "sql_complexity", "field": "warn_only"},
             )
         return data
 
@@ -391,10 +537,12 @@ class SqlComplexityRuleConfig(LayerFilterConfig):
 
     @warn_only.setter
     def warn_only(self, value: Any) -> None:
-        raise ValueError(
+        raise TffConfigError(
             "'rules.sql_complexity.warn_only' is deprecated and no longer supported. "
             "To emit warnings only, configure 'severity: warning' under 'rules.sql_complexity'. "
-            "To configure strict thresholds, define [warn, fail] values in 'thresholds'."
+            "To configure strict thresholds, define [warn, fail] values in 'thresholds'.",
+            hint="Configure 'severity: warning' under 'rules.sql_complexity' or define [warn, fail] values in 'thresholds'.",
+            details={"rule": "sql_complexity", "field": "warn_only"},
         )
 
 
@@ -408,6 +556,7 @@ class ColumnNamesRuleConfig(LayerFilterConfig):
 
 
 class ColumnTypeRuleEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     name: str
     pattern: str
     data_type: str
@@ -427,6 +576,19 @@ class MetadataRuleConfig(LayerFilterConfig):
     not_null: bool = True
     unique_values: bool = True
 
+    @field_validator("grain", mode="before")
+    @classmethod
+    def validate_model_grain(cls, v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str) and v.lower() in ("true", "false", "1", "0"):
+            return v.lower() in ("true", "1")
+        raise TffConfigError(
+            f"Invalid configuration for 'rules.metadata.grain': expected boolean, got {type(v).__name__}",
+            hint="Set 'grain: true' or 'grain: false' under 'rules.metadata'.",
+            details={"rule": "metadata", "field": "grain", "value": v, "provided_type": type(v).__name__},
+        )
+
 
 class FilenameEqualsModelnameRuleConfig(LayerFilterConfig):
     pass
@@ -436,8 +598,18 @@ class BanSelectStarRuleConfig(LayerFilterConfig):
     skip_layers: list[str] = Field(default_factory=lambda: ["sources"])
 
 
+class NoPositionalGroupByRuleConfig(LayerFilterConfig):
+    skip_layers: list[str] = Field(default_factory=lambda: ["sources"])
+
+
+class NoPositionalOrderByRuleConfig(LayerFilterConfig):
+    skip_layers: list[str] = Field(default_factory=lambda: ["sources"])
+
+
 class NoPositionalGroupByOrOrderByRuleConfig(LayerFilterConfig):
     skip_layers: list[str] = Field(default_factory=lambda: ["sources"])
+    group_by: bool = True
+    order_by: bool = True
 
 
 class EnvironmentAgnosticReferencesRuleConfig(LayerFilterConfig):
@@ -464,6 +636,12 @@ class RulesConfig(BaseModel):
     ban_select_star: BanSelectStarRuleConfig = Field(
         default_factory=BanSelectStarRuleConfig
     )
+    no_positional_group_by: NoPositionalGroupByRuleConfig = Field(
+        default_factory=NoPositionalGroupByRuleConfig
+    )
+    no_positional_order_by: NoPositionalOrderByRuleConfig = Field(
+        default_factory=NoPositionalOrderByRuleConfig
+    )
     no_positional_group_by_or_order_by: NoPositionalGroupByOrOrderByRuleConfig = Field(
         default_factory=NoPositionalGroupByOrOrderByRuleConfig
     )
@@ -471,13 +649,88 @@ class RulesConfig(BaseModel):
         default_factory=EnvironmentAgnosticReferencesRuleConfig
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_rule_entries(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Normalize boolean rule entries
+            for k in list(data.keys()):
+                if isinstance(data[k], bool):
+                    data[k] = {"enabled": data[k]}
+
+            # Synchronize positional group by and order by settings
+            if "no_positional_group_by_or_order_by" in data:
+                parent = data["no_positional_group_by_or_order_by"]
+                if isinstance(parent, dict):
+                    p_enabled = parent.get("enabled", True)
+                    p_group = parent.get("group_by", True)
+                    p_order = parent.get("order_by", True)
+                    p_skip = parent.get("skip_layers")
+                    p_only = parent.get("only_layers")
+                    p_sev = parent.get("severity")
+
+                    if "no_positional_group_by" not in data:
+                        grp_dict: dict[str, Any] = {"enabled": bool(p_enabled and p_group)}
+                        if p_skip is not None:
+                            grp_dict["skip_layers"] = p_skip
+                        if p_only is not None:
+                            grp_dict["only_layers"] = p_only
+                        if p_sev is not None:
+                            grp_dict["severity"] = p_sev
+                        data["no_positional_group_by"] = grp_dict
+
+                    if "no_positional_order_by" not in data:
+                        ord_dict: dict[str, Any] = {"enabled": bool(p_enabled and p_order)}
+                        if p_skip is not None:
+                            ord_dict["skip_layers"] = p_skip
+                        if p_only is not None:
+                            ord_dict["only_layers"] = p_only
+                        if p_sev is not None:
+                            ord_dict["severity"] = p_sev
+                        data["no_positional_order_by"] = ord_dict
+            elif "no_positional_group_by" in data or "no_positional_order_by" in data:
+                p_dict: dict[str, Any] = {}
+                if "no_positional_group_by" in data:
+                    g_val = data["no_positional_group_by"]
+                    if isinstance(g_val, dict) and "enabled" in g_val:
+                        p_dict["group_by"] = bool(g_val["enabled"])
+                if "no_positional_order_by" in data:
+                    o_val = data["no_positional_order_by"]
+                    if isinstance(o_val, dict) and "enabled" in o_val:
+                        p_dict["order_by"] = bool(o_val["enabled"])
+                if p_dict:
+                    data["no_positional_group_by_or_order_by"] = p_dict
+
+            known = set(cls.model_fields.keys())
+            for k, v in data.items():
+                if k not in known:
+                    if not isinstance(v, (dict, bool)):
+                        raise TffConfigError(
+                            f"Invalid configuration for rule '{k}': expected a dictionary of options or boolean, got {type(v).__name__}",
+                            hint=f"Configure rule '{k}' with a dictionary of options or a boolean.",
+                            details={"rule": k, "provided_type": type(v).__name__},
+                        )
+                    if isinstance(v, dict) and "severity" in v and v["severity"] is not None:
+                        sev = v["severity"]
+                        sev_norm = sev.lower() if isinstance(sev, str) else sev
+                        if sev_norm not in ("error", "warning"):
+                            raise TffConfigError(
+                                f"Invalid severity '{sev}' for rule '{k}': expected 'error' or 'warning'",
+                                hint=f"Set 'severity' for rule '{k}' to either 'error' or 'warning'.",
+                                details={"rule": k, "severity": sev},
+                            )
+                        v["severity"] = sev_norm
+        return data
+
 
 class HealthCheckPenaltyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     error: float | None = Field(default=None, ge=0.0)
     warning: float | None = Field(default=None, ge=0.0)
 
 
 class HealthPenaltiesConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     error: float = Field(default=1.0, ge=0.0)
     warning: float = Field(default=0.5, ge=0.0)
     project_error: float = Field(default=100.0, ge=0.0)
@@ -547,6 +800,7 @@ class HealthPenaltiesConfig(BaseModel):
 
 
 class HealthConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     weights: dict[str, float] = Field(default_factory=dict)
     category_weights: dict[str, float] = Field(default_factory=dict)
     penalties: HealthPenaltiesConfig = Field(default_factory=HealthPenaltiesConfig)
@@ -561,8 +815,10 @@ class HealthConfig(BaseModel):
             for k, val in v.items():
                 flt_val = float(val)
                 if flt_val < 0.0:
-                    raise ValueError(
-                        f"Weight for '{k}' must be non-negative, got {flt_val}"
+                    raise TffConfigError(
+                        f"Weight for '{k}' must be non-negative, got {flt_val}",
+                        hint=f"Set weight for '{k}' to a non-negative number under 'health'.",
+                        details={"key": k, "weight": flt_val},
                     )
                 validated[str(k)] = flt_val
             return validated
@@ -570,12 +826,15 @@ class HealthConfig(BaseModel):
 
 
 class FitnessFunctionsConfig(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
     _project_root: Path = PrivateAttr(default_factory=Path.cwd)
     _config_file_found: bool = PrivateAttr(default=True)
+    version: int | str | None = None
+    project_name: str | None = None
     contract_groups_path: str = "linter_contract_groups.json"
     exclusions_path: str = "linter_exclusions.json"
     plugins: list[str] = Field(default_factory=list)
+    provider: str | None = None
     layers: LayersConfig = Field(default_factory=LayersConfig)
     checks: ChecksConfig = Field(default_factory=ChecksConfig)
     rules: RulesConfig = Field(default_factory=RulesConfig)
@@ -584,8 +843,25 @@ class FitnessFunctionsConfig(BaseModel):
     exclusions: list[CustomExclusionRule] | None = None
     allowed_exceptions: list[AllowedExceptionRule] | None = None
     workers: int | None = None
+    chunk_size: int | None = None
     cache_ast: bool = True
     cache_dir: str = ".tff_cache"
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _validate_provider(cls, v: Any) -> str | None:
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise TffConfigError(
+                f"Expected string for provider, got {type(v).__name__}",
+                hint="Specify provider as a string, e.g. 'dbt', 'sqlmesh', 'dataform', or 'auto'.",
+                details={"field": "provider", "provided_type": type(v).__name__},
+            )
+        val = v.strip().lower()
+        if not val or val == "auto":
+            return None
+        return val
 
     @field_validator("workers", mode="before")
     @classmethod
@@ -594,7 +870,25 @@ class FitnessFunctionsConfig(BaseModel):
             return None
         val = int(v)
         if val < 1:
-            raise ValueError(f"workers must be at least 1, got {val}")
+            raise TffConfigError(
+                f"workers must be at least 1, got {val}",
+                hint="Set workers to an integer >= 1 in fitness_functions.yaml or CLI flag.",
+                details={"field": "workers", "workers": val, "min_workers": 1},
+            )
+        return val
+
+    @field_validator("chunk_size", mode="before")
+    @classmethod
+    def _validate_chunk_size(cls, v: Any) -> int | None:
+        if v is None:
+            return None
+        val = int(v)
+        if val < 1:
+            raise TffConfigError(
+                f"chunk_size must be at least 1, got {val}",
+                hint="Set chunk_size to an integer >= 1 in fitness_functions.yaml or CLI flag.",
+                details={"field": "chunk_size", "chunk_size": val, "min_chunk_size": 1},
+            )
         return val
 
     @field_validator("plugins", mode="before")
@@ -606,8 +900,10 @@ class FitnessFunctionsConfig(BaseModel):
             return [v]
         if isinstance(v, (list, tuple)):
             return [str(item) for item in v]
-        raise ValueError(
-            f"Expected list of strings for plugins, got {type(v).__name__}"
+        raise TffConfigError(
+            f"Expected list of strings for plugins, got {type(v).__name__}",
+            hint="Configure plugins as a list of file paths or module names under 'plugins'.",
+            details={"field": "plugins", "provided_type": type(v).__name__},
         )
 
     @property
@@ -668,8 +964,6 @@ def load_fitness_config(
                 content = yaml_path.read_text(encoding="utf-8")
                 loaded = yaml.safe_load(content) or {}
             except yaml.YAMLError as exc:
-                from tff.core.exceptions import TffConfigError
-
                 raise TffConfigError(
                     f"Failed to parse YAML configuration at '{yaml_path}': {exc}",
                     path=yaml_path,
@@ -686,8 +980,6 @@ def load_fitness_config(
                     expected_type="configuration file",
                 ) from exc
             if not isinstance(loaded, dict):
-                from tff.core.exceptions import TffConfigError
-
                 raise TffConfigError(
                     f"Expected mapping in {yaml_path}",
                     path=yaml_path,
@@ -732,8 +1024,6 @@ def _ensure_under_root(path: Path, root: Path) -> Path:
     try:
         resolved.relative_to(root_resolved)
     except ValueError:
-        from tff.core.exceptions import TffConfigError
-
         raise TffConfigError(
             f"Path {path} resolves outside project root {root}",
             path=path,

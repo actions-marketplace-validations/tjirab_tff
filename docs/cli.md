@@ -10,7 +10,7 @@ The CLI provides the following subcommands:
 
 | Subcommand | Description | Primary Use Case |
 | :--- | :--- | :--- |
-| [`tff lint`](#3-tff-lint) | Evaluates fitness checks and reports violations | Local pre-commit checks, CI lint steps, autofixing |
+| [`tff lint`](#3-tff-lint) (alias: [`tff check`](#3-tff-lint)) | Evaluates fitness checks and reports violations | Local pre-commit checks, CI lint steps, autofixing |
 | [`tff health`](#4-tff-health) | Calculates overall health score (0–100) and penalties | Quality thresholds, domain health breakdowns |
 | [`tff action`](#5-tff-action) | Runs the official GitHub Action pipeline locally or in CI | Base branch diff scoring, PR comments, annotations |
 | [`tff docs`](#6-tff-docs) | Generates interactive HTML report with lineage graphs | Architectural dashboards, team documentation |
@@ -18,15 +18,15 @@ The CLI provides the following subcommands:
 | [`tff stats`](#8-tff-stats) | Displays historical execution trends and metric logs | Tracking architectural drift over time |
 | [`tff info`](#9-tff-info) | Prints diagnostic info about environment and adapters | Debugging engine discovery, site-packages, config |
 | [`tff help`](#10-tff-help) | Displays help and usage information for commands | Exploring command arguments and syntax |
-| [`tff explain`](#11-tff-explain) | Displays in-terminal rule docs, rationale, and remediation | Understanding rules, learning how to fix violations |
-| [`tff rules`](#11-tff-explain) | Lists all available fitness checks and descriptions | Exploring rule catalog and default severities |
+| [`tff explain`](#11-tff-explain-tff-rules) | Displays in-terminal rule docs, rationale, and remediation | Understanding rules, learning how to fix violations |
+| [`tff rules`](#11-tff-explain-tff-rules) | Lists all available fitness checks and descriptions | Exploring rule catalog and default severities |
 
 ---
 
 ## 2. Global Conventions & Defaults
 
 * **Zero-Config Fallback**: If no `fitness_functions.yaml` is present, tff automatically infers standard architectural layer conventions (`staging` &rarr; `intermediate` &rarr; `core` &rarr; `marts`) and runs all baseline rules.
-* **Auto-Discovery**: tff automatically detects the project engine (`dbt`, `SQLMesh`, or `Dataform`) by scanning configuration files in the target directory.
+* **Auto-Discovery**: tff automatically detects the project engine (`dbt`, `SQLMesh`, or `Dataform`) by inspecting configuration files (with content verification to eliminate false positives on generic `config.py` or `config.yaml`), falling back to `models/` syntax inspection, or respecting declarative `provider:` in `fitness_functions.yaml`.
 * **Parallel Execution**: AST parsing, duplicate CTE fingerprinting, and model rule checks execute across a worker pool in parallel (`--workers`, `TFF_WORKERS`, or `workers:` in config). Worker tasks are dynamically batched to minimize `ThreadPoolExecutor` scheduling overhead (configurable via `TFF_CHUNK_SIZE`).
 * **Persistent AST Caching**: Precomputed ASTs are persistently cached under `.tff_cache/ast` keyed by SQLGlot version, SQL dialect, and SQL SHA-256 hash for sub-second repeat runs. Disable with `--no-cache` or clear with `--clear-cache`.
 * **Local Run Logging**: Executions of `tff lint` and `tff health` automatically save run metrics to `.tff_logs/` in JSON format (retained for 60 days). Disable anytime with `--no-log` or `export TFF_NO_LOG=1`.
@@ -41,10 +41,12 @@ The CLI provides the following subcommands:
 
 ## 3. `tff lint`
 
-Run architectural and SQL quality fitness checks against project models.
+Run architectural and SQL quality fitness checks against project models (`tff check` is supported as a first-class alias).
 
 ```bash
 tff lint [options]
+# or
+tff check [options]
 ```
 
 ### Options Reference Table
@@ -59,12 +61,15 @@ tff lint [options]
 | `--group-by` | `model`, `connascence` | `model` | How to group violations in the console report. |
 | `--dialect DIALECT` | String | (auto-inferred) | SQL dialect of models (e.g. `duckdb`, `snowflake`, `bigquery`). |
 | `--manifest PATH` | File Path | (auto-discovered) | Path to precompiled manifest (dbt `manifest.json` or Dataform `compilation_result.json`). |
-| `--fix` | Flag | `false` | Automatically fix simple violations (e.g. rewrite positional `GROUP BY`/`ORDER BY`, lift nested subqueries in final `SELECT` to CTEs, and scaffold missing metadata). |
+| `--fix` | Flag | `false` | Automatically fix safe violations (synchronizes SQLMesh and Dataform model name declarations with source file stems). |
 | `--format` | `text`, `json`, `sarif`, `github` | `text` | Output format to stdout. |
 | `--json` | Flag | `false` | Shorthand for `--format json`. |
 | `--github-annotations` | Flag | (auto if CI) | Emit GitHub Actions workflow commands (`::error` / `::warning`) to stderr. |
 | `--junit-xml PATH` | File Path | (none) | Write JUnit XML test report for CI results tabs (GitLab, Azure DevOps, Bitbucket). |
-| `--workers NUM` | Integer | (auto / CPU count) | Number of worker processes for parallel model loading, AST parsing, and CTE analysis (or set `TFF_WORKERS`). Task chunk size for rule evaluation can be tuned via `TFF_CHUNK_SIZE`. |
+| `--workers NUM` | Integer | (auto / CPU count) | Number of worker processes for parallel model loading, AST parsing, and CTE analysis (or set `TFF_WORKERS`). Task chunk size for rule evaluation can be tuned via `--chunk-size` or `TFF_CHUNK_SIZE`. |
+| `--chunk-size NUM` | Integer | (dynamic / `TFF_CHUNK_SIZE`) | Chunk size of models per thread worker during parallel rule execution. |
+| `--staged` | Flag | `false` | Only evaluate models/files currently staged in git. |
+| `--since REF`, `--diff REF` | Git Ref String | (none) | Only evaluate models/files modified relative to git ref (e.g. `origin/main`, `HEAD~1`). |
 | `--no-cache` | Flag | `false` | Disable disk-based AST caching in `.tff_cache/`. |
 | `--clear-cache` | Flag | `false` | Clear the persistent `.tff_cache/` directory before running. |
 | `--no-log` | Flag | `false` | Disable writing execution logs to `.tff_logs/lint/`. |
@@ -75,6 +80,14 @@ tff lint [options]
 ```bash
 # Standard linting run (zero-config out of the box)
 tff lint
+# or
+tff check
+
+# Check only models currently staged in git (fast pre-commit checks)
+tff check --staged
+
+# Check only models changed relative to main branch
+tff check --since origin/main
 
 # Run specific rules only
 tff lint --checks layer_integrity,ban_select_star
@@ -112,6 +125,9 @@ tff health [options]
 | `--dialect DIALECT` | String | (auto-inferred) | SQL dialect of models. |
 | `--manifest PATH` | File Path | (auto-discovered) | Path to precompiled manifest. |
 | `--workers NUM` | Integer | (auto / CPU count) | Number of worker processes for parallel model loading and AST parsing. |
+| `--chunk-size NUM` | Integer | (dynamic / `TFF_CHUNK_SIZE`) | Chunk size of models per thread worker during parallel rule execution. |
+| `--staged` | Flag | `false` | Only evaluate models/files currently staged in git. |
+| `--since REF`, `--diff REF` | Git Ref String | (none) | Only evaluate models/files modified relative to git ref (e.g. `origin/main`, `HEAD~1`). |
 | `--no-cache` | Flag | `false` | Disable disk-based AST caching in `.tff_cache/`. |
 | `--clear-cache` | Flag | `false` | Clear the persistent `.tff_cache/` directory before running. |
 | `--json` | Flag | `false` | Output results in JSON format to stdout. |
@@ -123,6 +139,12 @@ tff health [options]
 ```bash
 # Display overall health score and category breakdown
 tff health
+
+# Compute health score for models staged in git
+tff health --staged
+
+# Compute health score for models modified relative to main branch
+tff health --since origin/main
 
 # Require an 80% health score to pass CI
 tff health --fail-under 80
@@ -148,7 +170,7 @@ tff action [options]
 
 | Option | Type / Choices | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--project PATH` | Directory Path | `.` | Project root directory. |
+| `--project PATH`, `-p PATH` | Directory Path | `.` | Project root directory (can be specified multiple times for multi-repo projects). |
 | `--provider` | `auto`, `dbt`, `sqlmesh`, `dataform` | `auto` | Pipeline engine provider. |
 | `--fail-under SCORE` | Float (`0.0` - `100.0`) | `0.0` | Minimum overall health score required to pass. |
 | `--fail-level` | `error`, `warning` | `error` | Failure severity level triggering exit code `1`. |
@@ -156,12 +178,16 @@ tff action [options]
 | `--comment-pr {true,false}` | String | `false` | Create or update idempotent PR summary comment on GitHub. |
 | `--github-token TOKEN` | String | `$GITHUB_TOKEN` | GitHub API token for PR comments. |
 | `--base-ref REF` | String | (auto-detected) | Base branch reference to compare health score against (e.g. `main`). |
+| `--base-manifest PATH` | File Path | (none) | Path to precompiled baseline manifest for base branch comparison (e.g. dbt Cloud production manifest). |
+| `--manifest PATH` | File Path | (none) | Path to precompiled manifest or Dataform `compilation_result.json`. |
 | `--diff-against-base` / `--no-diff-against-base` | Flag | `true` | Compute health score diff vs target branch in temporary worktree. |
 | `--annotations` / `--no-annotations` | Flag | `true` | Emit GitHub Actions workflow command annotations. |
 | `--pr-number NUM` | Integer | (auto-detected) | Pull request number (auto-inferred from `$GITHUB_EVENT_PATH`). |
 | `--repo OWNER/REPO` | String | (auto-detected) | GitHub repository full name (auto-inferred from `$GITHUB_REPOSITORY`). |
 | `--workers NUM` | Integer | (auto / CPU count) | Number of worker processes for parallel model loading and AST parsing. |
+| `--chunk-size NUM` | Integer | (dynamic / `TFF_CHUNK_SIZE`) | Chunk size of models per thread worker during parallel rule execution. |
 | `--json` | Flag | `false` | Output final results as JSON to stdout. |
+| `--debug` | Flag | `false` | Enable verbose debug logging output to stderr. |
 
 ### Examples
 
@@ -171,6 +197,9 @@ tff action --base-ref main --fail-under 80
 
 # Only gate modified files in the current branch
 tff action --base-ref main --only-changed --fail-under 85
+
+# Multi-project workspace execution
+tff action -p packages/proj1 -p packages/proj2 --base-ref main
 ```
 
 ---
@@ -194,7 +223,9 @@ tff docs [options]
 | `--dialect DIALECT` | String | (auto-inferred) | SQL dialect of models. |
 | `--manifest PATH` | File Path | (auto-discovered) | Path to precompiled manifest. |
 | `--workers NUM` | Integer | (auto / CPU count) | Number of worker processes for parallel model loading and AST parsing. |
+| `--chunk-size NUM` | Integer | (dynamic / `TFF_CHUNK_SIZE`) | Chunk size of models per thread worker during parallel rule execution. |
 | `--no-log` | Flag | `false` | Disable writing execution logs. |
+| `--debug` | Flag | `false` | Enable verbose debug logging output to stderr. |
 
 ### Examples
 
@@ -222,6 +253,7 @@ tff init [options]
 | :--- | :--- | :--- | :--- |
 | `--project PATH` | Directory Path | `.` | Project root directory. |
 | `--force`, `-f` | Flag | `false` | Overwrite existing `fitness_functions.yaml` if one already exists. |
+| `--debug` | Flag | `false` | Enable verbose debug logging output to stderr. |
 
 ### Examples
 
@@ -250,6 +282,7 @@ tff stats [options]
 | `--project PATH`, `-p PATH` | Directory Path | `.` (current dir) | Project root directory (can be specified multiple times for multi-repo projects). |
 | `--days DAYS` | Integer | `7` | Number of days of historical execution logs to analyze. |
 | `--json` | Flag | `false` | Output stats summary as JSON to stdout. |
+| `--debug` | Flag | `false` | Enable verbose debug logging output to stderr. |
 
 ### Examples
 
@@ -281,11 +314,18 @@ tff info [options]
 | `--project PATH`, `-p PATH` | Directory Path | `.` (current dir) | Project root directory (can be specified multiple times for multi-repo projects). |
 | `--config PATH` | File Path | `fitness_functions.yaml` | Path to fitness functions config. |
 | `--provider` | `auto`, `dbt`, `sqlmesh`, `dataform` | `auto` | Pipeline engine provider. |
+| `--all-adapters`, `--all` | Flag | `false` | Display compatibility and version info for all supported adapters. |
+| `--json` | Flag | `false` | Output configuration and environment information in JSON format to stdout. |
+| `--debug` | Flag | `false` | Enable verbose debug logging output to stderr. |
 
 ### Examples
 
 ```bash
+# View active environment and project diagnostics
 tff info
+
+# View all supported adapters and compatibility
+tff info --all-adapters
 ```
 
 ---
@@ -319,6 +359,7 @@ tff rules
 | `rule` | String (optional) | (none) | Check ID, alias, or category abbreviation (e.g. `duplicate_ctes`, `ban_select_star`, `CoA`, `CoV`, `CoN`). |
 | `--all` | Flag | `false` | Display tabular catalog of all available checks and linter rules. |
 | `--json` | Flag | `false` | Output rule documentation or catalog in JSON format to stdout. |
+| `--debug` | Flag | `false` | Enable verbose debug logging output to stderr. |
 
 ### Examples
 
@@ -338,6 +379,33 @@ tff explain --all
 tff explain duplicate_ctes --json
 ```
 
+### Model Complexity & Decision Points Inspection
+
+When troubleshooting SQL complexity threshold violations (such as cyclomatic decision points, CTE counts, JOINs, or nested subqueries), inspect exact decision points and source line locations for any model or SQL file:
+
+```bash
+# Explain SQL complexity for a specific model
+tff explain sqlcomplexity --model stg_orders
+
+# Shorthand model inspection syntax
+tff explain stg_orders
+tff check explain sqlcomplexity for stg_orders
+
+# Inspect a standalone SQL file directly
+tff explain sqlcomplexity --model path/to/model.sql
+
+# Output complexity metrics and decision points as JSON
+tff explain sqlcomplexity --model stg_orders --json
+```
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--model`, `-m` | String | (none) | Model name or SQL file path to inspect for decision points and complexity metrics. |
+| `--project`, `-p` | Path | `.` | Root directory of the dbt/SQLMesh project. |
+| `--config`, `-c` | Path | (none) | Path to fitness functions config file (`tff.yaml`). |
+| `--dialect` | String | `duckdb` | SQL dialect for parsing (e.g. `duckdb`, `snowflake`, `bigquery`, `postgres`). |
+
+
 ---
 
 ## 12. Output Formats & Integrations
@@ -346,7 +414,7 @@ tff supports multiple structured output formats for seamless CI/CD and tool inte
 
 | Format | CLI Option | Primary Target | Description |
 | :--- | :--- | :--- | :--- |
-| **Terminal Text** | (default) | Local developers, CI terminal | Rich colored ASCII tables, violation callouts, recommendations, and clickable OSC-8 documentation hyperlinks. |
+| **Terminal Text** | (default) | Local developers, CI terminal | Architectural audit ledger, status badges (`ERR`/`WRN`), coupling tags, clickable OSC-8 file coordinates/docs hyperlinks, and prioritized remediation actions. |
 | **JSON** | `--format json` or `--json` | `jq`, custom telemetry, scripts | Pure JSON output of findings, health scores, and metrics. |
 | **SARIF v2.1.0** | `--format sarif` | GitHub Code Scanning | OASIS standard format for GitHub Security Alerts and PR file annotations. |
 | **GitHub Annotations**| `--format github` or `--github-annotations` | GitHub Actions Runners | Emits `::error` and `::warning` workflow commands to annotate changed lines in PRs. |
@@ -370,6 +438,37 @@ All error diagnostics, warnings, and progress indicators are routed exclusively 
 ### Debug Mode & Unexpected Errors
 * **Normal Mode**: Unexpected runtime crashes display a polite summary with a link to the issue tracker and instructions on enabling debug mode.
 * **Debug Mode**: Passing `--debug` (e.g. `tff --debug lint` or `tff lint --debug`) or setting `export TFF_DEBUG=1` reveals full Rich-formatted stack traces for in-depth troubleshooting.
+
+### Per-Model Error Isolation & `rule_execution_error`
+When evaluating rules across large repositories, individual models may encounter unhandled execution errors (for example, syntax errors in unparseable SQL, AST parsing exceptions, or bugs inside custom plugin rules). Rather than terminating the entire linting run and losing visibility into the rest of the project, tff isolates failures to the affected model:
+
+1. **Diagnostic Finding Representation**:
+   * The failure is recorded as an isolated diagnostic finding with check ID `rule_execution_error` and severity `error`.
+   * **Distinction from Quality Violations**: A `rule_execution_error` does not represent a failure to comply with architectural fitness functions (such as naming conventions or layer boundaries). It indicates that the rule or check could not be evaluated for that model.
+2. **Surfacing in CLI Summary & Ledger**:
+   * Appears in the architectural audit ledger with status `ERR`, check `rule_execution_error`, category `[Execution Errors]`, and the underlying exception message:
+     ```text
+     STATUS  LOCATION                                 RULE                  COUPLING
+     ─────────────────────────────────────────────────────────────────────────────────────────────
+     ERR     models/marts/orders.sql                  rule_execution_error  [Execution Errors]
+             ! Rule 'ban_select_star' failed to evaluate: Syntax error near 'QUALIFY' at line 14
+     ```
+   * Appears in the summary table with the count of models encountering execution failures.
+3. **CI Pipelines & Exit Codes**:
+   * Because `rule_execution_error` carries severity `error`, commands such as `tff lint` and `tff check` exit with a non-zero code (`1`) by default (`--fail-level error`).
+   * This ensures broken or un-evaluated models block CI merges rather than silently succeeding.
+4. **Structured CI Reports**:
+   * **SARIF (`--format sarif`)**: Recorded under rule ID `rule_execution_error` with `level: "error"` and the model's file location, creating actionable GitHub Code Scanning alerts.
+   * **GitHub Actions Annotations (`--format github` or `--github-annotations`)**: Emits `::error file=...::Rule '...' failed to evaluate: ...` annotations directly on the model in PR diffs.
+   * **JUnit XML (`--junit-xml`)**: Surfaces as a failed test case in standard CI test tabs.
+5. **Impact on Health Scores (`tff health`)**:
+   * Grouped under the `Execution Errors` category in diagnostic breakdowns.
+   * Because `rule_execution_error` represents an evaluation/infrastructure failure rather than a configured quality metric, its category score is not factored into or penalized against the architectural health score percentage (which measures fitness function conformance).
+6. **Troubleshooting**:
+   * Run with `--debug` or set `export TFF_DEBUG=1` to view the complete Python traceback and internal error context:
+     ```bash
+     tff lint --debug
+     ```
 
 ---
 

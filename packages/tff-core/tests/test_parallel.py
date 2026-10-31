@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pytest
 import sqlglot.expressions as exp
 
+from conftest import _make_model
 from tff.core.config import FitnessFunctionsConfig
 from tff.core.model import ModelRepresentation, read_model_sql
 from tff.core.parallel import (
@@ -83,57 +84,57 @@ def test_precompute_model_asts_sequential_and_filters(tmp_path: Path):
     sql_file = tmp_path / "model_file.sql"
     sql_file.write_text("SELECT 1 AS from_file", encoding="utf-8")
 
-    m1 = ModelRepresentation(
+    m1 = _make_model(
         name="m1",
         path="m1.sql",
         dialect="duckdb",
         query="SELECT 1",
     )
-    m_already_parsed = ModelRepresentation(
+    m_already_parsed = _make_model(
         name="m_already",
         path="m_already.sql",
         dialect="duckdb",
         expression=exp.Literal.number(42),
     )
-    m_external = ModelRepresentation(
+    m_external = _make_model(
         name="m_ext",
         path="ext.sql",
         dialect="duckdb",
         is_external=True,
         query="SELECT 1",
     )
-    m_symbolic = ModelRepresentation(
+    m_symbolic = _make_model(
         name="m_sym",
         path="sym.sql",
         dialect="duckdb",
         is_symbolic=True,
         query="SELECT 1",
     )
-    m_from_path = ModelRepresentation(
+    m_from_path = _make_model(
         name="m_file",
         path=str(sql_file),
         dialect="duckdb",
         query=None,
     )
-    m_nonexistent = ModelRepresentation(
+    m_nonexistent = _make_model(
         name="m_nonexistent",
         path="nonexistent_path_xyz.sql",
         dialect="duckdb",
         query=None,
     )
-    m_empty_path = ModelRepresentation(
+    m_empty_path = _make_model(
         name="m_empty_path",
         path="",
         dialect="duckdb",
         query=None,
     )
-    m_empty_sql = ModelRepresentation(
+    m_empty_sql = _make_model(
         name="m_empty_sql",
         path="empty.sql",
         dialect="duckdb",
         query="   ",
     )
-    m_model_block_only = ModelRepresentation(
+    m_model_block_only = _make_model(
         name="m_model_block_only",
         path="m_block.sql",
         dialect="duckdb",
@@ -144,7 +145,7 @@ def test_precompute_model_asts_sequential_and_filters(tmp_path: Path):
     rel_dir.mkdir(parents=True, exist_ok=True)
     rel_file = rel_dir / "rel_model.sql"
     rel_file.write_text("SELECT 99 AS val", encoding="utf-8")
-    m_rel = ModelRepresentation(
+    m_rel = _make_model(
         name="m_rel",
         path="models/staging/rel_model.sql",
         dialect="duckdb",
@@ -181,7 +182,7 @@ def test_precompute_model_asts_sequential_and_filters(tmp_path: Path):
 def test_precompute_model_asts_read_ioerror(tmp_path: Path):
     bad_file = tmp_path / "bad.sql"
     bad_file.write_text("SELECT 1", encoding="utf-8")
-    m_bad = ModelRepresentation(
+    m_bad = _make_model(
         name="m_bad",
         path=str(bad_file),
         dialect="duckdb",
@@ -202,7 +203,7 @@ def test_precompute_model_asts_cache_hit(tmp_path: Path):
     # Pre-populate cache
     parse_sql_with_cache(sql, dialect, cache_dir=cache_dir)
 
-    model = ModelRepresentation(
+    model = _make_model(
         name="cached_model",
         path="m.sql",
         dialect=dialect,
@@ -216,17 +217,17 @@ def test_precompute_model_asts_cache_hit(tmp_path: Path):
 
 
 def test_precompute_model_asts_parallel_pool(tmp_path: Path):
-    # Multiple models to trigger parallel pool execution (len > 2 and workers > 1)
+    # Multiple models to trigger parallel pool execution (len >= pool_threshold and workers > 1)
     models = {}
     for i in range(5):
-        models[f"model_{i}"] = ModelRepresentation(
+        models[f"model_{i}"] = _make_model(
             name=f"model_{i}",
             path=f"models/m_{i}.sql",
             dialect="duckdb",
             query=f"SELECT {i} AS val, name FROM table_{i}",
         )
 
-    precompute_model_asts(models, project_root=tmp_path, max_workers=2)
+    precompute_model_asts(models, project_root=tmp_path, max_workers=2, pool_threshold=2)
 
     for i in range(5):
         assert models[f"model_{i}"].expression is not None
@@ -236,7 +237,7 @@ def test_precompute_model_asts_parallel_pool(tmp_path: Path):
 def test_precompute_model_asts_parallel_pool_fallback(tmp_path: Path):
     models = {}
     for i in range(4):
-        models[f"model_{i}"] = ModelRepresentation(
+        models[f"model_{i}"] = _make_model(
             name=f"model_{i}",
             path=f"models/m_{i}.sql",
             dialect="duckdb",
@@ -248,10 +249,44 @@ def test_precompute_model_asts_parallel_pool_fallback(tmp_path: Path):
         "tff.core.parallel.ProcessPoolExecutor",
         side_effect=RuntimeError("Process pool unavailable"),
     ):
-        precompute_model_asts(models, project_root=tmp_path, max_workers=2)
+        precompute_model_asts(models, project_root=tmp_path, max_workers=2, pool_threshold=2)
 
     for i in range(4):
         assert models[f"model_{i}"].expression is not None
+
+
+def _threshold_models(n: int) -> dict[str, ModelRepresentation]:
+    return {
+        f"model_{i}": _make_model(
+            name=f"model_{i}",
+            path=f"models/m_{i}.sql",
+            dialect="duckdb",
+            query=f"SELECT {i} AS val",
+        )
+        for i in range(n)
+    }
+
+
+@pytest.mark.parametrize(
+    ("env_value", "expect_pool"),
+    [(None, False), ("2", True), ("not-a-number", False)],
+)
+def test_precompute_model_asts_pool_threshold_env(tmp_path, monkeypatch, env_value, expect_pool):
+    monkeypatch.setenv("TFF_NO_CACHE", "1")
+    if env_value is None:
+        monkeypatch.delenv("TFF_PROCESS_POOL_THRESHOLD", raising=False)
+    else:
+        monkeypatch.setenv("TFF_PROCESS_POOL_THRESHOLD", env_value)
+    models = _threshold_models(4)
+
+    with patch(
+        "tff.core.parallel.ProcessPoolExecutor",
+        side_effect=RuntimeError("pool spawned"),
+    ) as mock_pool:
+        precompute_model_asts(models, project_root=tmp_path, max_workers=2)
+
+    assert mock_pool.called is expect_pool
+    assert all(m.expression is not None for m in models.values())
 
 
 def test_run_parallel_model_rule_sequential():
@@ -260,9 +295,9 @@ def test_run_parallel_model_rule_sequential():
 
     # Sequential rule execution (<= 20 models)
     models = [
-        ModelRepresentation(name="foo_model", path="models/foo.sql", dialect="duckdb"),
-        ModelRepresentation(name="bar_model", path="models/bar.sql", dialect="duckdb"),
-        ModelRepresentation(name="external_foo", path="ext.sql", dialect="duckdb", is_external=True),
+        _make_model(name="foo_model", path="models/foo.sql", dialect="duckdb"),
+        _make_model(name="bar_model", path="models/bar.sql", dialect="duckdb"),
+        _make_model(name="external_foo", path="ext.sql", dialect="duckdb", is_external=True),
     ]
 
     findings = run_parallel_model_rule(
@@ -283,7 +318,7 @@ def test_run_parallel_model_rule_multithreaded():
     for i in range(25):
         name = f"foo_{i}" if i % 2 == 0 else f"bar_{i}"
         models.append(
-            ModelRepresentation(
+            _make_model(
                 name=name,
                 path=f"models/{name}.sql",
                 dialect="duckdb",
@@ -306,7 +341,7 @@ def test_precompute_model_asts_custom_cache_dir(tmp_path: Path):
     custom_dir = tmp_path / "custom_cache"
     cfg = FitnessFunctionsConfig(cache_dir=str(custom_dir))
 
-    model = ModelRepresentation(
+    model = _make_model(
         name="custom_cached_model",
         path="m.sql",
         dialect="duckdb",
@@ -330,13 +365,13 @@ def test_precompute_model_asts_directory_and_invalid_path(tmp_path: Path):
     sub_dir = tmp_path / "models_dir"
     sub_dir.mkdir()
 
-    m_dir = ModelRepresentation(
+    m_dir = _make_model(
         name="m_dir",
         path=str(sub_dir),
         dialect="duckdb",
         query=None,
     )
-    m_invalid = ModelRepresentation(
+    m_invalid = _make_model(
         name="m_invalid",
         path="\0invalid",
         dialect="duckdb",
@@ -353,7 +388,7 @@ def test_precompute_model_asts_directory_and_invalid_path(tmp_path: Path):
 def test_precompute_model_asts_invokes_read_model_sql(tmp_path: Path):
     f = tmp_path / "model.sql"
     f.write_text("SELECT 42", encoding="utf-8")
-    m = ModelRepresentation(
+    m = _make_model(
         name="m",
         path="model.sql",
         dialect="duckdb",
@@ -368,7 +403,7 @@ def test_precompute_model_asts_invokes_read_model_sql(tmp_path: Path):
 
 def test_run_parallel_model_rule_explicit_chunk_size():
     models = [
-        ModelRepresentation(
+        _make_model(
             name=f"foo_{i}" if i % 3 == 0 else f"bar_{i}",
             path=f"models/{i}.sql",
             dialect="duckdb",
@@ -391,7 +426,7 @@ def test_run_parallel_model_rule_explicit_chunk_size():
 
 def test_run_parallel_model_rule_env_var_chunk_size(monkeypatch: pytest.MonkeyPatch):
     models = [
-        ModelRepresentation(
+        _make_model(
             name=f"foo_{i}" if i % 2 == 0 else f"bar_{i}",
             path=f"models/{i}.sql",
             dialect="duckdb",
@@ -422,11 +457,46 @@ def test_run_parallel_model_rule_env_var_chunk_size(monkeypatch: pytest.MonkeyPa
     assert len(findings_fallback) == 13
 
 
+def test_run_parallel_model_rule_config_chunk_size():
+    models = [
+        _make_model(
+            name=f"foo_{i}" if i % 2 == 0 else f"bar_{i}",
+            path=f"models/{i}.sql",
+            dialect="duckdb",
+        )
+        for i in range(25)
+    ]
+    # Valid config.chunk_size
+    cfg = FitnessFunctionsConfig(chunk_size=6)
+    findings = run_parallel_model_rule(
+        rule_cls=DummyBanFooRule,
+        models=models,
+        config=cfg,
+        severity="error",
+        check_name="dummy_ban_foo",
+        max_workers=2,
+    )
+    assert len(findings) == 13
+
+    # Invalid config.chunk_size (mocked/bypassed) handled gracefully
+    cfg_invalid = FitnessFunctionsConfig()
+    cfg_invalid.__dict__["chunk_size"] = "invalid"
+    findings_invalid = run_parallel_model_rule(
+        rule_cls=DummyBanFooRule,
+        models=models,
+        config=cfg_invalid,
+        severity="error",
+        check_name="dummy_ban_foo",
+        max_workers=2,
+    )
+    assert len(findings_invalid) == 13
+
+
 def test_run_parallel_model_rule_large_model_volume():
     """Verify high-volume model repository (>1000 models) chunking and correctness."""
     total_models = 1200
     models = [
-        ModelRepresentation(
+        _make_model(
             name=f"foo_{i}" if i % 10 == 0 else f"bar_{i}",
             path=f"models/{i}.sql",
             dialect="duckdb",
@@ -449,7 +519,7 @@ def test_run_parallel_model_rule_large_model_volume():
 def test_check_single_model_backwards_compatibility():
     from tff.core.parallel import _check_single_model
 
-    model = ModelRepresentation(name="foo_compat", path="models/foo.sql", dialect="duckdb")
+    model = _make_model(name="foo_compat", path="models/foo.sql", dialect="duckdb")
     res = _check_single_model((DummyBanFooRule, None, model, "error", "dummy_ban_foo"))
     assert len(res) == 1
     assert res[0].model == "foo_compat"
@@ -467,7 +537,7 @@ def test_check_models_batch_instantiation_failure():
             return None
 
     models = [
-        ModelRepresentation(name=f"m_{i}", path=f"models/{i}.sql", dialect="duckdb")
+        _make_model(name=f"m_{i}", path=f"models/{i}.sql", dialect="duckdb")
         for i in range(3)
     ]
 

@@ -1,24 +1,24 @@
-
 from sqlglot import exp
+import pytest
+from conftest import _make_model
 from tff.core.checks.connascence_of_value import (
     collect_connascence_of_value_findings,
     is_ignored_literal,
 )
 from tff.core.config import FitnessFunctionsConfig
-from tff.core.model import ModelRepresentation
 
 
 def test_cov_no_duplicates():
     config = FitnessFunctionsConfig()
     config.checks.connascence_of_value.enabled = True
 
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_a') }} WHERE status = 'active'",
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -35,13 +35,13 @@ def test_cov_with_duplicates():
     config.checks.connascence_of_value.enabled = True
     config.checks.connascence_of_value.min_occurrences = 2
 
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_a') }} WHERE status = 'active'",
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -57,16 +57,19 @@ def test_cov_with_duplicates():
     assert all(f.check == "connascence_of_value" for f in findings)
     assert all(f.severity == "warning" for f in findings)
     assert all(f.path is not None and "models/marts" in f.path for f in findings)
-    
+
     # Original case preserved per model
     m1_finding = [f for f in findings if f.model == "model1"][0]
     m2_finding = [f for f in findings if f.model == "model2"][0]
-    
+
     assert "Literal 'active'" in m1_finding.message
     assert "Literal 'Active'" in m2_finding.message
     assert "(CoV)" in m1_finding.message
     assert "Centralize via macro, seed, or upstream model." in m1_finding.message
-    assert "https://tff.readthedocs.io/en/latest/rules_and_checks/#connascence-of-value-connascence_of_value" in m1_finding.message
+    assert (
+        "https://tff.readthedocs.io/en/latest/rules_and_checks/#connascence-of-value-connascence_of_value"
+        in m1_finding.message
+    )
 
 
 def test_cov_ignored_values():
@@ -75,13 +78,13 @@ def test_cov_ignored_values():
     # 'active' is now ignored
     config.checks.connascence_of_value.ignored_values = ["0", "1", "", "active"]
 
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_a') }} WHERE status = 'active' AND val = 0",
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -97,13 +100,13 @@ def test_cov_negated_literals():
     config = FitnessFunctionsConfig()
     config.checks.connascence_of_value.enabled = True
 
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_a') }} WHERE val = -5",
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -121,13 +124,13 @@ def test_cov_limit_offset_ignored():
     config.checks.connascence_of_value.enabled = True
 
     # 100 and 10 are duplicated in LIMIT and OFFSET
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_a') }} LIMIT 100 OFFSET 10",
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -145,13 +148,13 @@ def test_cov_layer_filtering():
     config.checks.connascence_of_value.skip_layers = ["sources"]
 
     # sources/model1.sql is in 'sources' layer, marts/model2.sql is in 'marts' layer.
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/sources/model1.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_a') }} WHERE status = 'active'",
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -168,13 +171,13 @@ def test_cov_disabled():
     config = FitnessFunctionsConfig()
     config.checks.connascence_of_value.enabled = False
 
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_a') }} WHERE status = 'active'",
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -191,13 +194,13 @@ def test_cov_unparseable_query():
     config.checks.connascence_of_value.enabled = True
 
     # model with unparseable query (syntax error causing parsed to be None)
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query="SELECT * FROM WHERE",
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -214,13 +217,13 @@ def test_cov_duplicate_within_single_model():
     config.checks.connascence_of_value.enabled = True
 
     # status = 'active' occurs twice in model1, but only once in model2.
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_a') }} WHERE status = 'active' OR status2 = 'active'",
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -240,7 +243,7 @@ def test_cov_multiple_other_occurrences():
     # literal duplicated across 4 models (so 3 other occurrences for each)
     models = {}
     for i in range(1, 5):
-        models[f"model{i}"] = ModelRepresentation(
+        models[f"model{i}"] = _make_model(
             name=f"model{i}",
             path=f"models/marts/model{i}.sql",
             dialect="postgres",
@@ -249,10 +252,22 @@ def test_cov_multiple_other_occurrences():
 
     findings = collect_connascence_of_value_findings(models, config)
     assert len(findings) == 4
-    
-    # Message should use oxford comma list
+
+    # Message should use oxford comma list with single 'models' prefix
     finding_m1 = [f for f in findings if f.model == "model1"][0]
-    assert "model 'model2', model 'model3', and model 'model4'" in finding_m1.message
+    assert "models 'model2', 'model3', and 'model4'" in finding_m1.message
+
+    # Test 3 models (2 other occurrences: 'models A and B')
+    models_3 = {k: models[k] for k in ["model1", "model2", "model3"]}
+    findings_3 = collect_connascence_of_value_findings(models_3, config)
+    f3_m1 = [f for f in findings_3 if f.model == "model1"][0]
+    assert "models 'model2' and 'model3'" in f3_m1.message
+
+    # Test 2 models (1 other occurrence: 'model A')
+    models_2 = {k: models[k] for k in ["model1", "model2"]}
+    findings_2 = collect_connascence_of_value_findings(models_2, config)
+    f2_m1 = [f for f in findings_2 if f.model == "model1"][0]
+    assert "model 'model2'" in f2_m1.message
 
 
 def test_cov_structural_sql_literals_ignored():
@@ -272,13 +287,13 @@ def test_cov_structural_sql_literals_ignored():
     ]
 
     for q in queries:
-        model1 = ModelRepresentation(
+        model1 = _make_model(
             name="model1",
             path="models/marts/model1.sql",
             dialect="postgres",
             query=q,
         )
-        model2 = ModelRepresentation(
+        model2 = _make_model(
             name="model2",
             path="models/marts/model2.sql",
             dialect="postgres",
@@ -286,7 +301,9 @@ def test_cov_structural_sql_literals_ignored():
         )
         models = {"model1": model1, "model2": model2}
         findings = collect_connascence_of_value_findings(models, config)
-        assert len(findings) == 0, f"Expected 0 findings for query: {q}, got: {findings}"
+        assert len(findings) == 0, (
+            f"Expected 0 findings for query: {q}, got: {findings}"
+        )
 
 
 def test_cov_domain_reuse_fixtures_warn():
@@ -295,36 +312,40 @@ def test_cov_domain_reuse_fixtures_warn():
     config.checks.connascence_of_value.min_occurrences = 2
 
     # 1. WHERE status = 'premium'
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_a') }} WHERE status = 'premium'",
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_b') }} WHERE status = 'premium'",
     )
-    findings = collect_connascence_of_value_findings({"model1": model1, "model2": model2}, config)
+    findings = collect_connascence_of_value_findings(
+        {"model1": model1, "model2": model2}, config
+    )
     assert len(findings) == 2
     assert all("premium" in f.message for f in findings)
 
     # 2. decode(tech_id, 2, '<value>', 'default')
-    model3 = ModelRepresentation(
+    model3 = _make_model(
         name="model3",
         path="models/marts/model3.sql",
         dialect="postgres",
         query="SELECT decode(tech_id, 2, '<value>', 'default') FROM {{ ref('stg_a') }}",
     )
-    model4 = ModelRepresentation(
+    model4 = _make_model(
         name="model4",
         path="models/marts/model4.sql",
         dialect="postgres",
         query="SELECT decode(tech_id, 2, '<value>', 'default') FROM {{ ref('stg_b') }}",
     )
-    findings_decode = collect_connascence_of_value_findings({"model3": model3, "model4": model4}, config)
+    findings_decode = collect_connascence_of_value_findings(
+        {"model3": model3, "model4": model4}, config
+    )
     # Literals 2, '<value>', and 'default' are duplicated across model3 and model4
     flagged_literals = {f.message for f in findings_decode}
     assert any("Literal '2'" in msg for msg in flagged_literals)
@@ -336,13 +357,13 @@ def test_cov_ignored_punctuation():
     config = FitnessFunctionsConfig()
     config.checks.connascence_of_value.enabled = True
 
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query="SELECT col1 || ' - ' || col2, col3 || ':' || col4 FROM {{ ref('stg_a') }}",
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -355,19 +376,21 @@ def test_cov_ignored_punctuation():
     # If ignored_punctuation is cleared, punctuation characters trigger if duplicated
     config.checks.connascence_of_value.ignored_punctuation = []
     # Test with a standalone punctuation string not in DPipe
-    model3 = ModelRepresentation(
+    model3 = _make_model(
         name="model3",
         path="models/marts/model3.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_a') }} WHERE delim = ':'",
     )
-    model4 = ModelRepresentation(
+    model4 = _make_model(
         name="model4",
         path="models/marts/model4.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_b') }} WHERE delim = ':'",
     )
-    findings_punct = collect_connascence_of_value_findings({"model3": model3, "model4": model4}, config)
+    findings_punct = collect_connascence_of_value_findings(
+        {"model3": model3, "model4": model4}, config
+    )
     assert len(findings_punct) == 2
     assert "Literal ':'" in findings_punct[0].message
 
@@ -376,13 +399,13 @@ def test_cov_negated_with_parentheses():
     config = FitnessFunctionsConfig()
     config.checks.connascence_of_value.enabled = True
 
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_a') }} WHERE val = -(99)",
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -398,20 +421,36 @@ def test_is_ignored_literal_standalone_node():
     node = exp.Literal.number(42)
     assert is_ignored_literal(node) is False
 
+    # Bracket index vs container
+    key_lit = exp.Literal.string("status")
+    exp.Bracket(this=exp.Column(this=exp.Identifier(this="obj")), expressions=[key_lit])
+    assert is_ignored_literal(key_lit) is True
+    # Container literal inside bracket, e.g. 'literal_str'[0]
+    str_lit = exp.Literal.string("hello")
+    exp.Bracket(this=str_lit, expressions=[exp.Literal.number(0)])
+    assert is_ignored_literal(str_lit) is False
+
+    # GetExtract / StructExtract / JSONExtract property
+    exp.GetExtract(this=exp.Column(this=exp.Identifier(this="obj")), expression=key_lit)
+    assert is_ignored_literal(key_lit) is True
+    # If target is container of GetExtract, not ignored
+    exp.GetExtract(this=str_lit, expression=exp.Literal.string("prop"))
+    assert is_ignored_literal(str_lit) is False
+
 
 def test_cov_does_not_rewrite_email_or_regex_at_symbols():
     config = FitnessFunctionsConfig()
     config.checks.connascence_of_value.enabled = True
     config.checks.connascence_of_value.min_occurrences = 2
 
-    model1 = ModelRepresentation(
+    model1 = _make_model(
         name="model1",
         path="models/marts/model1.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_a') }} WHERE regexp_like(email, '.@gmail.com')",
         provider="dbt",
     )
-    model2 = ModelRepresentation(
+    model2 = _make_model(
         name="model2",
         path="models/marts/model2.sql",
         dialect="postgres",
@@ -427,21 +466,348 @@ def test_cov_does_not_rewrite_email_or_regex_at_symbols():
         assert "Literal '.@gmail.com'" in f.message
 
     # Also test without provider specified (defaulting to provider=None)
-    model3 = ModelRepresentation(
+    model3 = _make_model(
         name="model3",
         path="models/marts/model3.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_a') }} WHERE email = 'support@company.com'",
     )
-    model4 = ModelRepresentation(
+    model4 = _make_model(
         name="model4",
         path="models/marts/model4.sql",
         dialect="postgres",
         query="SELECT * FROM {{ ref('stg_b') }} WHERE email = 'support@company.com'",
     )
-    findings_none = collect_connascence_of_value_findings({"model3": model3, "model4": model4}, config)
+    findings_none = collect_connascence_of_value_findings(
+        {"model3": model3, "model4": model4}, config
+    )
     assert len(findings_none) == 2
     for f in findings_none:
         assert "__sqlmesh_macro__" not in f.message
         assert "Literal 'support@company.com'" in f.message
 
+
+def test_cov_min_length_ignores_tiny_string_literals():
+    config = FitnessFunctionsConfig()
+    config.checks.connascence_of_value.enabled = True
+    config.checks.connascence_of_value.min_occurrences = 2
+    config.checks.connascence_of_value.min_length = 3
+    # Clear ignored_values to verify min_length alone ignores '0', '-1', '', '3'
+    config.checks.connascence_of_value.ignored_values = []
+
+    model1 = _make_model(
+        name="model1",
+        path="models/marts/model1.sql",
+        dialect="postgres",
+        query="SELECT * FROM {{ ref('stg_a') }} WHERE code = '0' AND status = '-1' AND flag = '' AND typ = '3' AND category = 'active'",
+    )
+    model2 = _make_model(
+        name="model2",
+        path="models/marts/model2.sql",
+        dialect="postgres",
+        query="SELECT * FROM {{ ref('stg_b') }} WHERE code = '0' AND status = '-1' AND flag = '' AND typ = '3' AND category = 'active'",
+    )
+
+    models = {"model1": model1, "model2": model2}
+    findings = collect_connascence_of_value_findings(models, config)
+
+    # Only 'active' (len 6 >= 3) should trigger findings; '0', '-1', '', '3' are ignored
+    assert len(findings) == 2
+    for f in findings:
+        assert "Literal 'active'" in f.message
+        assert "Literal '0'" not in f.message
+        assert "Literal '-1'" not in f.message
+        assert "Literal ''" not in f.message
+        assert "Literal '3'" not in f.message
+
+
+def test_cov_min_length_does_not_ignore_numbers():
+    config = FitnessFunctionsConfig()
+    config.checks.connascence_of_value.enabled = True
+    config.checks.connascence_of_value.min_occurrences = 2
+    config.checks.connascence_of_value.min_length = 5
+    config.checks.connascence_of_value.ignored_values = []
+
+    model1 = _make_model(
+        name="model1",
+        path="models/marts/model1.sql",
+        dialect="postgres",
+        query="SELECT * FROM {{ ref('stg_a') }} WHERE id = 42 AND str_val = 'hi'",
+    )
+    model2 = _make_model(
+        name="model2",
+        path="models/marts/model2.sql",
+        dialect="postgres",
+        query="SELECT * FROM {{ ref('stg_b') }} WHERE id = 42 AND str_val = 'hi'",
+    )
+
+    models = {"model1": model1, "model2": model2}
+    findings = collect_connascence_of_value_findings(models, config)
+
+    # 42 is a numeric literal so min_length does not ignore it; 'hi' is string len 2 < 5 so it is ignored
+    assert len(findings) == 2
+    for f in findings:
+        assert "Literal '42'" in f.message
+        assert "Literal 'hi'" not in f.message
+
+
+def test_cov_min_string_length_alias():
+    config = FitnessFunctionsConfig.model_validate(
+        {
+            "checks": {
+                "connascence_of_value": {
+                    "enabled": True,
+                    "min_occurrences": 2,
+                    "min_string_length": 4,
+                    "ignored_values": [],
+                }
+            }
+        }
+    )
+    assert config.checks.connascence_of_value.min_length == 4
+
+    model1 = _make_model(
+        name="model1",
+        path="models/marts/model1.sql",
+        dialect="postgres",
+        query="SELECT * FROM {{ ref('stg_a') }} WHERE val = 'abc' AND cat = 'good'",
+    )
+    model2 = _make_model(
+        name="model2",
+        path="models/marts/model2.sql",
+        dialect="postgres",
+        query="SELECT * FROM {{ ref('stg_b') }} WHERE val = 'abc' AND cat = 'good'",
+    )
+
+    models = {"model1": model1, "model2": model2}
+    findings = collect_connascence_of_value_findings(models, config)
+
+    # 'abc' (len 3 < 4) ignored; 'good' (len 4 >= 4) flagged
+    assert len(findings) == 2
+    for f in findings:
+        assert "Literal 'good'" in f.message
+        assert "Literal 'abc'" not in f.message
+
+
+@pytest.mark.parametrize(
+    ("dialect", "query"),
+    [
+        (
+            "snowflake",
+            "SELECT jsontext['status']::varchar as pto_status FROM {{ ref('stg_a') }}",
+        ),
+        ("snowflake", "SELECT new_value['status'] as status FROM {{ ref('stg_a') }}"),
+        ("snowflake", "SELECT jsontext['user']['status'] FROM {{ ref('stg_a') }}"),
+        ("snowflake", "SELECT GET(jsontext, 'status') FROM {{ ref('stg_a') }}"),
+        ("snowflake", "SELECT STRUCT_EXTRACT(data, 'status') FROM {{ ref('stg_a') }}"),
+        ("bigquery", "SELECT data['status'] as status FROM {{ ref('stg_a') }}"),
+        ("duckdb", "SELECT payload['status'] as status FROM {{ ref('stg_a') }}"),
+        ("duckdb", "SELECT arr[0], arr[1] FROM {{ ref('stg_a') }}"),
+        ("postgres", "SELECT data['status'] FROM {{ ref('stg_a') }}"),
+    ],
+)
+def test_cov_bracket_and_json_field_access_ignored(dialect: str, query: str):
+    config = FitnessFunctionsConfig()
+    config.checks.connascence_of_value.enabled = True
+    config.checks.connascence_of_value.min_occurrences = 2
+
+    model1 = _make_model(
+        name="model1",
+        path="models/marts/model1.sql",
+        dialect=dialect,
+        query=query,
+    )
+    model2 = _make_model(
+        name="model2",
+        path="models/marts/model2.sql",
+        dialect=dialect,
+        query=query,
+    )
+    findings = collect_connascence_of_value_findings(
+        {"model1": model1, "model2": model2}, config
+    )
+    assert len(findings) == 0
+
+
+def test_cov_repeated_column_alias_and_comment_not_flagged():
+    config = FitnessFunctionsConfig()
+    config.checks.connascence_of_value.enabled = True
+    config.checks.connascence_of_value.min_occurrences = 2
+
+    query = """
+    -- Primary Key status ...
+    WITH transformed AS (
+        SELECT new_value['status'] AS status FROM {{ ref('stg_a') }}
+    )
+    SELECT status FROM transformed
+    """
+    model1 = _make_model(
+        name="model1",
+        path="models/marts/model1.sql",
+        dialect="snowflake",
+        query=query,
+    )
+    model2 = _make_model(
+        name="model2",
+        path="models/marts/model2.sql",
+        dialect="snowflake",
+        query=query,
+    )
+    findings = collect_connascence_of_value_findings(
+        {"model1": model1, "model2": model2}, config
+    )
+    assert len(findings) == 0
+
+
+def test_cov_genuine_literal_in_where_clause_still_flagged():
+    config = FitnessFunctionsConfig()
+    config.checks.connascence_of_value.enabled = True
+    config.checks.connascence_of_value.min_occurrences = 2
+
+    model1 = _make_model(
+        name="model1",
+        path="models/marts/model1.sql",
+        dialect="snowflake",
+        query="SELECT * FROM {{ ref('stg_a') }} WHERE audit_field IN ('status')",
+    )
+    model2 = _make_model(
+        name="model2",
+        path="models/marts/model2.sql",
+        dialect="snowflake",
+        query="SELECT * FROM {{ ref('stg_b') }} WHERE status = 'status'",
+    )
+    findings = collect_connascence_of_value_findings(
+        {"model1": model1, "model2": model2}, config
+    )
+    assert len(findings) == 2
+    assert all("Literal 'status'" in f.message for f in findings)
+
+
+def test_cov_initcap_delimiters_ignored():
+    config = FitnessFunctionsConfig()
+    config.checks.connascence_of_value.enabled = True
+    config.checks.connascence_of_value.min_occurrences = 2
+
+    # In Snowflake, INITCAP(col) synthesizes default delimiter characters in sqlglot.
+    model1 = _make_model(
+        name="model1",
+        path="models/marts/model1.sql",
+        dialect="snowflake",
+        query="SELECT INITCAP(first_name) FROM {{ ref('stg_a') }}",
+    )
+    model2 = _make_model(
+        name="model2",
+        path="models/marts/model2.sql",
+        dialect="snowflake",
+        query="SELECT INITCAP(last_name) FROM {{ ref('stg_b') }}",
+    )
+    findings = collect_connascence_of_value_findings(
+        {"model1": model1, "model2": model2}, config
+    )
+    assert len(findings) == 0
+
+    # Explicit custom delimiters are also ignored
+    model3 = _make_model(
+        name="model3",
+        path="models/marts/model3.sql",
+        dialect="snowflake",
+        query="SELECT INITCAP(first_name, ' -') FROM {{ ref('stg_a') }}",
+    )
+    model4 = _make_model(
+        name="model4",
+        path="models/marts/model4.sql",
+        dialect="snowflake",
+        query="SELECT INITCAP(last_name, ' -') FROM {{ ref('stg_b') }}",
+    )
+    findings_custom = collect_connascence_of_value_findings(
+        {"model3": model3, "model4": model4}, config
+    )
+    assert len(findings_custom) == 0
+
+    # But genuine string literals passed as the input target string to INITCAP are still checked
+    model5 = _make_model(
+        name="model5",
+        path="models/marts/model5.sql",
+        dialect="snowflake",
+        query="SELECT INITCAP('hardcoded_value') FROM {{ ref('stg_a') }}",
+    )
+    model6 = _make_model(
+        name="model6",
+        path="models/marts/model6.sql",
+        dialect="snowflake",
+        query="SELECT INITCAP('hardcoded_value') FROM {{ ref('stg_b') }}",
+    )
+    findings_target = collect_connascence_of_value_findings(
+        {"model5": model5, "model6": model6}, config
+    )
+    assert len(findings_target) == 2
+    assert all("Literal 'hardcoded_value'" in f.message for f in findings_target)
+
+
+def test_cov_multiline_literal_escaped_in_message():
+    config = FitnessFunctionsConfig()
+    config.checks.connascence_of_value.enabled = True
+    config.checks.connascence_of_value.min_occurrences = 2
+
+    model1 = _make_model(
+        name="model1",
+        path="models/marts/model1.sql",
+        dialect="postgres",
+        query="SELECT * FROM {{ ref('stg_a') }} WHERE note = 'line1\nline2\r\ttab'",
+    )
+    model2 = _make_model(
+        name="model2",
+        path="models/marts/model2.sql",
+        dialect="postgres",
+        query="SELECT * FROM {{ ref('stg_b') }} WHERE note = 'line1\nline2\r\ttab'",
+    )
+    findings = collect_connascence_of_value_findings(
+        {"model1": model1, "model2": model2}, config
+    )
+    assert len(findings) == 2
+    for f in findings:
+        assert "\n" not in f.message
+        assert "\r" not in f.message
+        assert "Literal 'line1\\nline2\\r\\ttab'" in f.message
+
+
+def test_format_literal_display_truncation():
+    from tff.core.checks.connascence_of_value import format_literal_display
+
+    short_val = "short string"
+    assert format_literal_display(short_val) == "short string"
+
+    long_val = "A" * 100
+    formatted = format_literal_display(long_val, max_len=80)
+    assert len(formatted) == 83  # 80 chars + "..."
+    assert formatted == ("A" * 80) + "..."
+
+    # Zero or negative max_len disables truncation
+    assert format_literal_display(long_val, max_len=0) == long_val
+
+
+def test_cov_long_literal_truncated_in_finding_message():
+    config = FitnessFunctionsConfig()
+    config.checks.connascence_of_value.enabled = True
+    config.checks.connascence_of_value.min_occurrences = 2
+
+    long_str = "x" * 120
+    model1 = _make_model(
+        name="model1",
+        path="models/marts/model1.sql",
+        dialect="postgres",
+        query=f"SELECT * FROM {{{{ ref('stg_a') }}}} WHERE note = '{long_str}'",
+    )
+    model2 = _make_model(
+        name="model2",
+        path="models/marts/model2.sql",
+        dialect="postgres",
+        query=f"SELECT * FROM {{{{ ref('stg_b') }}}} WHERE note = '{long_str}'",
+    )
+    findings = collect_connascence_of_value_findings(
+        {"model1": model1, "model2": model2}, config
+    )
+    assert len(findings) == 2
+    expected_preview = ("x" * 80) + "..."
+    for f in findings:
+        assert f"Literal '{expected_preview}' is duplicated" in f.message

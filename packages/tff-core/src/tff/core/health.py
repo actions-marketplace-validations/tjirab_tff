@@ -1,14 +1,35 @@
-"""Scoring logic and Rich report rendering for project health."""
+"""Scoring logic and Rich report rendering for project health.
+ 
+ Formula Weight Calibration Guidelines:
+ --------------------------------------
+ When implementing new checks or rules, adhere to the following weight calibration bounds:
+ 1. Architectural DAG / Cross-Model Checks (e.g. layer_integrity, dependency_graph):
+    - Typical weights: 2.0 - 3.0
+    - Project-level penalties: 100.0 (error), 50.0 (warning)
+ 2. Semantic & Connascence Coupling Checks (e.g. duplicate_ctes, join_type_parity, connascence_of_value):
+    - Typical weights: 1.5 - 2.0
+    - Model-level penalties: 1.0 (error), 0.5 (warning)
+ 3. Single-Model Linter Rules (e.g. ban_select_star, no_positional_group_by):
+    - Typical weights: 1.0
+    - Model-level penalties: 1.0 (error), 0.5 (warning)
+ 4. Style & Metadata Hygiene (e.g. mart_naming, metadata, column_names):
+    - Typical weights: 0.5 - 1.0
+    - Model-level penalties: 1.0 (error), 0.5 (warning)
+ 
+ Stability and Drift Tolerances:
+ -------------------------------
+ - Overall and check-level scores must strictly fall within [0.0, 100.0].
+ - Minor releases must maintain mathematical score determinism; calibrated reference
+   graphs (examples/minimal-*) must remain invariant within a tolerance of ±0.01 points.
+ """
 
 from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
-from rich import box
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
@@ -127,6 +148,7 @@ def calculate_health_scores(
     *,
     scope: list[str] | None = None,
     scoped_models_count: int | None = None,
+    project_root: Path | Sequence[Path] | None = None,
 ) -> dict[str, Any]:
     """Calculate health scores based on findings and enabled checks.
 
@@ -273,14 +295,77 @@ def calculate_health_scores(
         else:
             overall_score = sum(check_scores.values()) / len(enabled_checks)
 
-    return {
+    result: dict[str, Any] = {
         "overall_score": overall_score,
         "check_scores": check_scores,
         "category_scores": category_scores,
         "enabled_checks": enabled_checks,
         "check_findings": check_findings,
         "check_weights": check_weights,
+        "models_checked": models_checked,
     }
+    result["by_domain"] = calculate_domain_health(
+        result, config=config, project_root=project_root
+    )
+    return result
+
+
+DIMENSION_DISPLAY_NAMES: dict[str, str] = {
+    "Dynamic Coupling & DAG Structure": "Architecture & DAG",
+    "Quality & Metadata (Non-Connascence)": "Contract & Metadata",
+    "Connascence of Algorithm (CoA)": "Connascence of Algorithm",
+    "Connascence of Position (CoP)": "Connascence of Position",
+    "Connascence of Value (CoV)": "Connascence of Value",
+    "Connascence of Name (CoN)": "Connascence of Name",
+    "Connascence of Type (CoT)": "Connascence of Type",
+    "Connascence of Meaning (CoM)": "Connascence of Meaning",
+}
+
+SHORT_CHECK_LABELS: dict[str, str] = {
+    "layer_integrity": "layer",
+    "duplicate_ctes": "dup_cte",
+    "banselectstar": "star",
+    "ban_select_star": "star",
+    "nomissingowner": "owner",
+    "nomissingdescription": "desc",
+    "nomissinggrain": "grain",
+    "join_type_parity": "join_parity",
+    "classificationmacros": "macro",
+    "classification_macros": "macro",
+    "sqlcomplexity": "complexity",
+    "sql_complexity": "complexity",
+    "nopositionalgroupby": "group_pos",
+    "no_positional_group_by": "group_pos",
+    "nopositionalorderby": "order_pos",
+    "no_positional_order_by": "order_pos",
+    "nopositionalgroupbyororderby": "position",
+    "no_positional_group_by_or_order_by": "position",
+    "schema_contracts": "contract",
+    "dependency_graph": "graph",
+    "materialization_depth": "depth",
+    "connascence_of_value": "value",
+    "filenameequalsmodelname": "filename",
+    "filename_equals_modelname": "filename",
+}
+
+
+def _get_action_phrase(check: str, count: int) -> str:
+    """Format an actionable remediation command."""
+    if check == "duplicate_ctes":
+        return f"Refactor {count} duplicate CTE{'s' if count != 1 else ''}"
+    if check == "layer_integrity":
+        return f"Fix {count} layer integrity violation{'s' if count != 1 else ''}"
+    if check in ("banselectstar", "ban_select_star"):
+        return f"Replace {count} wildcard SELECT * {'query' if count == 1 else 'queries'}"
+    if check in ("nomissingowner", "nomissingdescription", "nomissinggrain"):
+        return f"Add missing contract metadata to {count} model{'s' if count != 1 else ''}"
+    if check == "join_type_parity":
+        return f"Align data types across {count} JOIN condition{'s' if count != 1 else ''}"
+    if check in ("nopositionalgroupby", "no_positional_group_by"):
+        return f"Replace {count} positional GROUP BY reference{'s' if count != 1 else ''}"
+    if check in ("nopositionalorderby", "no_positional_order_by"):
+        return f"Replace {count} positional ORDER BY reference{'s' if count != 1 else ''}"
+    return f"Resolve {count} {CHECK_LABELS.get(check, check)} defect{'s' if count != 1 else ''}"
 
 
 def make_progress_bar(score: float, width: int = 15) -> str:
@@ -303,103 +388,147 @@ def render_health_report(
     *,
     group_by: str = "connascence",
     duration: float | None = None,
+    fail_under: float | None = None,
+    verbose: bool = False,
+    project_root: Path | None = None,
 ) -> None:
-    """Render a beautiful CLI health report using rich.
-
-    Parameters
-    ----------
-    group_by:
-        ``"connascence"`` (default) groups the detailed breakdown by
-        connascence category.  ``"domain"`` groups by the path segment
-        directly under ``models/`` and optionally a sub-domain, e.g.
-        ``models/sources``, ``models/marts/marketing``.
-    duration:
-        Execution duration in seconds (optional).
-    """
+    """Render project fitness score in architectural style."""
     console = console or Console()
-    
+
     overall_score = scores["overall_score"]
     enabled_checks = scores["enabled_checks"]
     category_scores = scores["category_scores"]
     check_scores = scores["check_scores"]
     check_findings = scores["check_findings"]
-    
-    score_color = "green" if overall_score >= 90 else "yellow" if overall_score >= 70 else "red"
-    
-    panel_info = f"Active checks: {len(enabled_checks)}  ·  Categories: {sum(1 for v in category_scores.values() if v is not None)}"
-    if duration is not None:
-        panel_info += f"  ·  Duration: {duration:.2f}s"
+    check_weights = scores.get("check_weights", {})
 
-    score_panel = Panel(
-        Text.assemble(
-            ("Overall Project Health Score: ", "bold white"),
-            (f"{overall_score:.1f}%", f"bold {score_color}"),
-            ("\n", ""),
-            (panel_info, "dim")
-        ),
-        title=f"[bold {score_color}]tff PROJECT HEALTH REPORT[/bold {score_color}]",
-        border_style=score_color,
-        padding=(1, 2),
-    )
-    console.print(score_panel)
+    score_color = "green" if overall_score >= 90 else "yellow" if overall_score >= 70 else "red"
+    width = max(78, min(console.width - 2, 86)) if console.width else 78
+
+    # 1. Header Block
+    console.print("[bold]PROJECT FITNESS SCORE[/bold]")
+    console.print("─" * width, style="dim")
+
+    header_line = Text()
+    header_line.append("OVERALL HEALTH", style="bold")
+    pad_to_score = max(2, 47 - len("OVERALL HEALTH"))
+    header_line.append(" " * pad_to_score)
+    header_line.append(f"{overall_score:5.1f}%", style=f"bold {score_color}")
+
+    if fail_under is not None and fail_under > 0:
+        if overall_score < fail_under:
+            header_line.append(f"  [FAIL: TARGET >= {fail_under:.1f}%]", style="bold red")
+        else:
+            header_line.append(f"  [PASS: TARGET >= {fail_under:.1f}%]", style="bold green")
+
+    console.print(header_line)
+    console.print("─" * width, style="dim")
     console.print()
-    
-    # 1. Summary Table
-    console.print("[bold cyan]Health Score by Category[/bold cyan]")
-    summary_table = Table(
-        box=box.SIMPLE,
+
+    # 2. Dimension Table
+    dim_table = Table(
+        box=None,
         show_header=True,
-        header_style="bold cyan",
+        header_style="bold",
         padding=(0, 2, 0, 0),
     )
-    summary_table.add_column("Category", style="bold", no_wrap=True)
-    summary_table.add_column("Checks", justify="center", no_wrap=True)
-    summary_table.add_column("Errors", justify="right", no_wrap=True)
-    summary_table.add_column("Warnings", justify="right", no_wrap=True)
-    summary_table.add_column("Score", justify="right", no_wrap=True)
-    
+    dim_table.add_column("DIMENSION", style="bold", min_width=38)
+    dim_table.add_column("SCORE", justify="right", width=7)
+    dim_table.add_column("DEFECTS", justify="right", width=8)
+    dim_table.add_column("DISTRIBUTION (0-100)", justify="left", width=20)
+
     for cat_name, cat_score in category_scores.items():
         if cat_score is None:
             continue
-            
         cat_checks = CATEGORIES.get(cat_name, [c for c in enabled_checks if c not in CONNASCENCE_CATEGORIES])
         enabled_cat_checks = [c for c in cat_checks if c in enabled_checks]
-        
-        # Count errors & warnings
-        errors = 0
-        warnings = 0
-        for c in enabled_cat_checks:
-            for f in check_findings[c]:
-                if f.severity == "error":
-                    errors += 1
-                else:
-                    warnings += 1
-                    
-        total_in_cat = len(cat_checks) if cat_name in CATEGORIES else len(enabled_cat_checks)
-        checks_ratio = f"{len(enabled_cat_checks)}/{total_in_cat}"
-        
-        error_cell = Text(str(errors) if errors else "·", style="bold red" if errors else "dim")
-        warn_cell = Text(str(warnings) if warnings else "·", style="bold yellow" if warnings else "dim")
-        
-        score_color = "green" if cat_score >= 90 else "yellow" if cat_score >= 70 else "red"
-        score_cell = Text(f"{cat_score:.1f}%", style=f"bold {score_color}")
-        
-        summary_table.add_row(
-            cat_name,
-            checks_ratio,
-            error_cell,
-            warn_cell,
-            score_cell,
+        defects = sum(len(check_findings[c]) for c in enabled_cat_checks)
+
+        c_color = "green" if cat_score >= 90 else "yellow" if cat_score >= 70 else "red"
+        score_cell = Text(f"{cat_score:.1f}%", style=f"bold {c_color}")
+        defects_cell = Text(
+            str(defects),
+            style="dim" if defects == 0 else ("bold red" if any(f.severity == "error" for c in enabled_cat_checks for f in check_findings[c]) else "bold yellow"),
         )
-        
-    console.print(summary_table)
+        bar_str = make_progress_bar(cat_score, width=10)
+        bar_cell = Text.from_markup(f"[{c_color}]{bar_str}[/{c_color}]")
+        display_name = DIMENSION_DISPLAY_NAMES.get(cat_name, cat_name)
+        dim_table.add_row(display_name, score_cell, defects_cell, bar_cell)
+
+    console.print(dim_table)
     console.print()
-    
-    # 2. Detailed Breakdown
-    if group_by == "domain":
-        _render_health_by_domain(scores, console, config=config)
+
+    # 3. Domain Breakdown
+    console.print("[bold]DOMAIN BREAKDOWN[/bold]")
+    console.print("─" * width, style="dim")
+
+    domain_table = Table(box=None, show_header=False, padding=(0, 2, 0, 0))
+    domain_table.add_column("Domain", style="bold", width=18)
+    domain_table.add_column("Score", justify="right", width=7)
+    domain_table.add_column("Issues", justify="right", width=11)
+    domain_table.add_column("Breakdown", justify="left")
+
+    domain_by_key = calculate_domain_health(
+        scores, config=config, project_root=project_root
+    )
+    scores["by_domain"] = domain_by_key
+    domain_data = sorted(
+        domain_by_key.values(), key=lambda d: (d["score"], -d["issues"])
+    )
+
+    for d in domain_data:
+        d_color = "green" if d["score"] >= 90 else "yellow" if d["score"] >= 70 else "red"
+        d_score_cell = Text(f"{d['score']:.1f}%", style=f"bold {d_color}")
+        issues_text = f"{d['issues']} issue{'s' if d['issues'] != 1 else ''}"
+        issues_cell = Text(issues_text, style="dim" if d["issues"] == 0 else ("bold red" if d["errors"] else "bold yellow"))
+        breakdown_cell = Text(d["breakdown"], style="dim")
+        domain_table.add_row(d["label"], d_score_cell, issues_cell, breakdown_cell)
+
+    console.print(domain_table)
+    console.print("─" * width, style="dim")
+
+    # 4. STATUS & ACTION
+    models_count = scores.get("models_checked") or sum(
+        d["models_checked"] for d in domain_by_key.values()
+    )
+    status_line = f"STATUS: {len(enabled_checks)} checks evaluated across {models_count} models."
+    console.print(status_line)
+
+    overall_total_weight = sum(check_weights.get(c, 1.0) for c in enabled_checks)
+    penalties_list: list[tuple[float, str, str]] = []
+    if overall_total_weight > 0:
+        for check in enabled_checks:
+            score = check_scores.get(check, 100.0)
+            if score < 100.0:
+                weight = check_weights.get(check, 1.0)
+                pts_lost = ((100.0 - score) * weight) / overall_total_weight
+                label = CHECK_LABELS.get(check, check)
+                penalties_list.append((pts_lost, label, check))
+
+    penalties_list.sort(key=lambda x: x[0], reverse=True)
+
+    if penalties_list:
+        pts_lost, top_label, top_check = penalties_list[0]
+        cnt = len(check_findings[top_check])
+        action_verb = _get_action_phrase(top_check, cnt)
+        target = fail_under if (fail_under is not None and fail_under > 0) else 80.0
+        if overall_score < target:
+            console.print(f"ACTION: {action_verb} to raise score above {target:.1f}%.")
+        else:
+            console.print(f"ACTION: {action_verb} to improve project fitness.")
     else:
-        _render_health_by_connascence(scores, enabled_checks, check_scores, check_findings, console)
+        console.print("ACTION: All fitness functions satisfied. Fitness score is optimal.")
+
+    if group_by == "domain":
+        console.print()
+        _render_health_by_domain(scores, console, config=config, verbose=verbose)
+    elif verbose:
+        console.print()
+        _render_health_by_connascence(
+            scores, enabled_checks, check_scores, check_findings, console, verbose=verbose
+        )
+    else:
+        console.print("\n[dim]Run [bold]tff explain <rule>[/bold] for remediation guides. Use [bold]--verbose[/bold] to expand all passing and disabled checks.[/dim]")
 
 
 def _format_health_check_desc(
@@ -415,20 +544,17 @@ def _format_health_check_desc(
     if disabled:
         desc.append("  - ", style="dim")
         desc.append(label, style=f"dim link {docs_url}" if docs_url else "dim")
-        desc.append("\n    (", style="dim")
-        desc.append(check, style=f"dim link {docs_url}" if docs_url else "dim")
-        desc.append(")", style="dim")
+        desc.append(" ")
+        desc.append(f"({check})", style=f"dim link {docs_url}" if docs_url else "dim")
         return desc
 
     desc.append("  ")
     desc.append_text(Text.from_markup(icon_markup))
     desc.append(" ")
     desc.append(label, style=f"link {docs_url}" if docs_url else None)
-    desc.append("\n    (", style="dim")
-    desc.append(check, style=f"dim link {docs_url}" if docs_url else "dim")
-    if weight_str:
-        desc.append(weight_str, style="dim")
-    desc.append(")", style="dim")
+    desc.append(" ")
+    check_inner = f"({check}{weight_str})"
+    desc.append(check_inner, style=f"dim link {docs_url}" if docs_url else "dim")
     return desc
 
 
@@ -438,12 +564,14 @@ def _render_health_by_connascence(
     check_scores: dict[str, float],
     check_findings: Any,
     console: Console,
+    verbose: bool = False,
 ) -> None:
     """Render detailed breakdown grouped by connascence category."""
-    console.print("[bold cyan]Detailed Breakdown by Check[/bold cyan]")
+    console.print("[bold]Detailed Breakdown by Check[/bold]")
 
     check_weights = scores.get("check_weights", {})
     first_cat = True
+    collapsed_count = 0
     for cat_name, cat_checks in CATEGORIES.items():
         # Only print category if it contains enabled checks
         enabled_cat_checks = [c for c in cat_checks if c in enabled_checks]
@@ -454,39 +582,75 @@ def _render_health_by_connascence(
             console.print()
         first_cat = False
 
-        console.print(f"[bold cyan]● {cat_name}[/bold cyan]")
+        console.print(f"[bold]● {cat_name}[/bold]")
 
         table = Table(box=None, show_header=False, padding=(0, 2, 0, 0))
         table.add_column(min_width=38)
         table.add_column(width=22, no_wrap=True)
         table.add_column(no_wrap=True)
 
-        for check in cat_checks:
-            label = CHECK_LABELS.get(check, check)
+        if verbose:
+            for check in cat_checks:
+                label = CHECK_LABELS.get(check, check)
 
-            if check in enabled_checks:
+                if check in enabled_checks:
+                    score = check_scores[check]
+                    cf = check_findings[check]
+
+                    # Determine status icon and color
+                    if score == 100.0:
+                        icon = "[green]PASS[/green]"
+                        score_text = "[green]100.0%[/green]"
+                        violation_text = ""
+                    else:
+                        icon_char = "FAIL" if score < 70 else "WARN"
+                        color = "red" if score < 70 else "yellow"
+                        icon = f"[{color}]{icon_char}[/{color}]"
+                        score_text = f"[{color}]{score:.1f}%[/{color}]"
+
+                        errors = sum(1 for f in cf if f.severity == "error")
+                        warnings = sum(1 for f in cf if f.severity == "warning")
+                        parts = []
+                        if errors:
+                            parts.append(f"{errors} error{'s' if errors != 1 else ''}")
+                        if warnings:
+                            parts.append(f"{warnings} warning{'s' if warnings != 1 else ''}")
+                        violation_text = f"[dim]({', '.join(parts)})[/dim]"
+
+                    weight = check_weights.get(check, 1.0)
+                    weight_str = f" · weight: {weight:g}" if weight != 1.0 else ""
+                    check_desc = _format_health_check_desc(icon, check, label, weight_str=weight_str)
+                    bar = make_progress_bar(score, width=10)
+                    score_cell = Text.from_markup(f"{bar} {score_text}")
+
+                    table.add_row(check_desc, score_cell, Text.from_markup(violation_text))
+                else:
+                    check_desc = _format_health_check_desc("-", check, label, disabled=True)
+                    table.add_row(check_desc, Text("Disabled", style="dim"), "")
+        else:
+            failing = [c for c in enabled_cat_checks if check_scores.get(c, 100.0) < 100.0]
+            passing = [c for c in enabled_cat_checks if check_scores.get(c, 100.0) >= 100.0]
+            disabled = [c for c in cat_checks if c not in enabled_checks]
+
+            # 1. Failing / warning checks
+            for check in failing:
+                label = CHECK_LABELS.get(check, check)
                 score = check_scores[check]
                 cf = check_findings[check]
 
-                # Determine status icon and color
-                if score == 100.0:
-                    icon = "[green]✔[/green]"
-                    score_text = "[green]100.0%[/green]"
-                    violation_text = ""
-                else:
-                    icon_char = "✘" if score < 70 else "⚠"
-                    color = "red" if score < 70 else "yellow"
-                    icon = f"[{color}]{icon_char}[/{color}]"
-                    score_text = f"[{color}]{score:.1f}%[/{color}]"
+                icon_char = "FAIL" if score < 70 else "WARN"
+                color = "red" if score < 70 else "yellow"
+                icon = f"[{color}]{icon_char}[/{color}]"
+                score_text = f"[{color}]{score:.1f}%[/{color}]"
 
-                    errors = sum(1 for f in cf if f.severity == "error")
-                    warnings = sum(1 for f in cf if f.severity == "warning")
-                    parts = []
-                    if errors:
-                        parts.append(f"{errors} error{'s' if errors != 1 else ''}")
-                    if warnings:
-                        parts.append(f"{warnings} warning{'s' if warnings != 1 else ''}")
-                    violation_text = f"[dim]({', '.join(parts)})[/dim]"
+                errors = sum(1 for f in cf if f.severity == "error")
+                warnings = sum(1 for f in cf if f.severity == "warning")
+                parts = []
+                if errors:
+                    parts.append(f"{errors} error{'s' if errors != 1 else ''}")
+                if warnings:
+                    parts.append(f"{warnings} warning{'s' if warnings != 1 else ''}")
+                violation_text = f"[dim]({', '.join(parts)})[/dim]"
 
                 weight = check_weights.get(check, 1.0)
                 weight_str = f" · weight: {weight:g}" if weight != 1.0 else ""
@@ -495,9 +659,43 @@ def _render_health_by_connascence(
                 score_cell = Text.from_markup(f"{bar} {score_text}")
 
                 table.add_row(check_desc, score_cell, Text.from_markup(violation_text))
-            else:
-                check_desc = _format_health_check_desc("-", check, label, disabled=True)
-                table.add_row(check_desc, Text("Disabled", style="dim"), "")
+
+            # 2. Passing checks
+            if passing:
+                if len(passing) == 1 and not failing:
+                    c = passing[0]
+                    label = CHECK_LABELS.get(c, c)
+                    weight = check_weights.get(c, 1.0)
+                    weight_str = f" · weight: {weight:g}" if weight != 1.0 else ""
+                    check_desc = _format_health_check_desc("[green]PASS[/green]", c, label, weight_str=weight_str)
+                    bar = make_progress_bar(100.0, width=10)
+                    score_cell = Text.from_markup(f"{bar} [green]100.0%[/green]")
+                    table.add_row(check_desc, score_cell, "")
+                else:
+                    collapsed_count += len(passing)
+                    if not failing:
+                        desc_text = f"  [green]PASS[/green] All {len(passing)} checks scored [green]100.0%[/green]"
+                    else:
+                        desc_text = f"  [green]PASS[/green] {len(passing)} check{'s' if len(passing) != 1 else ''} passing"
+                    bar = make_progress_bar(100.0, width=10)
+                    score_cell = Text.from_markup(f"{bar} [green]100.0%[/green]")
+                    table.add_row(Text.from_markup(desc_text), score_cell, "")
+
+            # 3. Disabled checks
+            if disabled:
+                collapsed_count += len(disabled)
+                desc = Text("  - ", style="dim")
+                desc.append(
+                    f"{len(disabled)} check{'s' if len(disabled) != 1 else ''} disabled (",
+                    style="dim",
+                )
+                for i, c in enumerate(disabled):
+                    if i > 0:
+                        desc.append(", ", style="dim")
+                    url = registry.get_docs_url(c)
+                    desc.append(c, style=f"dim link {url}" if url else "dim")
+                desc.append(")", style="dim")
+                table.add_row(desc, Text("Disabled", style="dim"), "")
 
         console.print(table)
 
@@ -509,7 +707,7 @@ def _render_health_by_connascence(
     if unknown_enabled:
         if not first_cat:
             console.print()
-        console.print("[bold cyan]● Other Checks[/bold cyan]")
+        console.print("[bold]● Other Checks[/bold]")
 
         table = Table(box=None, show_header=False, padding=(0, 2, 0, 0))
         table.add_column(min_width=38)
@@ -522,11 +720,11 @@ def _render_health_by_connascence(
             cf = check_findings[check]
 
             if score == 100.0:
-                icon = "[green]✔[/green]"
+                icon = "[green]PASS[/green]"
                 score_text = "[green]100.0%[/green]"
                 violation_text = ""
             else:
-                icon_char = "✘" if score < 70 else "⚠"
+                icon_char = "FAIL" if score < 70 else "WARN"
                 color = "red" if score < 70 else "yellow"
                 icon = f"[{color}]{icon_char}[/{color}]"
                 score_text = f"[{color}]{score:.1f}%[/{color}]"
@@ -549,6 +747,10 @@ def _render_health_by_connascence(
             table.add_row(check_desc, score_cell, Text.from_markup(violation_text))
 
         console.print(table)
+
+    if not verbose and collapsed_count > 0:
+        console.print()
+        console.print("[dim]Use [bold]--verbose[/bold] to expand all passing and disabled checks.[/dim]")
 
     console.print()
 
@@ -585,54 +787,194 @@ def _domain_key(path: str | None) -> str:
 
 
 
-def _render_health_by_domain(
+def _calculate_domain_check_score(
+    cf: list[LintFinding],
+    check: str,
+    domain_models_checked: int,
+    penalties: HealthPenaltiesConfig,
+) -> float:
+    """Compute the health score for a single check within a single domain."""
+    if not cf:
+        return 100.0
+    error_models = {f.model for f in cf if f.severity == "error" and f.model}
+    warning_models = (
+        {f.model for f in cf if f.severity == "warning" and f.model} - error_models
+    )
+    E = len(error_models) + sum(1 for f in cf if f.severity == "error" and not f.model)
+    W = len(warning_models) + sum(
+        1 for f in cf if f.severity == "warning" and not f.model
+    )
+    err_mult = penalties.get_check_error_penalty(check, is_project_level=False)
+    warn_mult = penalties.get_check_warning_penalty(check, is_project_level=False)
+    return max(
+        0.0, 100.0 * (1.0 - (err_mult * E + warn_mult * W) / domain_models_checked)
+    )
+
+
+def calculate_domain_health(
     scores: dict[str, Any],
-    console: Console,
     config: FitnessFunctionsConfig | None = None,
-) -> None:
-    """Render detailed breakdown grouped by domain (path segment after models/)."""
+    project_root: Path | Sequence[Path] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Calculate per-domain health scores, defect counts, and check breakdowns."""
+    enabled_checks = scores.get("enabled_checks", set())
+    check_findings = scores.get("check_findings", {})
+    check_weights = scores.get("check_weights", {})
+    check_scores = scores.get("check_scores", {})
+
+    domain_models: dict[str, set[str]] = defaultdict(set)
+    roots_to_try: list[Path] = []
+    if project_root is not None:
+        if isinstance(project_root, (str, Path)):
+            roots_to_try.append(Path(project_root))
+        else:
+            roots_to_try.extend(Path(p) for p in project_root)
+    else:
+        roots_to_try.extend([Path.cwd(), Path.cwd().parent])
+
+    for r in roots_to_try:
+        if not r.exists():
+            continue
+        for base in ("models", "definitions"):
+            base_dir = r / base
+            if base_dir.is_dir():
+                for p in base_dir.rglob("*"):
+                    if p.is_file() and p.suffix in (".sql", ".sqlx"):
+                        rel = str(p.relative_to(r)).replace("\\", "/")
+                        d_key = _domain_key(rel)
+                        domain_models[d_key].add(rel)
+        if domain_models:
+            break
+
+    for check in enabled_checks:
+        for f in check_findings.get(check, []):
+            d_key = _domain_key(f.path)
+            domain_models[d_key].add(f.path or (f.model or "project"))
+
+    if not domain_models:
+        domain_models["project"].add("project")
+
     penalties = (
         config.health.penalties
-        if config and hasattr(config, "health")
+        if config is not None and hasattr(config, "health")
         else HealthPenaltiesConfig()
     )
-    check_findings = scores["check_findings"]
-    enabled_checks = scores["enabled_checks"]
-    check_scores = scores["check_scores"]
 
-    # Collect all findings from enabled checks
-    all_findings: list[LintFinding] = []
-    for check in enabled_checks:
-        all_findings.extend(check_findings[check])
+    by_domain: dict[str, dict[str, Any]] = {}
+    for domain_label, model_set in domain_models.items():
+        domain_findings = [
+            f
+            for check in enabled_checks
+            for f in check_findings.get(check, [])
+            if _domain_key(f.path) == domain_label
+        ]
+        total_issues = len(domain_findings)
+        errors = sum(1 for f in domain_findings if f.severity == "error")
+        warnings = sum(1 for f in domain_findings if f.severity == "warning")
+        domain_models_checked = max(len(model_set), 1)
 
-    # Bucket by domain key
-    by_domain: dict[str, list[LintFinding]] = defaultdict(list)
-    for f in all_findings:
-        by_domain[_domain_key(f.path)].append(f)
-
-    if not by_domain:
-        console.print("[bold cyan]Detailed Breakdown by Domain[/bold cyan]")
-        console.print("[dim]No findings in selected scope.[/dim]")
-        console.print()
-        return
-
-    # Determine which checks appear in each domain
-    console.print("[bold cyan]Detailed Breakdown by Domain[/bold cyan]")
-    first_domain = True
-    for domain_label in sorted(by_domain):
-        domain_findings = by_domain[domain_label]
-
-        errors_total = sum(1 for f in domain_findings if f.severity == "error")
-        warnings_total = sum(1 for f in domain_findings if f.severity == "warning")
-
-        # Per-check scores within this domain
         domain_by_check: dict[str, list[LintFinding]] = defaultdict(list)
         for f in domain_findings:
             domain_by_check[f.check].append(f)
 
-        # Unique model paths seen in this domain (for denominator)
-        domain_model_paths = {f.path for f in domain_findings if f.path}
-        domain_models_checked = len(domain_model_paths)
+        domain_check_scores: dict[str, float] = {}
+        if not domain_findings or not enabled_checks:
+            domain_score = 100.0
+            for check in enabled_checks:
+                domain_check_scores[check] = 100.0
+        else:
+            local_scores: list[float] = []
+            local_weights: list[float] = []
+            for check in enabled_checks:
+                cf = domain_by_check.get(check, [])
+                w = check_weights.get(check, 1.0)
+                l_score = _calculate_domain_check_score(
+                    cf, check, domain_models_checked, penalties
+                )
+                domain_check_scores[check] = l_score
+                local_scores.append(l_score)
+                local_weights.append(w)
+
+            tot_w = sum(local_weights)
+            if tot_w > 0:
+                domain_score = (
+                    sum(s * w for s, w in zip(local_scores, local_weights)) / tot_w
+                )
+            else:
+                domain_score = sum(local_scores) / len(local_scores)
+
+        domain_path_models_count = len({f.path for f in domain_findings if f.path})
+        detailed_check_scores: dict[str, float] = {}
+        for check, cf in domain_by_check.items():
+            if domain_path_models_count > 0:
+                detailed_check_scores[check] = _calculate_domain_check_score(
+                    cf, check, domain_models_checked, penalties
+                )
+            else:
+                detailed_check_scores[check] = check_scores.get(
+                    check, domain_check_scores.get(check, 100.0)
+                )
+
+        check_counts: dict[str, int] = defaultdict(int)
+        for f in domain_findings:
+            short_lbl = SHORT_CHECK_LABELS.get(f.check, f.check.split("_")[0])
+            check_counts[short_lbl] += 1
+
+        sorted_counts = sorted(
+            check_counts.items(), key=lambda x: x[1], reverse=True
+        )
+        breakdown_parts = [f"{cnt} {lbl}" for lbl, cnt in sorted_counts[:4]]
+        breakdown_str = f"({', '.join(breakdown_parts)})" if breakdown_parts else ""
+
+        clean_label = domain_label
+        for prefix in ("models/", "definitions/"):
+            if clean_label.startswith(prefix):
+                clean_label = clean_label[len(prefix) :]
+
+        by_domain[domain_label] = {
+            "label": clean_label,
+            "raw_label": domain_label,
+            "score": domain_score,
+            "models_checked": len(model_set),
+            "issues": total_issues,
+            "errors": errors,
+            "warnings": warnings,
+            "breakdown": breakdown_str,
+            "check_scores": detailed_check_scores,
+            "check_findings": dict(domain_by_check),
+        }
+
+    return by_domain
+
+
+def _render_health_by_domain(
+    scores: dict[str, Any],
+    console: Console,
+    config: FitnessFunctionsConfig | None = None,
+    verbose: bool = False,
+) -> None:
+    """Render detailed breakdown grouped by domain (path segment after models/)."""
+    by_domain = scores.get("by_domain") or calculate_domain_health(
+        scores, config=config
+    )
+    domains_with_findings = {
+        k: v for k, v in by_domain.items() if v.get("check_findings")
+    }
+
+    if not domains_with_findings:
+        console.print("[bold]Detailed Breakdown by Domain[/bold]")
+        console.print("[dim]No findings in selected scope.[/dim]")
+        console.print()
+        return
+
+    console.print("[bold]Detailed Breakdown by Domain[/bold]")
+    first_domain = True
+    for domain_label in sorted(domains_with_findings):
+        domain_info = domains_with_findings[domain_label]
+        errors_total = domain_info["errors"]
+        warnings_total = domain_info["warnings"]
+        domain_by_check = domain_info["check_findings"]
+        domain_check_scores = domain_info["check_scores"]
 
         # Summary colour for the domain header
         err_style = "bold red" if errors_total else "dim"
@@ -645,7 +987,7 @@ def _render_health_by_domain(
         first_domain = False
 
         header_line = Text()
-        header_line.append(f"● {domain_label}", style="bold cyan")
+        header_line.append(f"● {domain_label}", style="bold")
         header_line.append("  ")
         header_line.append(error_part)
         header_line.append("  ·  ", style="dim")
@@ -662,25 +1004,14 @@ def _render_health_by_domain(
             cf = domain_by_check[check]
             errors = sum(1 for f in cf if f.severity == "error")
             warnings = sum(1 for f in cf if f.severity == "warning")
-
-            # Compute a local score for this domain/check combination
-            if domain_models_checked > 0:
-                error_models = {f.model for f in cf if f.severity == "error" and f.model}
-                warning_models = {f.model for f in cf if f.severity == "warning" and f.model} - error_models
-                E = len(error_models) + sum(1 for f in cf if f.severity == "error" and not f.model)
-                W = len(warning_models) + sum(1 for f in cf if f.severity == "warning" and not f.model)
-                err_mult = penalties.get_check_error_penalty(check, is_project_level=False)
-                warn_mult = penalties.get_check_warning_penalty(check, is_project_level=False)
-                local_score = max(0.0, 100.0 * (1.0 - (err_mult * E + warn_mult * W) / domain_models_checked))
-            else:
-                local_score = check_scores.get(check, 100.0)
+            local_score = domain_check_scores.get(check, 100.0)
 
             if local_score == 100.0:
-                icon = "[green]✔[/green]"
+                icon = "[green]PASS[/green]"
                 score_text = "[green]100.0%[/green]"
                 violation_text = ""
             else:
-                icon_char = "✘" if local_score < 70 else "⚠"
+                icon_char = "FAIL" if local_score < 70 else "WARN"
                 color = "red" if local_score < 70 else "yellow"
                 icon = f"[{color}]{icon_char}[/{color}]"
                 score_text = f"[{color}]{local_score:.1f}%[/{color}]"

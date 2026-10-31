@@ -1,36 +1,36 @@
+from conftest import _make_finding, _make_model
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from tff.core.cli import main
 from tff.core.docs import generate_docs_dashboard
 
 
-@patch("tff.core.cli._get_runner")
-@patch("tff.dbt.manifest.load_dbt_models")
+@patch("tff.core.cli._get_adapter")
 @patch("tff.core.docs.collect_stats")
 @patch("tff.core.docs.save_log")
 def test_generate_docs_dashboard_dbt(
     mock_save_log,
     mock_collect_stats,
-    mock_load_dbt_models,
-    mock_get_runner,
+    mock_get_adapter,
     tmp_path: Path
 ):
-    # Setup mock data for dbt runner
-    mock_runner = MagicMock()
-    mock_runner.run_all_checks.return_value = ([], 2, ["rules"])
-    mock_get_runner.return_value = mock_runner
+    # Setup mock adapter for dbt
+    mock_adapter = MagicMock()
+    mock_adapter.run_checks.return_value = ([], 2, ["rules"])
+    mock_get_adapter.return_value = mock_adapter
 
     # Setup mock models
-    from tff.core.model import ModelRepresentation
-    mock_model_1 = ModelRepresentation(
+    mock_model_1 = _make_model(
         name="model_1",
         path=str(tmp_path / "models/model_1.sql"),
         dialect="duckdb",
         materialized="table",
         depends_on=set()
     )
-    mock_model_2 = ModelRepresentation(
+    mock_model_2 = _make_model(
         name="model_2",
         path=str(tmp_path / "models/model_2.sql"),
         dialect="duckdb",
@@ -44,7 +44,7 @@ def test_generate_docs_dashboard_dbt(
     (tmp_path / "models/model_2.sql").touch()
     (tmp_path / "fitness_functions.yaml").touch()
 
-    mock_load_dbt_models.return_value = {
+    mock_adapter.load_models.return_value = {
         "model.my_project.model_1": mock_model_1,
         "model.my_project.model_2": mock_model_2,
     }
@@ -72,42 +72,38 @@ def test_generate_docs_dashboard_dbt(
     assert "const TFF_DATA =" in html_content
     assert "model_1" in html_content
     assert "model_2" in html_content
+    assert "This is an external source or seed not directly checked by tff rules." in html_content
+    assert "checked by TFF rules" not in html_content
 
 
-@patch("tff.core.cli._get_runner")
-@patch("sqlmesh.core.context.Context")
-@patch("tff.sqlmesh.runner.map_sqlmesh_context_models")
+@patch("tff.core.cli._get_adapter")
 @patch("tff.core.docs.collect_stats")
 @patch("tff.core.docs.save_log")
 def test_generate_docs_dashboard_sqlmesh(
     mock_save_log,
     mock_collect_stats,
-    mock_map_sqlmesh,
-    mock_context,
-    mock_get_runner,
+    mock_get_adapter,
     tmp_path: Path
 ):
-    # Setup mock data for SQLMesh runner
-    mock_runner = MagicMock()
-    from tff.core.report import LintFinding
+    # Setup mock adapter for SQLMesh
+    mock_adapter = MagicMock()
     mock_findings = [
-        LintFinding(check="ban_select_star", severity="warning", model="model_1", path=None, message="banned select *"),
-        LintFinding(check="layer_integrity", severity="error", model="model_2", path="models/model_2.sql", message="layer violation"),
-        LintFinding(check="custom_exclusions", severity="error", message="project wide check violation")
+        _make_finding(check="ban_select_star", severity="warning", model="model_1", path=None, message="banned select *"),
+        _make_finding(check="layer_integrity", severity="error", model="model_2", path="models/model_2.sql", message="layer violation"),
+        _make_finding(check="custom_exclusions", severity="error", message="project wide check violation")
     ]
-    mock_runner.run_all_checks.return_value = (mock_findings, 2, ["sqlmesh"])
-    mock_get_runner.return_value = mock_runner
+    mock_adapter.run_checks.return_value = (mock_findings, 2, ["sqlmesh"])
+    mock_get_adapter.return_value = mock_adapter
 
     # Setup mock models mapping
-    from tff.core.model import ModelRepresentation
-    mock_model_1 = ModelRepresentation(
+    mock_model_1 = _make_model(
         name="model_1",
         path=str(tmp_path / "models/model_1.sql"),
         dialect="duckdb",
         materialized="table",
         depends_on=set()
     )
-    mock_model_2 = ModelRepresentation(
+    mock_model_2 = _make_model(
         name="model_2",
         path=str(tmp_path / "models/model_2.sql"),
         dialect="duckdb",
@@ -120,7 +116,7 @@ def test_generate_docs_dashboard_sqlmesh(
     (tmp_path / "models/model_2.sql").touch()
     (tmp_path / "fitness_functions.yaml").touch()
 
-    mock_map_sqlmesh.return_value = {
+    mock_adapter.load_models.return_value = {
         "model_1": mock_model_1,
         "model_2": mock_model_2,
     }
@@ -147,21 +143,19 @@ def test_generate_docs_dashboard_sqlmesh(
     assert "error" in html_content
 
 
-@patch("tff.core.cli._get_runner")
-@patch("tff.dbt.manifest.load_dbt_models")
+@patch("tff.core.cli._get_adapter")
 @patch("tff.core.docs.collect_stats")
 @patch("tff.core.docs.save_log")
 def test_generate_docs_dashboard_relative_output(
     mock_save_log,
     mock_collect_stats,
-    mock_load_dbt_models,
-    mock_get_runner,
+    mock_get_adapter,
     tmp_path: Path
 ):
-    mock_runner = MagicMock()
-    mock_runner.run_all_checks.return_value = ([], 0, [])
-    mock_get_runner.return_value = mock_runner
-    mock_load_dbt_models.return_value = {}
+    mock_adapter = MagicMock()
+    mock_adapter.run_checks.return_value = ([], 0, [])
+    mock_adapter.load_models.return_value = {}
+    mock_get_adapter.return_value = mock_adapter
     mock_collect_stats.return_value = []
     
     (tmp_path / "fitness_functions.yaml").touch()
@@ -326,5 +320,60 @@ def test_generate_docs_dashboard_multi_project(tmp_path: Path):
     res = generate_docs_dashboard([r1, r2], no_log=True)
     assert res.exists()
     assert res == r1 / "tff_report.html"
+
+
+def test_generate_docs_dashboard_chunk_size(tmp_path: Path):
+    from unittest.mock import patch
+    from tff.dbt.adapter import DBTAdapter
+
+    r = tmp_path / "repo"
+    r.mkdir()
+    (r / "dbt_project.yml").touch()
+    (r / "fitness_functions.yaml").touch()
+    (r / "target").mkdir()
+    (r / "target" / "manifest.json").write_text(
+        '{"metadata": {"adapter_type": "duckdb"}, "nodes": {}, "sources": {}}',
+        encoding="utf-8",
+    )
+
+    with patch.object(DBTAdapter, "run_checks", autospec=True, side_effect=DBTAdapter.run_checks) as spy_run_checks:
+        res = generate_docs_dashboard(r, chunk_size=8, no_log=True)
+        assert res.exists()
+        assert spy_run_checks.call_args.kwargs.get("chunk_size") == 8
+
+
+@pytest.mark.parametrize(
+    ("root_asset", "docs_asset"),
+    [
+        ("assets/favicon.svg", "docs/assets/favicon.svg"),
+        ("assets/tff.svg", "docs/assets/tff.svg"),
+    ],
+)
+def test_branding_assets_sync(root_asset: str, docs_asset: str) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    root_file = repo_root / root_asset
+    docs_file = repo_root / docs_asset
+    assert root_file.exists(), f"{root_asset} does not exist"
+    assert docs_file.exists(), f"{docs_asset} does not exist"
+    assert root_file.read_text(encoding="utf-8") == docs_file.read_text(encoding="utf-8")
+
+
+def test_readme_branding_asset_references() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    readme = (repo_root / "README.md").read_text(encoding="utf-8")
+    assert "tff-white.svg" not in readme
+    assert "docs/assets/tff.svg" not in readme
+
+
+def test_dashboard_template_resource_loading() -> None:
+    from tff.core.docs import HTML_TEMPLATE, _HTML_TEMPLATE, _load_dashboard_template
+
+    loaded = _load_dashboard_template()
+    assert loaded == HTML_TEMPLATE
+    assert _HTML_TEMPLATE == HTML_TEMPLATE
+    assert "<!-- INSERT_TFF_DATA_HERE -->" in loaded
+    assert "tff Health & Documentation Dashboard" in loaded
+
+
 
 

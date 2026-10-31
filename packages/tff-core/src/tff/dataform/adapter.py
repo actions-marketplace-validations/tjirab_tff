@@ -34,8 +34,9 @@ class DataformAdapter(PipelineAdapter):
         from tff.dataform.manifest import load_dataform_models
 
         roots = normalize_project_roots(project_root)
+        root_arg = roots[0] if len(roots) == 1 else roots
         return load_dataform_models(
-            project_root=roots[0],
+            project_root=root_arg,
             manifest_path=manifest_path,
             dialect=dialect,
         )
@@ -48,35 +49,27 @@ class DataformAdapter(PipelineAdapter):
         dialect: str | None = None,
         manifest_path: str | Path | None = None,
         models: dict[str, ModelRepresentation] | None = None,
+        scoped_models: set[str] | None = None,
+        chunk_size: int | None = None,
     ) -> tuple[list[LintFinding], int, list[str]]:
+        from typing import Any
         from tff.dataform.runner import run_all_checks
 
         roots = normalize_project_roots(project_root)
-        return run_all_checks(
-            project_root=roots[0],
-            config=config,
-            checks=checks,
-            dialect=dialect,
-            manifest_path=manifest_path,
-            models=models,
-        )
-
-    def apply_metadata_fix(
-        self,
-        project_root: Path,
-        abs_path: Path,
-        model_name: str,
-        missing_owner: bool,
-        missing_description: bool,
-    ) -> str | None:
-        from tff.core.autofix import fix_dataform_metadata
-
-        return fix_dataform_metadata(
-            abs_path=abs_path,
-            missing_owner=missing_owner,
-            missing_description=missing_description,
-            model_name=model_name,
-        )
+        root_arg = roots[0] if len(roots) == 1 else roots
+        kwargs: dict[str, Any] = {
+            "project_root": root_arg,
+            "config": config,
+            "checks": checks,
+            "dialect": dialect,
+            "manifest_path": manifest_path,
+            "models": models,
+        }
+        if scoped_models is not None:
+            kwargs["scoped_models"] = scoped_models
+        if chunk_size is not None:
+            kwargs["chunk_size"] = chunk_size
+        return run_all_checks(**kwargs)
 
     def get_diagnostic_files(
         self, project_root: Path | Sequence[Path]

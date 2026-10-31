@@ -1,6 +1,7 @@
 """Tests for fitness_functions.yaml loading and merging."""
 
 from pathlib import Path
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
@@ -9,11 +10,18 @@ from tff.core.config import (
     DEFAULT_LAYER_ORDER,
     MISSING_CONFIG_NOTICE,
     STARTER_CONFIG_YAML,
+    CheckEnabled,
     FitnessFunctionsConfig,
+    HealthConfig,
+    LayerFilterConfig,
+    MetadataRuleConfig,
+    Severity,
+    SqlComplexityRuleConfig,
     init_fitness_config,
     load_fitness_config,
     resolve_project_path,
 )
+from tff.core.exceptions import TffConfigError
 
 
 def test_load_defaults_without_file(tmp_path: Path) -> None:
@@ -134,6 +142,76 @@ rules:
     assert rule_config.should_run("core") is True
     assert rule_config.should_run("sources") is False
     assert rule_config.should_run("derived") is False
+
+
+def test_split_positional_config_parsing(tmp_path: Path) -> None:
+    # 1. Test separate rule definitions in YAML
+    yaml_path = tmp_path / "fitness_functions.yaml"
+    yaml_path.write_text(
+        """
+rules:
+  no_positional_group_by:
+    enabled: false
+  no_positional_order_by:
+    enabled: true
+    skip_layers: [sources, staging]
+""",
+        encoding="utf-8",
+    )
+    config = load_fitness_config(tmp_path)
+    assert config.rules.no_positional_group_by.enabled is False
+    assert config.rules.no_positional_order_by.enabled is True
+    assert config.rules.no_positional_order_by.skip_layers == ["sources", "staging"]
+    assert config.rules.no_positional_group_by_or_order_by.group_by is False
+    assert config.rules.no_positional_group_by_or_order_by.order_by is True
+
+    # 2. Test parent rule with individual toggles
+    yaml_path.write_text(
+        """
+rules:
+  no_positional_group_by_or_order_by:
+    enabled: true
+    group_by: false
+    order_by: true
+    skip_layers: [staging]
+""",
+        encoding="utf-8",
+    )
+    config2 = load_fitness_config(tmp_path)
+    assert config2.rules.no_positional_group_by_or_order_by.group_by is False
+    assert config2.rules.no_positional_group_by_or_order_by.order_by is True
+    assert config2.rules.no_positional_group_by.enabled is False
+    assert config2.rules.no_positional_order_by.enabled is True
+    assert config2.rules.no_positional_group_by.skip_layers == ["staging"]
+    assert config2.rules.no_positional_order_by.skip_layers == ["staging"]
+
+    # 3. Test boolean disabled parent
+    yaml_path.write_text(
+        """
+rules:
+  no_positional_group_by_or_order_by: false
+""",
+        encoding="utf-8",
+    )
+    config3 = load_fitness_config(tmp_path)
+    assert config3.rules.no_positional_group_by_or_order_by.enabled is False
+    assert config3.rules.no_positional_group_by.enabled is False
+    assert config3.rules.no_positional_order_by.enabled is False
+
+
+def test_split_positional_config_severity(tmp_path: Path) -> None:
+    yaml_path = tmp_path / "fitness_functions.yaml"
+    yaml_path.write_text(
+        """
+rules:
+  no_positional_group_by_or_order_by:
+    severity: warning
+""",
+        encoding="utf-8",
+    )
+    config = load_fitness_config(tmp_path)
+    assert config.rules.no_positional_group_by.severity == "warning"
+    assert config.rules.no_positional_order_by.severity == "warning"
 
 
 def test_environment_agnostic_references_config_parsing(tmp_path: Path) -> None:
@@ -600,3 +678,500 @@ def test_load_fitness_config_multiple_project_roots(tmp_path: Path) -> None:
     cfg3 = load_fitness_config([r3, r4])
     assert cfg3._config_file_found is False
     assert cfg3._project_root == r3.resolve()
+
+
+def test_connascence_of_value_config_min_length():
+    from tff.core.config import ConnascenceOfValueCheckConfig
+
+    # Default
+    cfg = ConnascenceOfValueCheckConfig()
+    assert cfg.min_length == 0
+    assert cfg.min_string_length is None
+
+    # Explicit min_length
+    cfg_explicit = ConnascenceOfValueCheckConfig(min_length=3)
+    assert cfg_explicit.min_length == 3
+
+    # Alias min_string_length resolves to min_length
+    cfg_alias = ConnascenceOfValueCheckConfig(min_string_length=5)
+    assert cfg_alias.min_length == 5
+    assert cfg_alias.min_string_length == 5
+
+    # Both provided with non-zero min_length: min_length stays if min_string_length given but min_length != 0
+    cfg_both = ConnascenceOfValueCheckConfig(min_length=2, min_string_length=4)
+    assert cfg_both.min_length == 2
+
+    # Negative value raises ValidationError
+    with pytest.raises(ValidationError):
+        ConnascenceOfValueCheckConfig(min_length=-1)
+
+    with pytest.raises(ValidationError):
+        ConnascenceOfValueCheckConfig(min_string_length=-1)
+
+
+def test_unrecognized_rule_config_is_disallowed(tmp_path: Path) -> None:
+    yaml_path = tmp_path / "fitness_functions.yaml"
+    # User misspelled skip_layers as skipped_layers
+    yaml_path.write_text(
+        """
+rules:
+  ban_select_star:
+    enabled: true
+    skipped_layers: ["a_layer"]
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        load_fitness_config(tmp_path)
+    errors = exc_info.value.errors()
+    assert any(
+        "skipped_layers" in err["loc"] or "skipped_layers" in str(err)
+        for err in errors
+    )
+
+
+def test_unrecognized_top_level_config_is_disallowed(tmp_path: Path) -> None:
+    yaml_path = tmp_path / "fitness_functions.yaml"
+    yaml_path.write_text(
+        """
+workrs: 4
+invalid_option: true
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError) as exc_info:
+        load_fitness_config(tmp_path)
+    errors = exc_info.value.errors()
+    locs = [err["loc"][0] for err in errors]
+    assert "workrs" in locs or "invalid_option" in locs
+
+
+@pytest.mark.parametrize(
+    "yaml_content",
+    [
+        "layers:\n  ordered: [staging, core]\n",
+        "checks:\n  layer_integrity:\n    enabled: true\n    unrecognized_option: 123\n",
+    ],
+)
+def test_unrecognized_config_options_are_disallowed(tmp_path: Path, yaml_content: str) -> None:
+    yaml_path = tmp_path / "fitness_functions.yaml"
+    yaml_path.write_text(yaml_content, encoding="utf-8")
+    with pytest.raises(ValidationError):
+        load_fitness_config(tmp_path)
+
+
+def test_invalid_type_directly_under_rules_or_checks() -> None:
+    # A list directly under rules (e.g. accidentally unindented skipped_layers)
+    with pytest.raises(ValidationError, match="Invalid configuration for rule 'skipped_layers'"):
+        FitnessFunctionsConfig.model_validate({
+            "rules": {
+                "skipped_layers": ["a_layer"]
+            }
+        })
+
+    # A list directly under checks
+    with pytest.raises(ValidationError, match="Invalid configuration for check 'skipped_layers'"):
+        FitnessFunctionsConfig.model_validate({
+            "checks": {
+                "skipped_layers": ["a_layer"]
+            }
+        })
+
+
+def test_version_and_project_name_top_level() -> None:
+    cfg = FitnessFunctionsConfig.model_validate({
+        "version": 1,
+        "project_name": "my_project",
+    })
+    assert cfg.version == 1
+    assert cfg.project_name == "my_project"
+
+
+def test_severity_valid_values() -> None:
+    assert get_args(Severity) == ("error", "warning")
+
+    # LayerFilterConfig default is None
+    lfc = LayerFilterConfig()
+    assert lfc.severity is None
+
+    # CheckEnabled default is None
+    ce = CheckEnabled()
+    assert ce.severity is None
+
+    # LayerFilterConfig with explicit valid severities
+    assert LayerFilterConfig(severity="error").severity == "error"
+    assert LayerFilterConfig(severity="warning").severity == "warning"
+    assert LayerFilterConfig(severity=None).severity is None
+
+    # CheckEnabled with explicit valid severities
+    assert CheckEnabled(severity="error").severity == "error"
+    assert CheckEnabled(severity="warning").severity == "warning"
+    assert CheckEnabled(severity=None).severity is None
+
+    # FitnessFunctionsConfig with standard rules and checks
+    cfg = FitnessFunctionsConfig.model_validate({
+        "rules": {
+            "ban_select_star": {"severity": "warning"},
+            "sql_complexity": {"severity": "error"},
+        },
+        "checks": {
+            "layer_integrity": {"severity": "warning"},
+            "duplicate_ctes": {"severity": "error"},
+            "join_type_parity": {"severity": "warning"},
+        },
+    })
+    assert cfg.rules.ban_select_star.severity == "warning"
+    assert cfg.rules.sql_complexity.severity == "error"
+    assert cfg.checks.layer_integrity.severity == "warning"
+    assert cfg.checks.duplicate_ctes.severity == "error"
+    assert cfg.checks.join_type_parity.severity == "warning"
+
+
+def test_severity_case_insensitive_normalization() -> None:
+    assert LayerFilterConfig(severity="ERROR").severity == "error"
+    assert LayerFilterConfig(severity="Warning").severity == "warning"
+    assert CheckEnabled(severity="WARNING").severity == "warning"
+    assert CheckEnabled(severity="Error").severity == "error"
+
+    cfg = FitnessFunctionsConfig.model_validate({
+        "rules": {
+            "ban_select_star": {"severity": "WARNING"},
+        },
+        "checks": {
+            "layer_integrity": {"severity": "ERROR"},
+        },
+    })
+    assert cfg.rules.ban_select_star.severity == "warning"
+    assert cfg.checks.layer_integrity.severity == "error"
+
+
+def test_severity_invalid_values_rejected() -> None:
+    for invalid in ("warn", "info", "fatal", "critical", "debug", ""):
+        with pytest.raises(ValidationError):
+            LayerFilterConfig(severity=invalid)  # type: ignore[arg-type]
+
+        with pytest.raises(ValidationError):
+            CheckEnabled(severity=invalid)  # type: ignore[arg-type]
+
+        with pytest.raises(ValidationError):
+            FitnessFunctionsConfig.model_validate({
+                "rules": {"ban_select_star": {"severity": invalid}}
+            })
+
+        with pytest.raises(ValidationError):
+            FitnessFunctionsConfig.model_validate({
+                "checks": {"layer_integrity": {"severity": invalid}}
+            })
+
+        with pytest.raises(ValidationError):
+            FitnessFunctionsConfig.model_validate({
+                "checks": {"duplicate_ctes": {"severity": invalid}}
+            })
+
+
+def test_severity_invalid_types_rejected() -> None:
+    for invalid in (123, True, ["error"], {"sev": "error"}):
+        with pytest.raises(ValidationError):
+            LayerFilterConfig(severity=invalid)  # type: ignore[arg-type]
+
+        with pytest.raises(ValidationError):
+            CheckEnabled(severity=invalid)  # type: ignore[arg-type]
+
+
+def test_custom_check_and_rule_severity_validation() -> None:
+    # Valid extra rule and check with severity
+    cfg = FitnessFunctionsConfig.model_validate({
+        "rules": {
+            "custom_rule_a": {"severity": "WARNING"},
+            "custom_rule_b": {"severity": "error"},
+            "custom_rule_c": {"severity": None},
+        },
+        "checks": {
+            "custom_check_x": {"severity": "ERROR"},
+            "custom_check_y": {"severity": "warning"},
+            "custom_check_z": {"severity": None},
+        },
+    })
+    assert cfg.rules.model_extra["custom_rule_a"]["severity"] == "warning"
+    assert cfg.rules.model_extra["custom_rule_b"]["severity"] == "error"
+    assert cfg.rules.model_extra["custom_rule_c"]["severity"] is None
+    assert cfg.checks.model_extra["custom_check_x"]["severity"] == "error"
+    assert cfg.checks.model_extra["custom_check_y"]["severity"] == "warning"
+    assert cfg.checks.model_extra["custom_check_z"]["severity"] is None
+
+    # Invalid extra rule severity
+    with pytest.raises(ValidationError, match="Invalid severity 'warn' for rule 'custom_rule_bad'"):
+        FitnessFunctionsConfig.model_validate({
+            "rules": {
+                "custom_rule_bad": {"severity": "warn"}
+            }
+        })
+
+    # Invalid extra check severity
+    with pytest.raises(ValidationError, match="Invalid severity 'info' for check 'custom_check_bad'"):
+        FitnessFunctionsConfig.model_validate({
+            "checks": {
+                "custom_check_bad": {"severity": "info"}
+            }
+        })
+
+
+def test_load_fitness_config_severity_yaml_and_error(tmp_path: Path) -> None:
+    valid_yaml = tmp_path / "fitness_functions.yaml"
+    valid_yaml.write_text(
+        """
+rules:
+  ban_select_star:
+    severity: warning
+checks:
+  duplicate_ctes:
+    severity: error
+""",
+        encoding="utf-8",
+    )
+    cfg = load_fitness_config(tmp_path)
+    assert cfg.rules.ban_select_star.severity == "warning"
+    assert cfg.checks.duplicate_ctes.severity == "error"
+
+    invalid_yaml = tmp_path / "fitness_functions.yaml"
+    invalid_yaml.write_text(
+        """
+rules:
+  ban_select_star:
+    severity: warn
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError):
+        load_fitness_config(tmp_path)
+
+
+def test_fitness_functions_config_chunk_size(tmp_path: Path) -> None:
+    # 1. Default is None
+    cfg = FitnessFunctionsConfig()
+    assert cfg.chunk_size is None
+
+    # 2. Valid positive integer
+    cfg = FitnessFunctionsConfig(chunk_size=10)
+    assert cfg.chunk_size == 10
+
+    # 3. String numeric converts to int
+    cfg = FitnessFunctionsConfig.model_validate({"chunk_size": "25"})
+    assert cfg.chunk_size == 25
+
+    # 4. None explicitly set
+    cfg = FitnessFunctionsConfig(chunk_size=None)
+    assert cfg.chunk_size is None
+
+    # 5. Invalid values (< 1) raise ValidationError
+    with pytest.raises(ValidationError, match="chunk_size must be at least 1"):
+        FitnessFunctionsConfig(chunk_size=0)
+
+    with pytest.raises(ValidationError, match="chunk_size must be at least 1"):
+        FitnessFunctionsConfig(chunk_size=-5)
+
+    with pytest.raises(ValidationError):
+        FitnessFunctionsConfig.model_validate({"chunk_size": "invalid"})
+
+    # 6. Load from YAML
+    yaml_file = tmp_path / "fitness_functions.yaml"
+    yaml_file.write_text("chunk_size: 15\n", encoding="utf-8")
+    loaded = load_fitness_config(tmp_path)
+    assert loaded.chunk_size == 15
+
+
+def test_validation_errors_standardized_to_tff_config_error() -> None:
+    # 1. workers validation
+    with pytest.raises(ValidationError) as exc_info:
+        FitnessFunctionsConfig(workers=0)
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert isinstance(err, ValueError)
+    assert "workers must be at least 1" in err.message
+    assert err.hint == "Set workers to an integer >= 1 in fitness_functions.yaml or CLI flag."
+    assert err.details == {"field": "workers", "workers": 0, "min_workers": 1}
+
+    # 2. provider validation
+    with pytest.raises(ValidationError) as exc_info:
+        FitnessFunctionsConfig(provider=123)  # type: ignore[arg-type]
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "Expected string for provider" in err.message
+    assert "Specify provider as a string" in err.hint
+    assert err.details["field"] == "provider"
+
+    # 3. plugins validation
+    with pytest.raises(ValidationError) as exc_info:
+        FitnessFunctionsConfig(plugins=123)  # type: ignore[arg-type]
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "Expected list of strings for plugins" in err.message
+    assert "Configure plugins as a list" in err.hint
+    assert err.details["field"] == "plugins"
+
+    # 4. health weights validation
+    with pytest.raises(ValidationError) as exc_info:
+        HealthConfig(weights={"layer_integrity": -1.0})
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "Weight for 'layer_integrity' must be non-negative" in err.message
+    assert err.details == {"key": "layer_integrity", "weight": -1.0}
+    assert "Set weight for 'layer_integrity' to a non-negative number" in err.hint
+
+    # 5. check entries: invalid type
+    with pytest.raises(ValidationError) as exc_info:
+        FitnessFunctionsConfig.model_validate({"checks": {"custom_check": 123}})
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "Invalid configuration for check 'custom_check'" in err.message
+    assert err.details == {"check": "custom_check", "provided_type": "int"}
+
+    # 6. check entries: invalid severity
+    with pytest.raises(ValidationError) as exc_info:
+        FitnessFunctionsConfig.model_validate({"checks": {"custom_check": {"severity": "fatal"}}})
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "Invalid severity 'fatal' for check 'custom_check'" in err.message
+    assert err.details == {"check": "custom_check", "severity": "fatal"}
+
+    # 7. rule entries: invalid type
+    with pytest.raises(ValidationError) as exc_info:
+        FitnessFunctionsConfig.model_validate({"rules": {"custom_rule": 123}})
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "Invalid configuration for rule 'custom_rule'" in err.message
+    assert err.details == {"rule": "custom_rule", "provided_type": "int"}
+
+    # 8. rule entries: invalid severity
+    with pytest.raises(ValidationError) as exc_info:
+        FitnessFunctionsConfig.model_validate({"rules": {"custom_rule": {"severity": "fatal"}}})
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "Invalid severity 'fatal' for rule 'custom_rule'" in err.message
+    assert err.details == {"rule": "custom_rule", "severity": "fatal"}
+
+    # 9. sql_complexity warn_only deprecation
+    with pytest.raises(ValidationError) as exc_info:
+        SqlComplexityRuleConfig.model_validate({"warn_only": True})
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "warn_only' is deprecated" in err.message
+    assert err.details == {"rule": "sql_complexity", "field": "warn_only"}
+
+    # warn_only setter
+    cfg_sql = SqlComplexityRuleConfig()
+    with pytest.raises(TffConfigError) as exc_info_setter:
+        cfg_sql.warn_only = True
+    assert isinstance(exc_info_setter.value, ValueError)
+    assert "warn_only' is deprecated" in exc_info_setter.value.message
+    assert exc_info_setter.value.details == {"rule": "sql_complexity", "field": "warn_only"}
+
+    # 10. sql_complexity threshold boundaries validation
+    # Not a dict
+    with pytest.raises(ValidationError) as exc_info:
+        SqlComplexityRuleConfig.model_validate({"thresholds": "bad"})
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "Expected dictionary for thresholds" in err.message
+
+    # Not 2 elements
+    with pytest.raises(ValidationError) as exc_info:
+        SqlComplexityRuleConfig.model_validate({"thresholds": {"line_count": [10]}})
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "must be a pair [warn, fail]" in err.message
+    assert err.details["metric"] == "line_count"
+
+    # Non-integer element
+    with pytest.raises(ValidationError) as exc_info:
+        SqlComplexityRuleConfig.model_validate({"thresholds": {"line_count": ["a", "b"]}})
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "must be integers" in err.message
+    assert err.details["metric"] == "line_count"
+
+    # Negative integer
+    with pytest.raises(ValidationError) as exc_info:
+        SqlComplexityRuleConfig.model_validate({"thresholds": {"line_count": [-5, 10]}})
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "must be non-negative" in err.message
+    assert err.details["metric"] == "line_count"
+
+    # warn > fail
+    with pytest.raises(ValidationError) as exc_info:
+        SqlComplexityRuleConfig.model_validate({"thresholds": {"line_count": [500, 200]}})
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "Warn threshold (500) cannot be greater than fail threshold (200)" in err.message
+    assert err.details == {"rule": "sql_complexity", "metric": "line_count", "warn": 500, "fail": 200}
+
+    # 11. metadata grain validation (validate_model_grain)
+    meta = MetadataRuleConfig(grain=True)
+    assert meta.grain is True
+    meta_str = MetadataRuleConfig(grain="false")  # type: ignore[arg-type]
+    assert meta_str.grain is False
+
+    with pytest.raises(ValidationError) as exc_info:
+        MetadataRuleConfig(grain="not_a_bool")  # type: ignore[arg-type]
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert "Invalid configuration for 'rules.metadata.grain': expected boolean" in err.message
+    assert err.hint == "Set 'grain: true' or 'grain: false' under 'rules.metadata'."
+    assert err.details["rule"] == "metadata"
+    assert err.details["field"] == "grain"
+
+    # 12. chunk_size validation
+    with pytest.raises(ValidationError) as exc_info:
+        FitnessFunctionsConfig(chunk_size=0)
+    err = exc_info.value.errors()[0]["ctx"]["error"]
+    assert isinstance(err, TffConfigError)
+    assert isinstance(err, ValueError)
+    assert "chunk_size must be at least 1" in err.message
+    assert err.hint == "Set chunk_size to an integer >= 1 in fitness_functions.yaml or CLI flag."
+    assert err.details == {"field": "chunk_size", "chunk_size": 0, "min_chunk_size": 1}
+
+
+def test_starter_config_yaml_contains_all_rules_and_checks() -> None:
+    import yaml
+    from tff.core.config import ChecksConfig, RulesConfig
+
+    raw = yaml.safe_load(STARTER_CONFIG_YAML)
+    assert isinstance(raw, dict)
+
+    validated = FitnessFunctionsConfig.model_validate(raw)
+    assert validated == FitnessFunctionsConfig()
+
+    expected_checks = set(ChecksConfig.model_fields.keys())
+    assert set(raw.get("checks", {}).keys()) == expected_checks
+
+    expected_rules = set(RulesConfig.model_fields.keys()) - {
+        "no_positional_group_by_or_order_by"
+    }
+    assert expected_rules.issubset(set(raw.get("rules", {}).keys()))
+
+
+@pytest.mark.parametrize(
+    ("input_thresholds", "expected_key", "expected_val"),
+    [
+        (None, "decision_points", [15, 25]),
+        (None, "cte_count", [8, 12]),
+        ({"cte_count": [10, 20]}, "cte_count", [10, 20]),
+        ({"cte_count": [10, 20]}, "decision_points", [15, 25]),
+        ({"line_count": [500, 1000]}, "line_count", [500, 1000]),
+        ({"line_count": [500, 1000]}, "join_count", [8, 12]),
+    ],
+)
+def test_sql_complexity_thresholds_partial_override_preserves_defaults(
+    input_thresholds: dict[str, list[int]] | None,
+    expected_key: str,
+    expected_val: list[int],
+) -> None:
+    payload = {"thresholds": input_thresholds} if input_thresholds is not None else {}
+    cfg = SqlComplexityRuleConfig.model_validate(payload)
+    assert cfg.thresholds[expected_key] == expected_val
+
+
+
+
+

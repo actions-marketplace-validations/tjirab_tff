@@ -1,9 +1,11 @@
 """Tests for CheckRegistry, CheckDefinition, and granular rule execution."""
+from conftest import _make_finding
 
 from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
 
+from conftest import _make_model
 from tff.core.config import FitnessFunctionsConfig
 from tff.core.model import ModelRepresentation
 from tff.core.registry import (
@@ -14,7 +16,6 @@ from tff.core.registry import (
     registry,
     run_model_rule,
 )
-from tff.core.report import LintFinding
 from tff.core.rules.ban_select_star import BanSelectStar
 from tff.core.rules.base import Rule, RuleViolation
 import tff.dbt.runner as dbt_runner
@@ -139,7 +140,7 @@ def test_check_definition_run(tmp_path: Path) -> None:
     sql_file.parent.mkdir(parents=True, exist_ok=True)
     sql_file.write_text("SELECT * FROM tbl", encoding="utf-8")
 
-    model = ModelRepresentation(
+    model = _make_model(
         name="test_model",
         path=str(sql_file),
         dialect="duckdb",
@@ -171,7 +172,7 @@ def test_check_definition_run(tmp_path: Path) -> None:
         category="DAG",
         scope="dag",
         collector_fn=lambda m, c: [
-            LintFinding(check="dag_check", severity="error", message="dag violation")
+            _make_finding(check="dag_check", severity="error", message="dag violation")
         ],
     )
     findings_dag = c3.run(models, cfg)
@@ -201,11 +202,11 @@ def test_run_model_rule_variations(tmp_path: Path) -> None:
     sql_file = tmp_path / "model.sql"
     sql_file.write_text("SELECT 1", encoding="utf-8")
 
-    m_symbolic = ModelRepresentation(name="sym", path=str(sql_file), dialect="duckdb", is_symbolic=True)
-    m_external = ModelRepresentation(name="ext", path=str(sql_file), dialect="duckdb", is_external=True)
-    m_single = ModelRepresentation(name="single_msg", path=str(sql_file), dialect="duckdb")
-    m_multi = ModelRepresentation(name="multi_msg", path=str(sql_file), dialect="duckdb")
-    m_clean = ModelRepresentation(name="clean", path=str(sql_file), dialect="duckdb")
+    m_symbolic = _make_model(name="sym", path=str(sql_file), dialect="duckdb", is_symbolic=True)
+    m_external = _make_model(name="ext", path=str(sql_file), dialect="duckdb", is_external=True)
+    m_single = _make_model(name="single_msg", path=str(sql_file), dialect="duckdb")
+    m_multi = _make_model(name="multi_msg", path=str(sql_file), dialect="duckdb")
+    m_clean = _make_model(name="clean", path=str(sql_file), dialect="duckdb")
 
     models = {
         "sym": m_symbolic,
@@ -315,7 +316,7 @@ def test_check_registry_run_checks_helper(tmp_path: Path) -> None:
         label="Custom DAG",
         category="DAG",
         scope="dag",
-        collector_fn=lambda m, c: [LintFinding(check="custom_dag", severity="error", message="failed")],
+        collector_fn=lambda m, c: [_make_finding(check="custom_dag", severity="error", message="failed")],
     )
     reg.register(r1)
     reg.register(d1)
@@ -325,7 +326,7 @@ def test_check_registry_run_checks_helper(tmp_path: Path) -> None:
 
     sql_file = tmp_path / "model.sql"
     sql_file.write_text("SELECT * FROM t", encoding="utf-8")
-    model = ModelRepresentation(name="m", path=str(sql_file), dialect="duckdb")
+    model = _make_model(name="m", path=str(sql_file), dialect="duckdb")
     models = {"m": model}
 
     # checks=None
@@ -365,7 +366,7 @@ def test_dbt_runner_granular_execution(tmp_path: Path) -> None:
 
     sql_file = tmp_path / "model.sql"
     sql_file.write_text("SELECT * FROM t", encoding="utf-8")
-    model = ModelRepresentation(name="m", path=str(sql_file), dialect="duckdb")
+    model = _make_model(name="m", path=str(sql_file), dialect="duckdb")
     models = {"m": model}
 
     # Test collect_dbt_rules_findings direct call
@@ -398,7 +399,7 @@ def test_dataform_runner_granular_execution(tmp_path: Path) -> None:
 
     sql_file = tmp_path / "model.sqlx"
     sql_file.write_text("SELECT * FROM t", encoding="utf-8")
-    model = ModelRepresentation(name="m", path=str(sql_file), dialect="bigquery")
+    model = _make_model(name="m", path=str(sql_file), dialect="bigquery")
     models = {"m": model}
 
     # Test collect_dataform_rules_findings direct call
@@ -471,13 +472,13 @@ def test_sqlmesh_runner_granular_execution() -> None:
     mock_context._linters = {"default": mock_linter}
 
     mapped_models = {
-        "sqlmesh_example.src_model": ModelRepresentation(
+        "sqlmesh_example.src_model": _make_model(
             name="sqlmesh_example.src_model",
             path="models/staging/src_model.sql",
             dialect="duckdb",
             depends_on={"sqlmesh_example.violating_model"},
         ),
-        "sqlmesh_example.violating_model": ModelRepresentation(
+        "sqlmesh_example.violating_model": _make_model(
             name="sqlmesh_example.violating_model",
             path="models/marts/violating_model.sql",
             dialect="duckdb",
@@ -552,7 +553,7 @@ def test_sqlmesh_runner_fallback_without_context(tmp_path: Path) -> None:
 
     sql_file = tmp_path / "model.sql"
     sql_file.write_text("SELECT * FROM t", encoding="utf-8")
-    model = ModelRepresentation(name="m", path=str(sql_file), dialect="duckdb")
+    model = _make_model(name="m", path=str(sql_file), dialect="duckdb")
     models = {"m": model}
 
     # Pass nonexistent project root so context is None, but provide models dict
@@ -697,7 +698,7 @@ def test_check_definition_dynamic_severity(tmp_path: Path):
 
     sql_file = tmp_path / "model.sql"
     sql_file.write_text("SELECT 1", encoding="utf-8")
-    models = {"m": ModelRepresentation(name="m", path=str(sql_file), dialect="duckdb")}
+    models = {"m": _make_model(name="m", path=str(sql_file), dialect="duckdb")}
 
     # Default severity is error
     cfg = FitnessFunctionsConfig()
@@ -771,8 +772,8 @@ def test_registry_run_checks_parallel():
     reg.register_rule(Rule2, id="rule_two")
 
     models = {
-        "m1": ModelRepresentation(name="m1", path="m1.sql", dialect="duckdb"),
-        "m2": ModelRepresentation(name="m2", path="m2.sql", dialect="duckdb"),
+        "m1": _make_model(name="m1", path="m1.sql", dialect="duckdb"),
+        "m2": _make_model(name="m2", path="m2.sql", dialect="duckdb"),
     }
 
     # Sequential
@@ -798,7 +799,7 @@ def test_registry_run_checks_parallel():
 
 def test_check_definition_run_with_workers():
     cfg = FitnessFunctionsConfig()
-    models = {"m": ModelRepresentation(name="m", path="m.sql", dialect="duckdb")}
+    models = {"m": _make_model(name="m", path="m.sql", dialect="duckdb")}
 
     # Model scope
     class DummyRule(Rule):
@@ -818,7 +819,7 @@ def test_check_definition_run_with_workers():
 
     # DAG scope with max_workers in signature
     def collector_with_workers(m, c, max_workers=None):
-        return [LintFinding("dag_check", "warning", "m", "m.sql", "msg")]
+        return [_make_finding("dag_check", "warning", "m", "m.sql", "msg")]
 
     check_dag_workers = CheckDefinition(
         id="dag_workers",
@@ -832,7 +833,7 @@ def test_check_definition_run_with_workers():
 
     # DAG scope without max_workers in signature
     def collector_without_workers(m, c):
-        return [LintFinding("dag_no_workers", "warning", "m", "m.sql", "msg")]
+        return [_make_finding("dag_no_workers", "warning", "m", "m.sql", "msg")]
 
     check_dag_no_workers = CheckDefinition(
         id="dag_no_workers",
@@ -876,8 +877,8 @@ def test_run_model_rule_propagates_chunk_size() -> None:
     from unittest.mock import patch
 
     models = {
-        "m1": ModelRepresentation(name="m1", path="models/m1.sql", dialect="duckdb"),
-        "m2": ModelRepresentation(name="m2", path="models/m2.sql", dialect="duckdb"),
+        "m1": _make_model(name="m1", path="models/m1.sql", dialect="duckdb"),
+        "m2": _make_model(name="m2", path="models/m2.sql", dialect="duckdb"),
     }
 
     with patch("tff.core.parallel.run_parallel_model_rule") as mock_parallel:
@@ -913,7 +914,7 @@ def test_check_definition_run_propagates_chunk_size() -> None:
         rule_cls=BanSelectStar,
     )
     models = {
-        "m1": ModelRepresentation(name="m1", path="models/m1.sql", dialect="duckdb"),
+        "m1": _make_model(name="m1", path="models/m1.sql", dialect="duckdb"),
     }
     cfg = FitnessFunctionsConfig()
 
@@ -943,7 +944,7 @@ def test_run_model_rule_with_chunk_size_execution(tmp_path: Path) -> None:
     sql_file.write_text("SELECT 1", encoding="utf-8")
 
     models = {
-        f"m_{i}": ModelRepresentation(
+        f"m_{i}": _make_model(
             name=f"foo_{i}" if i % 2 == 0 else f"bar_{i}",
             path=str(sql_file),
             dialect="duckdb",
@@ -1035,7 +1036,12 @@ def test_registry_get_by_category() -> None:
 
 
 def test_all_builtin_checks_have_rich_metadata() -> None:
-    fresh_reg = create_default_registry()
+    from tff.core.catalog import get_builtin_checks, register_builtin_checks
+
+    fresh_reg = CheckRegistry()
+    register_builtin_checks(fresh_reg)
+    cfg = FitnessFunctionsConfig()
+    assert len(get_builtin_checks()) == len(fresh_reg.all_checks())
     for check in fresh_reg.all_checks():
         assert check.description, f"{check.id} is missing description"
         assert check.what_it_checks, f"{check.id} what_it_checks property failed"
@@ -1043,3 +1049,168 @@ def test_all_builtin_checks_have_rich_metadata() -> None:
         assert check.how_to_fix, f"{check.id} is missing how_to_fix"
         assert check.configuration_example, f"{check.id} is missing configuration_example"
         assert len(check.providers) > 0, f"{check.id} has no providers"
+        assert isinstance(check.is_enabled(cfg, provider="dbt"), bool)
+        assert isinstance(check.is_enabled(cfg, provider="sqlmesh"), bool)
+
+
+
+@pytest.mark.parametrize(
+    "check",
+    [c for c in create_default_registry().all_checks() if c.configuration_example],
+    ids=lambda c: c.id,
+)
+def test_builtin_check_configuration_examples_validate_against_schema(
+    check: CheckDefinition,
+) -> None:
+    import yaml
+
+    parsed = yaml.safe_load(check.configuration_example) or {}
+    assert isinstance(parsed, dict), f"{check.id} configuration_example must parse to a mapping"
+    cfg = FitnessFunctionsConfig.model_validate(parsed)
+    assert not cfg.checks.model_extra, (
+        f"{check.id} configuration_example contains unknown checks keys: {cfg.checks.model_extra}"
+    )
+    assert not cfg.rules.model_extra, (
+        f"{check.id} configuration_example contains unknown rules keys: {cfg.rules.model_extra}"
+    )
+
+
+def test_positional_checks_registry() -> None:
+    reg = create_default_registry()
+
+    # 1. Lookup by ID and aliases
+    check_group = reg.get("no_positional_group_by")
+    assert check_group is not None
+    assert check_group.id == "no_positional_group_by"
+    assert reg.get("nopositionalgroupby") is check_group
+
+    check_order = reg.get("no_positional_order_by")
+    assert check_order is not None
+    assert check_order.id == "no_positional_order_by"
+    assert reg.get("nopositionalorderby") is check_order
+
+    check_parent = reg.get("no_positional_group_by_or_order_by")
+    assert check_parent is not None
+    assert check_parent.id == "no_positional_group_by_or_order_by"
+    assert reg.get("nopositionalgroupbyororderby") is check_parent
+
+    # 2. Resolution of parent umbrella check resolves to both individual checks
+    config = FitnessFunctionsConfig()
+    resolved_parent = reg.resolve_checks(["no_positional_group_by_or_order_by"], config)
+    resolved_ids = [c.id for c in resolved_parent]
+    assert "no_positional_group_by" in resolved_ids
+    assert "no_positional_order_by" in resolved_ids
+    assert "no_positional_group_by_or_order_by" not in resolved_ids
+
+    # 3. Resolution of individual checks
+    resolved_grp = reg.resolve_checks(["no_positional_group_by"], config)
+    assert [c.id for c in resolved_grp] == ["no_positional_group_by"]
+
+    resolved_ord = reg.resolve_checks(["no_positional_order_by"], config)
+    assert [c.id for c in resolved_ord] == ["no_positional_order_by"]
+
+    # 4. is_enabled filtering
+    config.rules.no_positional_group_by_or_order_by.group_by = False
+    assert check_group.is_enabled(config) is False
+    assert check_order.is_enabled(config) is True
+
+    config.rules.no_positional_group_by_or_order_by.group_by = True
+    config.rules.no_positional_group_by_or_order_by.order_by = False
+    assert check_group.is_enabled(config) is True
+    assert check_order.is_enabled(config) is False
+
+    config.rules.no_positional_group_by.enabled = False
+    assert check_group.is_enabled(config) is False
+
+
+def test_check_registry_run_checks_propagates_chunk_size_sequential() -> None:
+    from unittest.mock import MagicMock
+
+    reg = CheckRegistry()
+    mock_check = MagicMock(spec=CheckDefinition)
+    mock_check.id = "mock_rule"
+    mock_check.finding_id = "mock_rule"
+    mock_check.scope = "model"
+    mock_check.category = "Test"
+    mock_check.aliases = ()
+    mock_check.finding_check_id = None
+    mock_check.is_enabled.return_value = True
+    mock_check.run.return_value = []
+    reg.register(mock_check)
+
+    models = {
+        "m1": _make_model(name="m1", path="models/m1.sql", dialect="duckdb"),
+    }
+    cfg = FitnessFunctionsConfig(workers=1)
+    findings, executed = reg.run_checks(
+        models,
+        cfg,
+        checks=["mock_rule"],
+        max_workers=1,
+        chunk_size=7,
+    )
+    assert findings == []
+    assert executed == ["mock_rule"]
+    mock_check.run.assert_called_once_with(
+        models,
+        cfg,
+        max_workers=1,
+        scoped_models=None,
+        chunk_size=7,
+    )
+
+
+def test_check_registry_run_checks_propagates_chunk_size_parallel() -> None:
+    from unittest.mock import MagicMock
+
+    reg = CheckRegistry()
+    mock_c1 = MagicMock(spec=CheckDefinition)
+    mock_c1.id = "mock_rule_1"
+    mock_c1.finding_id = "mock_rule_1"
+    mock_c1.scope = "model"
+    mock_c1.category = "Test"
+    mock_c1.aliases = ()
+    mock_c1.finding_check_id = None
+    mock_c1.is_enabled.return_value = True
+    mock_c1.run.return_value = []
+
+    mock_c2 = MagicMock(spec=CheckDefinition)
+    mock_c2.id = "mock_rule_2"
+    mock_c2.finding_id = "mock_rule_2"
+    mock_c2.scope = "model"
+    mock_c2.category = "Test"
+    mock_c2.aliases = ()
+    mock_c2.finding_check_id = None
+    mock_c2.is_enabled.return_value = True
+    mock_c2.run.return_value = []
+
+    reg.register(mock_c1)
+    reg.register(mock_c2)
+
+    models = {
+        "m1": _make_model(name="m1", path="models/m1.sql", dialect="duckdb"),
+    }
+    cfg = FitnessFunctionsConfig(workers=2)
+    findings, executed = reg.run_checks(
+        models,
+        cfg,
+        checks=["mock_rule_1", "mock_rule_2"],
+        max_workers=2,
+        chunk_size=9,
+    )
+    assert findings == []
+    mock_c1.run.assert_called_once_with(
+        models,
+        cfg,
+        max_workers=1,
+        scoped_models=None,
+        chunk_size=9,
+    )
+    mock_c2.run.assert_called_once_with(
+        models,
+        cfg,
+        max_workers=1,
+        scoped_models=None,
+        chunk_size=9,
+    )
+
